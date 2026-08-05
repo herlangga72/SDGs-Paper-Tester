@@ -1,0 +1,16 @@
+# Render Blueprint — one-click free-tier deployment.
+# Usage: render.com → New → Blueprint → select this GitHub repo.
+# (Or: New → Web Service → connect repo → runtime Docker → plan Free.)
+# Free tier: no credit card, sleeps after 15 min idle, ~750 free hours/month.
+services:
+  - type: web
+    name: sdg-paper-matcher
+    runtime: docker
+    repo: https://github.com/herlangga72/sdg-paper-matcher
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: PORT
+        value: 10000
