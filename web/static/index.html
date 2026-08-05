@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SDG Paper Matcher</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="wrap">
+  <header class="app">
+    <div class="logo">SDG</div>
+    <div>
+      <h1>SDG Paper Matcher</h1>
+      <p>Check a paper's title / abstract / keywords against the Scopus SDG queries — matched, near-missed, or excluded.</p>
+    </div>
+  </header>
+
+  <div class="card form-card">
+    <div class="tabs">
+      <span class="tab active" data-tab="form" onclick="switchTab('form')">✎ Form</span>
+      <span class="tab" data-tab="paste" onclick="switchTab('paste')">⌨ Paste</span>
+      <span class="tab" data-tab="samples" onclick="switchTab('samples')">☰ Samples</span>
+      <span class="tab" data-tab="upload" onclick="switchTab('upload')">⇪ Upload</span>
+    </div>
+
+    <div id="tab-form" class="tab-body">
+      <div class="doi-row">
+        <span class="small" style="font-weight:600">Auto-fill from DOI:</span>
+        <input id="f-doi-fetch" type="text" placeholder="10.1257/jep.28.4.99  (or paste a full https://doi.org/... link)">
+        <button class="primary" id="doi-btn" onclick="fetchDOI()">Fetch</button>
+        <span id="doi-status" class="small"></span>
+      </div>
+      <div class="form-grid">
+        <label class="fld wide">Title
+          <input id="f-title" type="text" placeholder="Paper title">
+        </label>
+        <label class="fld">Authors
+          <input id="f-authors" type="text" placeholder="A. Author, B. Author">
+        </label>
+        <label class="fld">Year
+          <input id="f-year" type="text" placeholder="2025">
+        </label>
+        <label class="fld">Journal
+          <input id="f-journal" type="text" placeholder="Journal name">
+        </label>
+        <label class="fld">DOI
+          <input id="f-doi" type="text" placeholder="10.xxxx/...">
+        </label>
+        <label class="fld wide">Keywords
+          <input id="f-keywords" type="text" placeholder="keyword one, keyword two (comma-separated)">
+        </label>
+        <label class="fld wide">Abstract
+          <textarea id="f-abstract" rows="8" placeholder="Paste the abstract here..."></textarea>
+        </label>
+      </div>
+      <p class="hint">Only <b>Title</b>, <b>Abstract</b> and <b>Keywords</b> are searched by the SDG queries; the rest is metadata shown in the report header. The DOI fetch uses the Crossref API (needs internet) and fills whatever the publisher provides — abstract &amp; keywords are included when available, otherwise add them yourself.</p>
+    </div>
+
+    <div id="tab-paste" class="tab-body" hidden>
+      <textarea id="paper" name="paper" spellcheck="false" placeholder="---
+title: &quot;My paper&quot;
+abstract: |
+  The abstract text...
+keywords: [keyword one, keyword two]
+---"></textarea>
+      <p class="hint">Markdown with YAML frontmatter: <b>title</b>, <b>abstract</b>, <b>keywords</b>. Press <kbd>Ctrl</kbd>+<kbd>Enter</kbd> to match.</p>
+    </div>
+
+    <div id="tab-samples" class="tab-body" hidden>
+      <div class="sample-grid" id="sample-grid"></div>
+      <p class="hint">Click a sample to load it into the editor, then hit <b>Match SDGs</b>.</p>
+    </div>
+
+    <div id="tab-upload" class="tab-body" hidden>
+      <label class="upload-box" for="file">
+        <span class="upload-icon">⇪</span>
+        <span>Choose a .md / .txt paper file</span>
+      </label>
+      <input id="file" type="file" accept=".md,.txt,.markdown" hidden>
+      <p class="hint">The file is read locally and sent only to this local server.</p>
+    </div>
+
+    <div class="row">
+      <label class="small">near-misses per SDG
+        <input id="top" type="number" min="1" max="20" value="3" style="width:64px">
+      </label>
+      <label class="small">max keywords
+        <input id="maxkw" type="number" min="1" max="50" value="10" style="width:70px">
+      </label>
+      <span class="spacer"></span>
+      <button class="ghost" onclick="clearAll()">Clear</button>
+      <button class="primary" id="go" onclick="run()">Match SDGs</button>
+    </div>
+  </div>
+
+  <div id="results"></div>
+
+  <details class="card legend">
+    <summary>The 17 SDGs</summary>
+    <div class="legend-grid" id="legend-grid"></div>
+  </details>
+
+  <footer>SDG Paper Matcher · zero-dependency web app · engine: engine/ · server: web/app.py</footer>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

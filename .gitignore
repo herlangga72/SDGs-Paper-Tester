@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# generated query database (rebuild with: python3 engine/sdg2sqlite.py)
+engine/data/sdg_queries.sqlite3
+
+# Rust build artifacts
+target/
+rust/target/
+
+# OS junk
+.DS_Store
+Thumbs.db
