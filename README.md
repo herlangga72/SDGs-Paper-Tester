@@ -67,11 +67,11 @@ python3 engine/match_paper.py papers/sample_paper.md --top 3 --max-kw 10
 
 ## Deploy for free
 
-This app has zero dependencies and runs anywhere — including the free tiers
-of Hugging Face Spaces (recommended), Render, and others, with **no credit
-card**. The repo ships a `Dockerfile`, `render.yaml`, and a GitHub Actions
-workflow that auto-deploys to a free HF Space on every push. See
-[DEPLOY.md](DEPLOY.md) for step-by-step instructions.
+This app has zero dependencies and runs anywhere — including **Render's free
+web-service tier** (recommended, one click from this repo, no credit card)
+and **PythonAnywhere's free tier** (always on, via the included `wsgi.py`
+adapter). The repo ships a `Dockerfile`, `render.yaml`, and `wsgi.py`.
+Step-by-step instructions: [DEPLOY.md](DEPLOY.md).
 
 ## Web API
 

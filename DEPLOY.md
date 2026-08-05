@@ -4,121 +4,99 @@ This app is pure Python **standard library** (no pip installs) and runs as a
 plain HTTP server, which makes it trivially deployable on free tiers. All
 options below cost **$0.00** and need **no credit card**.
 
+> **Note (2026):** Hugging Face now requires a **PRO subscription** to host
+> Docker/Gradio Spaces on the free tier (static Spaces only are free), so HF
+> is no longer a zero-cost option for this app. The two viable paths are
+> **Render** and **PythonAnywhere** below.
+
 | Option | Cost | Sleeps? | Setup effort |
 |---|---|---|---|
-| **Hugging Face Spaces** (recommended) | $0 forever | after 48 h idle, wakes on visit | medium |
-| **Render** free tier | $0 (750 h/month) | after 15 min idle, cold start ~1 min | low |
-| PythonAnywhere free | $0 | never | medium (needs WSGI) |
+| **Render** free tier | $0 (750 h/month) | after 15 min idle, cold start ~1 min | **low — recommended** |
+| **PythonAnywhere** free | $0 | **never (always on)** | medium (WSGI, included) |
 
 The Dockerfile builds the SQLite query DB into the image, so first requests
-are fast. The DOI auto-fill (Crossref) works on all of these — outbound HTTPS
-is allowed.
+are fast. The DOI auto-fill (Crossref) works on both — outbound HTTPS is
+allowed.
 
 ---
 
-## Option 1 — Hugging Face Spaces (recommended)
+## Option 1 — Render (recommended, lowest effort)
 
-Free CPU-basic Docker Spaces, no hourly limits, auto-sleep after 48 h of no
-traffic (first visit after sleep takes ~30–60 s to wake).
+Your repo is already on GitHub — no new files needed.
 
-### 1. Create the Space
-
-1. Sign up at <https://huggingface.co/join> (free).
-2. Go to <https://huggingface.co/new-space>:
-   - **Space name:** `sdg-paper-matcher`
-   - **License:** MIT
-   - **SDK:** `Docker`
-   - **Hardware:** `CPU basic` (free) — 2 vCPU / 16 GB, enough for this app
-   - **Visibility:** Public (private Spaces need a paid plan)
-   - Create Space.
-
-### 2. Deploy — pick one:
-
-**A. Automatic (recommended): GitHub Actions** — this repo already contains
-`.github/workflows/deploy-hf.yml`.
-
-1. Create a write token at <https://huggingface.co/settings/tokens>.
-2. On GitHub: repo **Settings → Secrets and variables → Actions → New
-   repository secret** → name `HF_TOKEN`, paste the token.
-3. (Optional) Set repo **variable** `HF_SPACE_ID` to `youruser/sdg-paper-matcher`
-   if you named your Space differently. Defaults to
-   `herlangga72/sdg-paper-matcher`.
-4. Push to `main` — the workflow syncs the repo to the Space and prints the
-   public URL. Every future push auto-deploys.
-
-**B. Manual (no GitHub Actions):**
-
-```bash
-git clone https://huggingface.co/spaces/<youruser>/sdg-paper-matcher
-cd sdg-paper-matcher
-# copy the project files (NOT the Space's README.md — it has the
-# required "sdk: docker" front matter that HF generates)
-cp -r <this-repo>/engine <this-repo>/web <this-repo>/papers <this-repo>/Dockerfile \
-      <this-repo>/entrypoint.sh <this-repo>/LICENSE .
-git add -A && git commit -m "Deploy SDG Paper Matcher" && git push
-```
-
-### 3. Done
-
-Your app: `https://<youruser>-sdg-paper-matcher.hf.space` (HF builds the
-Docker image automatically on push).
-
----
-
-## Option 2 — Render (free tier)
-
-Zero code changes. Your repo is already on GitHub.
-
-1. Sign up at <https://render.com> (free, no card).
-2. **New → Web Service** → connect the `sdg-paper-matcher` repo.
-3. **Runtime:** Docker. **Instance type:** Free. Region: any.
+1. Sign up at <https://render.com> (free, no credit card).
+2. **New → Web Service** → connect the `herlangga72/sdg-paper-matcher` repo.
+3. **Runtime:** Docker. **Instance type:** Free. Region: any (e.g. Frankfurt).
 4. **Health check path:** `/health` (the app exposes it).
 5. Create — Render builds the image and starts the service.
 
-Alternatively, **New → Blueprint** and select this repo (it contains
-`render.yaml` with everything preconfigured, including the free plan).
+Alternatively, **New → Blueprint** and select this repo: `render.yaml` is
+already in the repo with everything preconfigured (free plan, Docker, health
+check).
 
 Your app: `https://sdg-paper-matcher.onrender.com`
 
-Notes on the free tier: sleeps after 15 min of no traffic (cold start ~1 min),
-and you get ~750 free hours/month (plenty for a hobby tool; it counts only
-while the service is running).
+Free-tier behavior: sleeps after 15 min of no traffic (cold start ~1 min),
+~750 free hours/month (plenty for a hobby tool — it only counts while the
+service is awake).
 
 ---
 
-## Option 3 — PythonAnywhere (free)
+## Option 2 — PythonAnywhere (always on, never sleeps)
 
-Always-on free tier (never sleeps), 1 web app, 512 MB disk. Needs a WSGI
-adapter since PythonAnywhere doesn't run `http.server`:
+Free tier: one web app, 512 MB disk, always online. The repo ships a WSGI
+adapter (`wsgi.py`) so no code changes are needed.
 
-```python
-# wsgi.py — add to the repo and point PythonAnywhere at it
-import sys, os
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from web.app import Handler  # noqa: E402  (Handler is a WSGI-compatible class)
-application = Handler  # needs the do_GET/do_POST methods exposed — see below
-```
+1. Sign up at <https://www.pythonanywhere.com> (free, no credit card).
+2. Open a **Bash console** and clone + build the DB:
 
-`http.server` handlers are not WSGI apps, so the practical approach is:
+   ```bash
+   git clone https://github.com/herlangga72/sdg-paper-matcher.git
+   cd sdg-paper-matcher
+   python3.11 engine/sdg2sqlite.py --quiet
+   ```
 
-```bash
-# On PythonAnywhere: install nothing, just run the app in a "Always-on task"
-# (free tier supports one) — or use the Flask-less trick:
-python3 web/app.py --host 0.0.0.0 --port 8000 --no-browser
-```
+3. **Web tab → Add a new web app → Manual configuration → Python 3.11**.
+   - Source directory: `/home/<youruser>/sdg-paper-matcher`
+   - Working directory: `/home/<youruser>/sdg-paper-matcher`
+4. Edit the **WSGI configuration file** — replace its contents with:
 
-PythonAnywhere free "always-on tasks" are a paid feature on newer plans, so
-if you want a truly always-on free host, prefer Hugging Face Spaces or Render
-for this project. (Listed here for completeness — it works, but with more
-friction.)
+   ```python
+   import sys
+   sys.path.insert(0, '/home/<youruser>/sdg-paper-matcher')
+   from wsgi import application
+   ```
+
+5. Click **Reload**.
+
+Your app: `https://<youruser>.pythonanywhere.com`
+
+Notes: free-tier CPU is throttled (matching a paper takes ~1–2 s, fine for
+occasional use); static files are served by the app itself, so no extra
+static-file mapping is needed.
+
+---
+
+## What happened to the Hugging Face option?
+
+`DEPLOY.md` earlier pointed at free HF Docker Spaces, and a GitHub Actions
+workflow (`deploy-hf.yml`) was added to auto-deploy there. Hugging Face's API
+now rejects creating Docker Spaces on the free tier:
+
+> "hosting Gradio and Docker Spaces on free cpu-basic requires a PRO
+> subscription"
+
+so that workflow was removed. The `HF_TOKEN` GitHub secret is harmless to
+keep — it's useful the day you have PRO or want to use HF for other things.
+If HF ever re-opens free Docker Spaces, the workflow can be restored from git
+history (`git show <commit>:.github/workflows/deploy-hf.yml`).
 
 ---
 
 ## Cost & behavior summary
 
-- **Hugging Face Spaces:** $0, no card, sleeps after 48 h idle → wakes on
-  visit. Best long-term home.
 - **Render free:** $0, no card, sleeps after 15 min idle, 750 h/month.
-- **DOI auto-fill:** works everywhere (outbound HTTPS to Crossref allowed).
+- **PythonAnywhere free:** $0, no card, always on, throttled CPU.
+- **DOI auto-fill:** works on both (outbound HTTPS to Crossref allowed).
 - **No data is stored server-side** — papers are matched in memory and never
   persisted, so there's nothing to migrate or clean up.
