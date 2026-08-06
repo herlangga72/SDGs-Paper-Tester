@@ -2,7 +2,9 @@
 # Works on Render (free tier) or any Docker host.
 # The web server is Rust (SIMD engine): matching a paper takes ~80 ms
 # instead of ~0.9 s with the old Python server.
-FROM rust:1.97-slim AS build
+# Pin the build stage to bookworm: rust:1.97-slim is trixie (glibc 2.41),
+# whose binaries won't run on the bookworm runtime (glibc 2.36).
+FROM rust:1.97-slim-bookworm AS build
 
 WORKDIR /build
 COPY rust/Cargo.toml rust/Cargo.lock ./

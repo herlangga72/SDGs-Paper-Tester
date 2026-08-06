@@ -6,7 +6,9 @@ engine/data/sdg_queries.sqlite3
 .github
 __pycache__/
 *.pyc
-rust/
+# Only exclude the Rust build output; rust/src and Cargo files are needed
+# to build the web server inside the image.
+rust/target/
 target/
 .DS_Store
 Thumbs.db
