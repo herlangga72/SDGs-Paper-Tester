@@ -3,11 +3,14 @@
 Check academic papers against the 17 UN Sustainable Development Goal (SDG)
 search queries that Scopus uses for its research classification.
 
+**Live demo:** <https://sdgs-paper-tester.onrender.com> ·
+**Repository:** <https://github.com/herlangga72/SDGs-Paper-Tester>
+
 Paste a paper (title / abstract / keywords), upload a file, or auto-fill from
 a DOI — and see **which SDGs the paper matches**, **which are near misses**
 (exact missing keywords to add), and **which excluded (NOT) terms** appear
 in the text. The web server and matching engine are Rust with SIMD
-acceleration (AVX-512/AVX2 on x86_64, NEON on ARM64); the Python engine is
+acceleration (AVX-512/AVX2 and SSE3–SSE4.2 on x86_64); the Python engine is
 kept as a reference implementation.
 
 ![stack](https://img.shields.io/badge/dependencies-none-19486A)
@@ -30,8 +33,8 @@ sdg-paper-matcher/
     ├── src/lib.rs           #   engine modules (parser, matcher, SIMD)
     ├── src/main.rs          #   CLI: sdg_tools parse / match
     ├── src/bin/web.rs       #   HTTP server: API + report rendering (was web/app.py)
-    └── src/simd.rs          #   AVX-512/AVX2 (x86_64) + NEON (arm64)
-                               #   lowercasing + substring search (scalar fallback)
+    └── src/simd.rs          #   AVX-512/AVX2 + SSE3–SSE4.2 ladder (x86_64)
+                               #   lowercasing, substring search, ws scan
 ```
 
 **Engine** = the brains: parses the Elsevier Scopus SDG query files into an
@@ -42,7 +45,8 @@ and the reference Python engine (`engine/`).
 **Webserver** = the face: a threaded HTTP server written in Rust
 (`rust/src/bin/web.rs`) that serves a browser UI (form, paste, samples,
 upload, DOI auto-fill). It reuses the SIMD matcher, so a full paper match
-round-trip takes ~80 ms instead of ~0.9 s with the Python server.
+round-trip takes ~15–50 ms locally and ~80–270 ms on Render's free tier
+(0.1 CPU), instead of ~0.9 s with the Python server.
 
 ## Quick start
 
@@ -74,10 +78,17 @@ The legacy Python server still works if you prefer it:
   add, excluded terms found in the text, and all matched keywords
   highlighted in the paper text.
 - **Official UN colors** for the 17 SDGs throughout the UI.
-- **SIMD-accelerated matching**: case folding and substring search run on
-  AVX-512 (64-byte) then AVX2 (32-byte) vectors on x86_64 (runtime-detected)
-  and NEON (16-byte) vectors on ARM64, with a portable scalar fallback — a
-  paper that took ~0.9 s in Python matches in ~80 ms.
+- **Fast SIMD matching**: case folding, substring search and whitespace
+  scans run on AVX-512 (64-byte), AVX2 (32-byte) and an SSE3–SSE4.2
+  (16-byte) ladder on x86_64 (runtime-detected, scalar fallback). All 21k
+  query keywords are precompiled once at boot, per-request text indexes and
+  memoization skip most searches, so a paper matches in ~15–50 ms locally —
+  ~30× faster than the original Python server.
+- **`POST /api/match`**: the same form fields return a machine-readable
+  JSON report (`{ms, sdgs: [{sdg, matched, near, near_total, excluded}]}`)
+  for scripts and batch use.
+- **Gzip responses**: HTML/JSON are compressed when the client sends
+  `Accept-Encoding: gzip`.
 - Matching semantics identical to Scopus: `NOT > AND/W-n > OR` precedence,
   whole-word matching, `*`/`?` wildcards — implemented the same way in the
   Rust engine and the reference Python engine.
@@ -101,7 +112,17 @@ Step-by-step instructions: [DEPLOY.md](DEPLOY.md).
 | `GET /sample?name=X&format=json` | parsed fields of a sample |
 | `GET /doi?doi=…` | Crossref lookup → JSON fields |
 | `POST /match` | form fields or `paper` text / `file` upload → HTML report |
+| `POST /api/match` | same input → JSON report (see [Web API](#web-api)) |
 | `GET /health` | liveness |
+
+Example (match a paper from the command line):
+
+```bash
+curl -s -H "Accept-Encoding: gzip" --compressed \
+  -d "title=Climate+action+and+renewable+energy" \
+  -d "abstract=We+study+renewable+energy+policy+and+CO2+reduction" \
+  https://sdgs-paper-tester.onrender.com/api/match
+```
 
 ## Requirements
 
