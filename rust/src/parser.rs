@@ -144,7 +144,7 @@ impl Parser {
                 // `TITLE-ABS(neogobius melanostomus)` (SDG15); quoted and
                 // braced terms keep their boundaries.
                 let mut kw = value;
-                let mut ex = exact;
+                let ex = exact;
                 while let Some(Token::Str { value: v, exact: e }) = self.peek().cloned() {
                     if ex || e {
                         break;

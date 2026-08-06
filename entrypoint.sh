@@ -4,5 +4,5 @@
 #   - Render free tier injects $PORT (e.g. 10000)
 set -e
 PORT="${PORT:-7860}"
-echo "[entrypoint] starting SDG Paper Matcher on 0.0.0.0:${PORT}"
-exec python3 web/app.py --host 0.0.0.0 --port "${PORT}" --no-browser
+echo "[entrypoint] starting SDG Paper Matcher (Rust + SIMD) on 0.0.0.0:${PORT}"
+exec /usr/local/bin/sdg-web --host 0.0.0.0 --port "${PORT}" --no-browser

@@ -4,19 +4,14 @@
 //! Usage:
 //!   sdg_tools parse [DIR] [-o out.csv] [--dedup] [--quiet]
 //!   sdg_tools match <paper.md> [--dir DIR] [--top N] [--max-kw M]
+//!
+//! The web server lives in src/bin/web.rs (build with `cargo build --bin web`).
 
-mod ast;
-mod matcher;
-mod paper;
-mod parser;
-mod query;
-mod simd;
-mod tokenizer;
-
-use ast::Node;
-use matcher::Pattern;
-use paper::Paper;
-use query::load_queries;
+use sdg_tools::ast::Node;
+use sdg_tools::matcher;
+use sdg_tools::matcher::Pattern;
+use sdg_tools::paper::Paper;
+use sdg_tools::query::load_queries;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Read;

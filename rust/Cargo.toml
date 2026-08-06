@@ -1,10 +1,15 @@
 [package]
 name = "sdg_tools"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "Parse Scopus SDG query files and check papers against them — Rust, SIMD (AVX2), zero dependencies"
+description = "Parse Scopus SDG query files, match papers against them, and serve the web app — Rust, SIMD (AVX2)"
+license = "GPL-3.0-or-later"
 
+# The engine (lib) is dependency-free; only the `web` binary pulls in an
+# HTTP client (for the Crossref DOI lookup) and JSON support.
 [dependencies]
+ureq = "3"
+serde_json = "1"
 
 [profile.release]
 opt-level = 3

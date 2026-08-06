@@ -1,7 +1,7 @@
 //! Paper matching: evaluate the AST against a paper, with SIMD pattern search.
 
 use crate::ast::Node;
-use crate::paper::{Paper, ALL_FIELDS, F_ANY};
+use crate::paper::{Paper, ALL_FIELDS, F_ABS, F_ANY, F_AUTHKEY, F_KEY, F_TITLE};
 use crate::simd::find;
 use std::collections::HashMap;
 
@@ -179,6 +179,73 @@ pub fn scan_block(block: &Node, paper: &Paper, cache: &mut HashMap<String, Patte
     let mut out = BlockScan { hits: Vec::new(), misses: Vec::new(), excluded_hits: Vec::new() };
     rec(block, None, false, paper, cache, &mut out);
     out
+}
+
+fn field_name(f: u8) -> &'static str {
+    match f {
+        F_TITLE => "TITLE",
+        F_ABS => "ABS",
+        F_KEY => "KEY",
+        F_AUTHKEY => "AUTHKEY",
+        _ => "TITLE-ABS-KEY",
+    }
+}
+
+/// Like `scan_block`, but each hit/miss also carries the field(s) the term is
+/// searched in ('' -> the default TITLE-ABS-KEY). Used by the web server,
+/// which renders `[TITLE,ABS]` chips next to every keyword.
+/// Returns (hits, misses, excluded_hits).
+pub fn scan_with_fields(
+    block: &Node,
+    paper: &Paper,
+    cache: &mut HashMap<String, Pattern>,
+) -> (Vec<(String, String)>, Vec<(String, String)>, Vec<String>) {
+    let mut hits = Vec::new();
+    let mut misses = Vec::new();
+    let mut ex_hits = Vec::new();
+    rec_fields(block, None, false, paper, cache, &mut hits, &mut misses, &mut ex_hits);
+    (hits, misses, ex_hits)
+}
+
+fn rec_fields(
+    node: &Node,
+    fields: Option<&[u8]>,
+    excluded: bool,
+    paper: &Paper,
+    cache: &mut HashMap<String, Pattern>,
+    hits: &mut Vec<(String, String)>,
+    misses: &mut Vec<(String, String)>,
+    ex_hits: &mut Vec<String>,
+) {
+    match node {
+        Node::Leaf { keyword, .. } => {
+            let p = pat(cache, keyword);
+            let found = term_hit(paper, p, fields.unwrap_or(&ALL_FIELDS));
+            let fname = fields.map_or(String::new(), |f| {
+                f.iter().map(|&x| field_name(x)).collect::<Vec<_>>().join(",")
+            });
+            if excluded {
+                if found {
+                    ex_hits.push(keyword.clone());
+                }
+            } else if found {
+                hits.push((keyword.clone(), fname));
+            } else {
+                misses.push((keyword.clone(), fname));
+            }
+        }
+        Node::Field { fields: fs, child } => {
+            rec_fields(child, Some(&field_ids(fs)), excluded, paper, cache, hits, misses, ex_hits)
+        }
+        Node::Not { child } => {
+            rec_fields(child, fields, !excluded, paper, cache, hits, misses, ex_hits)
+        }
+        Node::Group { children, .. } => {
+            for c in children {
+                rec_fields(c, fields, excluded, paper, cache, hits, misses, ex_hits);
+            }
+        }
+    }
 }
 
 fn rec(

@@ -113,9 +113,59 @@ pub fn parse_frontmatter(text: &str) -> (Vec<(String, YVal)>, String) {
     (meta, body)
 }
 
+/// Paper metadata (YAML frontmatter or the web form). Used by the web UI
+/// to fill the report header and the sample/DOI JSON endpoints.
+#[derive(Debug, Default, Clone)]
+pub struct Meta {
+    pub title: Option<String>,
+    pub authors: Vec<String>,
+    pub year: Option<String>,
+    pub journal: Option<String>,
+    pub doi: Option<String>,
+    pub keywords: Vec<String>,
+    pub abstract_text: Option<String>,
+}
+
+impl Meta {
+    /// Build Meta from the raw frontmatter key/value pairs (keys are
+    /// already lowercased by `parse_simple_yaml`).
+    pub fn from_pairs(pairs: &[(String, YVal)]) -> Meta {
+        let mut m = Meta::default();
+        for (k, v) in pairs {
+            match (k.as_str(), v) {
+                ("title", YVal::S(s)) => m.title = Some(s.clone()),
+                ("abstract" | "summary", YVal::S(s)) => m.abstract_text = Some(s.clone()),
+                ("keywords" | "keyword" | "author_keywords", YVal::L(l)) => {
+                    m.keywords = l.clone();
+                }
+                ("keywords" | "keyword" | "author_keywords", YVal::S(s)) => {
+                    m.keywords = s
+                        .split(',')
+                        .map(|x| x.trim().to_string())
+                        .filter(|x| !x.is_empty())
+                        .collect();
+                }
+                ("authors" | "author" | "creators", YVal::L(l)) => m.authors = l.clone(),
+                ("authors" | "author" | "creators", YVal::S(s)) => {
+                    m.authors = s
+                        .split(',')
+                        .map(|x| x.trim().to_string())
+                        .filter(|x| !x.is_empty())
+                        .collect();
+                }
+                ("year", YVal::S(s)) => m.year = Some(s.clone()),
+                ("journal", YVal::S(s)) => m.journal = Some(s.clone()),
+                ("doi", YVal::S(s)) => m.doi = Some(s.clone()),
+                _ => {}
+            }
+        }
+        m
+    }
+}
+
 pub struct Paper {
     pub title: Option<String>,
-    sections: [Option<String>; 4],
+    full_text: String,
     lower_sections: [Option<Vec<u8>>; 4],
     lower_full: Vec<u8>,
 }
@@ -199,7 +249,36 @@ impl Paper {
             sections[2].as_ref().map(|s| lower_ascii(s.as_bytes())),
             sections[3].as_ref().map(|s| lower_ascii(s.as_bytes())),
         ];
-        Paper { title, sections, lower_sections, lower_full }
+        Paper { title, lower_full, lower_sections, full_text: full }
+    }
+
+    /// Parse text and also return the frontmatter metadata (web server).
+    pub fn from_text_with_meta(text: &str) -> (Paper, Meta) {
+        let (pairs, _) = parse_frontmatter(text);
+        let meta = Meta::from_pairs(&pairs);
+        (Paper::from_text(text), meta)
+    }
+
+    /// Build a Paper straight from field sections (web form input, no YAML
+    /// round-trip), with the same fallback semantics as `from_text`: fields
+    /// that are missing fall back to the joined full text.
+    pub fn from_sections(sections: [Option<String>; 4]) -> Paper {
+        let full = sections.iter().flatten().cloned().collect::<Vec<_>>().join("\n");
+        let lower_full = lower_ascii(full.as_bytes());
+        let lower_sections = [
+            sections[0].as_ref().map(|s| lower_ascii(s.as_bytes())),
+            sections[1].as_ref().map(|s| lower_ascii(s.as_bytes())),
+            sections[2].as_ref().map(|s| lower_ascii(s.as_bytes())),
+            sections[3].as_ref().map(|s| lower_ascii(s.as_bytes())),
+        ];
+        let title = sections[F_TITLE as usize].clone();
+        Paper { title, lower_full, lower_sections, full_text: full }
+    }
+
+    /// Original (un-lowercased) full text; byte offsets in it are 1:1 with
+    /// `text_lower(F_ANY)` because ASCII lowercasing preserves length.
+    pub fn full_text(&self) -> &str {
+        &self.full_text
     }
 
     /// Lowercased text for a field id (falls back to full text).

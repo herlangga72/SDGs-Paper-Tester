@@ -1,8 +1,9 @@
 # Zero-Cost Deployment
 
-This app is pure Python **standard library** (no pip installs) and runs as a
-plain HTTP server, which makes it trivially deployable on free tiers. All
-options below cost **$0.00** and need **no credit card**.
+The app runs as a plain HTTP server with a self-contained Rust binary
+(SIMD-accelerated matching) and needs no runtime package installs, which
+makes it trivially deployable on free tiers. All options below cost
+**$0.00** and need **no credit card**.
 
 > **Note (2026):** Hugging Face now requires a **PRO subscription** to host
 > Docker/Gradio Spaces on the free tier (static Spaces only are free), so HF
