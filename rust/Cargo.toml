@@ -2,7 +2,7 @@
 name = "sdg_tools"
 version = "0.2.0"
 edition = "2021"
-description = "Parse Scopus SDG query files, match papers against them, and serve the web app — Rust, SIMD (AVX2)"
+description = "Parse Scopus SDG query files, match papers against them, and serve the web app — Rust, SIMD (AVX-512/AVX2/SSE3–SSE4.2)"
 license = "GPL-3.0-or-later"
 
 # The engine (lib) is dependency-free; only the `web` binary pulls in an
