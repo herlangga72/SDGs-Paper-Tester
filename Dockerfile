@@ -17,7 +17,10 @@ FROM rust:1.97-slim-bookworm AS build
 WORKDIR /build
 
 # Fetch dependencies first (layer-cached, and cached by the registry mount).
+# A stub src/lib.rs satisfies cargo's manifest check; the real sources are
+# copied in below and overwrite it.
 COPY rust/Cargo.toml rust/Cargo.lock ./
+RUN mkdir -p src && touch src/lib.rs
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo fetch
 
@@ -27,9 +30,12 @@ ENV CARGO_PROFILE_RELEASE_LTO=thin \
     CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
     CARGO_PROFILE_RELEASE_STRIP=symbols
 
+# The target dir lives on a cache mount for incremental builds; BuildKit
+# cannot snapshot a mount into a layer, so COPY it into a plain path first.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
-    cargo build --release --bin web
+    cargo build --release --bin web && \
+    cp /build/target/release/web /build/web-bin
 
 FROM debian:bookworm-slim
 
@@ -42,7 +48,7 @@ COPY LICENSE .
 
 # The Rust web server (queries are parsed from engine/data/queries at boot,
 # which takes <10 ms with the SIMD tokenizer — no build-time DB step needed).
-COPY --from=build /build/target/release/web /usr/local/bin/sdg-web
+COPY --from=build /build/web-bin /usr/local/bin/sdg-web
 
 # Copy the entrypoint that honors the platform-assigned $PORT
 # (Render injects $PORT; Hugging Face Spaces expects 7860 by default).

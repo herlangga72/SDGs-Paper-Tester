@@ -1,9 +1,10 @@
 # Zero-Cost Deployment
 
 The app runs as a plain HTTP server with a self-contained Rust binary
-(SIMD-accelerated matching) and needs no runtime package installs, which
-makes it trivially deployable on free tiers. All options below cost
-**$0.00** and need **no credit card**.
+(SIMD-accelerated matching: AVX-512 / AVX2 / SSE3–SSE4.2 with runtime
+dispatch) and needs no runtime package installs, which makes it trivially
+deployable on free tiers. All options below cost **$0.00** and need **no
+credit card**.
 
 > **Note (2026):** Hugging Face now requires a **PRO subscription** to host
 > Docker/Gradio Spaces on the free tier (static Spaces only are free), so HF
@@ -15,9 +16,17 @@ makes it trivially deployable on free tiers. All options below cost
 | **Render** free tier | $0 (750 h/month) | after 15 min idle, cold start ~1 min | **low — recommended** |
 | **PythonAnywhere** free | $0 | **never (always on)** | medium (WSGI, included) |
 
-The Dockerfile builds the SQLite query DB into the image, so first requests
-are fast. The DOI auto-fill (Crossref) works on both — outbound HTTPS is
-allowed.
+The Dockerfile builds with BuildKit cache mounts (cargo registry + target
+dir) so incremental rebuilds on Render are fast, and thin LTO + symbol
+stripping keep the image small for quick cold starts. All 17 SDG query
+patterns are precompiled once at boot (~20 ms), so each request only does
+the search work. The DOI auto-fill (Crossref) works on both — outbound
+HTTPS is allowed.
+
+**API:** besides the HTML form at `POST /match`, scripts can use
+`POST /api/match` with the same urlencoded/multipart fields to get a JSON
+report (`{ms, sdgs: [{sdg, matched, near, near_total, excluded}]}`).
+Responses are gzip-compressed when the client sends `Accept-Encoding: gzip`.
 
 ---
 
