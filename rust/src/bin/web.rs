@@ -29,7 +29,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
 // SDG metadata (official UN short names + brand colors)
@@ -649,7 +649,7 @@ fn kw_tags(entries: &[(String, String)], cls: &str, max_kw: usize) -> String {
     out
 }
 
-fn render_results(report: &[SdgReport], paper: &Paper, meta: &Meta) -> String {
+fn render_results(report: &[SdgReport], paper: &Paper, meta: &Meta, ms: f64) -> String {
     let mut meta_parts: Vec<String> = Vec::new();
     if let Some(t) = &meta.title {
         meta_parts.push(format!("<b>{}</b>", esc(t)));
@@ -706,10 +706,11 @@ fn render_results(report: &[SdgReport], paper: &Paper, meta: &Meta) -> String {
 
     let stat = format!(
         "<div class=\"stat\"><b>{}</b> of <b>17</b> SDGs matched · <b>{}</b> near misses · \
-         <b>{}</b> with excluded terms found</div>",
+         <b>{}</b> with excluded terms found · processed in <b>{:.1}</b> ms</div>",
         matched_sdgs.len(),
         near_sdgs.len(),
-        ex_sdgs.len()
+        ex_sdgs.len(),
+        ms
     );
 
     let mut cards = String::new();
@@ -1072,23 +1073,28 @@ struct Resp {
     reason: &'static str,
     ctype: String,
     body: Vec<u8>,
+    headers: Vec<(String, String)>,
 }
 
 impl Resp {
     fn html(code: u16, body: String) -> Resp {
-        Resp { code, reason: "OK", ctype: "text/html; charset=utf-8".into(), body: body.into_bytes() }
+        Resp { code, reason: "OK", ctype: "text/html; charset=utf-8".into(), body: body.into_bytes(), headers: Vec::new() }
     }
     fn json(code: u16, body: String) -> Resp {
-        Resp { code, reason: "OK", ctype: "application/json; charset=utf-8".into(), body: body.into_bytes() }
+        Resp { code, reason: "OK", ctype: "application/json; charset=utf-8".into(), body: body.into_bytes(), headers: Vec::new() }
     }
     fn text(code: u16, body: &str) -> Resp {
-        Resp { code, reason: "OK", ctype: "text/plain; charset=utf-8".into(), body: body.as_bytes().to_vec() }
+        Resp { code, reason: "OK", ctype: "text/plain; charset=utf-8".into(), body: body.as_bytes().to_vec(), headers: Vec::new() }
     }
     fn bytes(code: u16, body: Vec<u8>, ctype: &str) -> Resp {
-        Resp { code, reason: "OK", ctype: ctype.into(), body }
+        Resp { code, reason: "OK", ctype: ctype.into(), body, headers: Vec::new() }
     }
     fn not_found() -> Resp {
-        Resp { code: 404, reason: "Not Found", ctype: "text/plain; charset=utf-8".into(), body: b"not found".to_vec() }
+        Resp { code: 404, reason: "Not Found", ctype: "text/plain; charset=utf-8".into(), body: b"not found".to_vec(), headers: Vec::new() }
+    }
+    fn with_header(mut self, name: &str, value: &str) -> Resp {
+        self.headers.push((name.to_string(), value.to_string()));
+        self
     }
 }
 
@@ -1145,6 +1151,7 @@ fn route_get(path: &str, qs: &str) -> Resp {
 }
 
 fn route_match(headers: &[(String, String)], body: &[u8]) -> Resp {
+    let t0 = Instant::now();
     let ctype = headers
         .iter()
         .find(|(k, _)| k == "content-type")
@@ -1188,7 +1195,9 @@ fn route_match(headers: &[(String, String)], body: &[u8]) -> Resp {
     let top = clamp_int(fields.get("top").map(String::as_str), 3, 1, 20);
     let max_kw = clamp_int(fields.get("maxkw").map(String::as_str), 10, 1, 50);
     let report = match_report(&paper, top, max_kw);
-    Resp::html(200, render_results(&report, &paper, &meta))
+    let ms = t0.elapsed().as_secs_f64() * 1000.0;
+    Resp::html(200, render_results(&report, &paper, &meta, ms))
+        .with_header("X-Processing-Time", &format!("{ms:.1} ms"))
 }
 
 fn route(method: &str, target: &str, headers: &[(String, String)], body: &[u8]) -> Resp {
@@ -1255,17 +1264,19 @@ fn handle_conn(stream: &mut TcpStream) {
 
     let resp = route(&method, &target, &headers, &body);
     let mut out = Vec::with_capacity(resp.body.len() + 256);
-    out.extend_from_slice(
-        format!(
-            "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\
-             Cache-Control: no-store\r\n\r\n",
-            resp.code,
-            resp.reason,
-            resp.ctype,
-            resp.body.len()
-        )
-        .as_bytes(),
+    let mut head = format!(
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\
+         Cache-Control: no-store\r\n",
+        resp.code,
+        resp.reason,
+        resp.ctype,
+        resp.body.len()
     );
+    for (k, v) in &resp.headers {
+        head.push_str(&format!("{k}: {v}\r\n"));
+    }
+    head.push_str("\r\n");
+    out.extend_from_slice(head.as_bytes());
     out.extend_from_slice(&resp.body);
     let _ = stream.write_all(&out);
     eprintln!("[web] {method} {target} -> {}", resp.code);
