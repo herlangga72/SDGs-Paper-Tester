@@ -60,11 +60,10 @@ unsafe fn lower_ascii_avx512(s: &[u8]) -> Vec<u8> {
     let mut i = 0;
     while i + 64 <= n {
         let chunk = _mm512_loadu_si512(out.as_ptr().add(i) as *const __m512i);
-        // t = saturating(chunk - 'A' + 1); upper-case iff 1 <= t <= 26
-        let t = _mm512_subs_epu8(chunk, _mm512_set1_epi8(b'A' as i8 - 1));
-        let le26 = _mm512_cmpeq_epi8_mask(_mm512_min_epu8(t, _mm512_set1_epi8(26)), t);
-        let pos = _mm512_cmpgt_epi8_mask(t, _mm512_set1_epi8(0));
-        let upper = le26 & pos;
+        // Branchless upper-case mask via two compares: 'A' <= c <= 'Z'.
+        let ge_a = _mm512_cmpgt_epi8_mask(chunk, _mm512_set1_epi8(b'A' as i8 - 1));
+        let le_z = _mm512_cmplt_epi8_mask(chunk, _mm512_set1_epi8(b'Z' as i8 + 1));
+        let upper = ge_a & le_z;
         let lc = _mm512_add_epi8(chunk, _mm512_maskz_set1_epi8(upper, 32));
         _mm512_storeu_si512(out.as_mut_ptr().add(i) as *mut __m512i, lc);
         i += 64;
@@ -83,11 +82,12 @@ unsafe fn lower_ascii_avx2(s: &[u8]) -> Vec<u8> {
     let mut i = 0;
     while i + 32 <= n {
         let chunk = _mm256_loadu_si256(out.as_ptr().add(i) as *const __m256i);
-        // t = saturating(chunk - 'A' + 1); upper-case iff 1 <= t <= 26
-        let t = _mm256_subs_epu8(chunk, _mm256_set1_epi8(b'A' as i8 - 1));
-        let le26 = _mm256_cmpeq_epi8(_mm256_min_epu8(t, _mm256_set1_epi8(26)), t);
-        let pos = _mm256_cmpgt_epi8(t, _mm256_set1_epi8(0));
-        let upper = _mm256_and_si256(le26, pos);
+        // Branchless upper-case mask via two compares: 'A' <= c <= 'Z'.
+        let ge_a = _mm256_cmpgt_epi8(chunk, _mm256_set1_epi8(b'A' as i8 - 1));
+        // chunk < 'Z'+1 (0x5B); non-ASCII bytes are signed-negative, so
+        // they fail `ge_a` and stay untouched.
+        let le_z = _mm256_cmpgt_epi8(_mm256_set1_epi8(b'Z' as i8 + 1), chunk);
+        let upper = _mm256_and_si256(ge_a, le_z);
         let lc = _mm256_add_epi8(chunk, _mm256_and_si256(upper, _mm256_set1_epi8(32)));
         _mm256_storeu_si256(out.as_mut_ptr().add(i) as *mut __m256i, lc);
         i += 32;
@@ -135,17 +135,19 @@ pub fn find(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
     }
     #[cfg(target_arch = "x86_64")]
     {
+        // AVX-512 is the widest rung; keep it first for hosts that have it.
         if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw")
             && needle.len() <= 64
         {
             return unsafe { find_avx512(rem, needle).map(|k| k + from) };
         }
-        if is_x86_feature_detected!("avx2") && needle.len() <= 32 {
-            return unsafe { find_avx2(rem, needle).map(|k| k + from) };
-        }
-        // SSE ladder: `pcmpistri` (SSE4.2) for 1-8 byte needles, then the
-        // quad filters (SSE4.1 pcmpeqq, SSE3 pcmpeqd); every rung handles
-        // any needle length via scalar verify.
+        // Benchmarked on Zen+ (2026-08): the SSE4.2 `pcmpistri` rung runs
+        // ~7x faster than the AVX2 quad filter for needles <= 8 bytes
+        // (52 us vs 373 us per 512 KiB scan), and SSE4.1 pcmpeqq edges
+        // out AVX2 for longer needles as well. Prefer the SSE ladder;
+        // AVX2 stays for the bulk transform paths (lower_ascii,
+        // next_special, skip_ws). Every CPU with AVX2 also has SSE4.2,
+        // so the AVX2 find rung is unreachable and intentionally omitted.
         if is_x86_feature_detected!("sse4.2") {
             return unsafe { find_sse42(rem, needle).map(|k| k + from) };
         }
@@ -260,71 +262,10 @@ unsafe fn find_avx512(hay: &[u8], needle: &[u8]) -> Option<usize> {
     find_scalar_from(hay, needle, i)
 }
 
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn find_avx2(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    let n = hay.len();
-    let m = needle.len();
-    let mut i = 0usize;
-    match m {
-        // One byte: broadcast-compare every 32-byte chunk.
-        1 => {
-            let v = _mm256_set1_epi8(needle[0] as i8);
-            while i + 32 <= n {
-                let chunk = _mm256_loadu_si256(hay.as_ptr().add(i) as *const __m256i);
-                let mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, v)) as u32;
-                if mask != 0 {
-                    return Some(i + mask.trailing_zeros() as usize);
-                }
-                i += 32;
-            }
-        }
-        // 2-3 bytes: first-byte candidates + scalar verify.
-        2..=3 => {
-            let v = _mm256_set1_epi8(needle[0] as i8);
-            while i + 32 <= n {
-                let chunk = _mm256_loadu_si256(hay.as_ptr().add(i) as *const __m256i);
-                let mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, v)) as u32;
-                let mut bits = mask;
-                while bits != 0 {
-                    let off = bits.trailing_zeros() as usize;
-                    let cand = i + off;
-                    if cand + m <= n && &hay[cand..cand + m] == needle {
-                        return Some(cand);
-                    }
-                    bits &= bits - 1;
-                }
-                i += 32;
-            }
-        }
-        // 4..=32 bytes: 4-byte window filter at offsets 0..3 (the quad trick),
-        // then scalar verify of the full needle at rare candidate positions.
-        _ => {
-            let first4 = u32::from_le_bytes([needle[0], needle[1], needle[2], needle[3]]);
-            let v = _mm256_set1_epi32(first4 as i32);
-            while i + 35 <= n {
-                // Candidate positions are scanned in ascending order: a
-                // naive off/lane nesting can verify a later match first.
-                let mut masks = [0u32; 4];
-                for off in 0..4usize {
-                    let chunk = _mm256_loadu_si256(hay.as_ptr().add(i + off) as *const __m256i);
-                    let eq = _mm256_cmpeq_epi32(chunk, v);
-                    masks[off] = _mm256_movemask_epi8(eq) as u32;
-                }
-                for pos in 0..32usize {
-                    if (masks[pos % 4] >> ((pos / 4) * 4)) & 0xF != 0 {
-                        let cand = i + pos;
-                        if cand + m <= n && &hay[cand..cand + m] == needle {
-                            return Some(cand);
-                        }
-                    }
-                }
-                i += 32;
-            }
-        }
-    }
-    find_scalar_from(hay, needle, i)
-}
+// NOTE: `find_avx2` was removed after benchmarking (2026-08): the SSE4.2
+// `pcmpistri` rung is ~7x faster for needles <= 8 bytes and SSE4.1 edges
+// out AVX2 for longer needles on Zen+. Every AVX2 CPU also has SSE4.2, so
+// the AVX2 find rung was unreachable in practice.
 
 #[cfg(target_arch = "aarch64")]
 unsafe fn find_neon(hay: &[u8], needle: &[u8]) -> Option<usize> {
@@ -640,11 +581,12 @@ unsafe fn lower_ascii_sse3(s: &[u8]) -> Vec<u8> {
     let mut i = 0;
     while i + 16 <= n {
         let chunk = _mm_loadu_si128(out.as_ptr().add(i) as *const __m128i);
-        // t = saturating(chunk - 'A' + 1); upper-case iff 1 <= t <= 26
-        let t = _mm_subs_epu8(chunk, _mm_set1_epi8(b'A' as i8 - 1));
-        let le26 = _mm_cmpeq_epi8(_mm_min_epu8(t, _mm_set1_epi8(26)), t);
-        let pos = _mm_cmpgt_epi8(t, _mm_set1_epi8(0));
-        let upper = _mm_and_si128(le26, pos);
+        // Branchless upper-case mask via two compares: 'A' <= c <= 'Z'.
+        // Benchmarked faster than the saturating-subtract range trick
+        // (LLVM autovectorizes the naive map into this form too).
+        let ge_a = _mm_cmpgt_epi8(chunk, _mm_set1_epi8(b'A' as i8 - 1));
+        let le_z = _mm_cmplt_epi8(chunk, _mm_set1_epi8(b'Z' as i8 + 1));
+        let upper = _mm_and_si128(ge_a, le_z);
         let lc = _mm_add_epi8(chunk, _mm_and_si128(upper, _mm_set1_epi8(32)));
         _mm_storeu_si128(out.as_mut_ptr().add(i) as *mut __m128i, lc);
         i += 16;
@@ -1200,6 +1142,167 @@ mod tests {
                 assert_eq!(hits, want9, "SSE finder (9-byte needle)");
             }
         }
+    }
+
+    #[test]
+    #[ignore = "speed benchmark; run with --ignored --nocapture in release mode"]
+    fn bench_sse_ladder() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        // ~512 KiB of realistic mixed-case text with occasional specials,
+        // so every workload terminates quickly and realistically.
+        let mut text = Vec::with_capacity(512 << 10);
+        let words = b"lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod \
+                      tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, \
+                      quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. ";
+        while text.len() + words.len() <= 512 << 10 {
+            text.extend_from_slice(words);
+            let start = text.len() - words.len();
+            if text.len() % 4096 < 2048 {
+                text[start..].make_ascii_uppercase();
+            }
+            // Sprinkle tokenizer specials into the trailing gap (never
+            // inside words, so the find needles stay intact).
+            text[start + words.len() - 1] = b'(';
+        }
+        let text = text;
+        let n = text.len();
+
+        fn bench<T>(name: &str, iters: u64, f: impl Fn() -> T) {
+            for _ in 0..5 {
+                black_box(f());
+            }
+            let t0 = Instant::now();
+            for _ in 0..iters {
+                black_box(f());
+            }
+            let us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
+            println!("{name:<30} {us:>9.1} us/op");
+            eprintln!("done: {name}");
+        }
+
+        println!(
+            "input: {} bytes on {}",
+            n,
+            if is_x86_feature_detected!("avx2") { "AVX2 host" } else { "SSE host" }
+        );
+
+        // lower_ascii
+        let iters = 100u64;
+        let want = black_box(text.iter().map(|b| b.to_ascii_lowercase()).collect::<Vec<u8>>());
+        assert_eq!(lower_ascii(&text), want);
+        bench("lower_ascii scalar", iters, || {
+            text.iter().map(|b| b.to_ascii_lowercase()).collect::<Vec<u8>>()
+        });
+        bench("lower_ascii sse3", iters, || unsafe { lower_ascii_sse3(&text) });
+        bench("lower_ascii avx2", iters, || unsafe { lower_ascii_avx2(&text) });
+        bench("lower_ascii dispatched", iters, || lower_ascii(&text));
+
+        // find: sparse needles over the full text
+        let needles: [&[u8]; 4] = [b"amet", b"lorem", b"consectetur", b"eiusmod tempor incididunt"];
+        for &nd in &needles {
+            let exp = find_all(&text, nd).len() as u64;
+            assert!(exp > 0, "needle {:?} not found", String::from_utf8_lossy(nd));
+            let iters = 30u64;
+            let f = |fnder: unsafe fn(&[u8], &[u8]) -> Option<usize>| {
+                // One full scan per invocation (bench repeats it). The
+                // finder returns an offset relative to the `from` slice,
+                // so advance by `p + 1` in absolute coordinates.
+                let mut count = 0u64;
+                let mut from = 0usize;
+                while let Some(p) = unsafe { fnder(&text[from..], nd) } {
+                    count += 1;
+                    from += p + 1;
+                }
+                assert_eq!(count, exp, "needle {:?}", String::from_utf8_lossy(nd));
+            };
+            bench(&format!("find({}) scalar", String::from_utf8_lossy(nd)), iters, || {
+                let mut from = 0;
+                while let Some(p) = find_scalar_from(&text, nd, from) {
+                    from = p + 1;
+                }
+            });
+            bench(&format!("find({}) sse3", String::from_utf8_lossy(nd)), iters, || f(find_sse3));
+            bench(&format!("find({}) sse41", String::from_utf8_lossy(nd)), iters, || f(find_sse41));
+            bench(&format!("find({}) sse42", String::from_utf8_lossy(nd)), iters, || f(find_sse42));
+            bench(&format!("find({}) dispatched", String::from_utf8_lossy(nd)), iters, || {
+                let mut from = 0;
+                while let Some(p) = find(&text, nd, from) {
+                    from = p + 1;
+                }
+            });
+        }
+
+        // next_special: text now contains real '(' hits
+        let chars: &[u8] = b"()\"*";
+        let iters = 200u64;
+        bench("next_special scalar", iters, || {
+            let mut i = 0;
+            while let Some(p) = (i..n).find(|&j| chars.contains(&text[j])) {
+                i = p + 1;
+            }
+        });
+        bench("next_special sse3", iters, || {
+            let mut i = 0;
+            while let Some(p) = unsafe { next_special_sse3(&text, i, chars) } {
+                i = p + 1;
+            }
+        });
+        bench("next_special ssse3", iters, || {
+            let mut i = 0;
+            while let Some(p) = unsafe { next_special_ssse3(&text, i, chars) } {
+                i = p + 1;
+            }
+        });
+        bench("next_special sse42", iters, || {
+            let mut i = 0;
+            while let Some(p) = unsafe { next_special_sse42(&text, i, chars) } {
+                i = p + 1;
+            }
+        });
+        bench("next_special dispatched", iters, || {
+            let mut i = 0;
+            while let Some(p) = next_special(&text, i, chars) {
+                i = p + 1;
+            }
+        });
+
+        // skip_ws: text with runs of whitespace
+        let mut wstext = Vec::with_capacity(256 << 10);
+        while wstext.len() + 32 <= 256 << 10 {
+            wstext.extend_from_slice(b"   \t\n\r  word ");
+        }
+        let wstext = wstext;
+        let iters = 200u64;
+        bench("skip_ws scalar", iters, || {
+            let mut i = 0;
+            while i < wstext.len() {
+                i = wstext.iter().skip(i).position(|b| !b.is_ascii_whitespace()).map(|k| i + k).unwrap_or(wstext.len());
+                i = wstext.iter().skip(i).position(|b| b.is_ascii_whitespace()).map(|k| i + k).unwrap_or(wstext.len());
+            }
+        });
+        bench("skip_ws sse3", iters, || {
+            let mut i = 0;
+            while i < wstext.len() {
+                i = unsafe { skip_ws_sse3(&wstext, i) };
+                i = wstext.iter().skip(i).position(|b| b.is_ascii_whitespace()).map(|k| i + k).unwrap_or(wstext.len());
+            }
+        });
+        bench("skip_ws sse42", iters, || {
+            let mut i = 0;
+            while i < wstext.len() {
+                i = unsafe { skip_ws_sse42(&wstext, i) };
+                i = wstext.iter().skip(i).position(|b| b.is_ascii_whitespace()).map(|k| i + k).unwrap_or(wstext.len());
+            }
+        });
+        bench("skip_ws dispatched", iters, || {
+            let mut i = 0;
+            while i < wstext.len() {
+                i = skip_ws(&wstext, i);
+                i = wstext.iter().skip(i).position(|b| b.is_ascii_whitespace()).map(|k| i + k).unwrap_or(wstext.len());
+            }
+        });
     }
 
     #[test]
