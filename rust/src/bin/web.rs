@@ -23,7 +23,7 @@ use sdg_tools::paper::{self, Meta, Paper, F_ANY};
 use sdg_tools::query::{self, Query};
 use sdg_tools::simd::find;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -165,10 +165,13 @@ fn match_report(paper: &Paper, top: usize, max_kw: usize) -> Vec<SdgReport> {
         for (bno, block) in q.blocks.iter().enumerate() {
             let (hits, misses, ex_hits, is_match) = matcher::scan_with_fields(block, paper, table, &mut memo);
             ex.extend(ex_hits);
+            // The Scopus query files repeat terms across AND sub-groups, so
+            // dedupe by (keyword identity, field mask) before rendering.
+            let hits = dedupe_kw(hits);
             if is_match {
                 matched.push((bno, hits));
             } else {
-                near.push((bno, misses, hits.len()));
+                near.push((bno, dedupe_kw(misses), hits.len()));
             }
         }
         near.sort_by_key(|t| t.1.len()); // fewest missing keywords first
@@ -681,6 +684,16 @@ fn kw_tags<K: AsRef<str>>(entries: &[(K, u8)], cls: &str, max_kw: usize) -> Stri
 /// Mask of the default TITLE-ABS-KEY search (all four section fields).
 fn field_mask_all() -> u8 {
     (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3)
+}
+
+/// Drop repeated (keyword, field-mask) entries, keyed on the Arc string
+/// identity + mask so the same keyword in different field contexts stays.
+fn dedupe_kw(entries: Vec<(Arc<str>, u8)>) -> Vec<(Arc<str>, u8)> {
+    let mut seen: HashSet<(usize, u8)> = HashSet::with_capacity(entries.len());
+    entries
+        .into_iter()
+        .filter(|(kw, m)| seen.insert((kw.as_ptr() as *const u8 as usize, *m)))
+        .collect()
 }
 
 fn render_results(report: &[SdgReport], paper: &Paper, meta: &Meta, ms: f64) -> String {
