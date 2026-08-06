@@ -153,7 +153,7 @@ impl Parser {
                     kw.push(' ');
                     kw.push_str(&v);
                 }
-                Ok(Node::Leaf { keyword: kw, exact: ex })
+                Ok(Node::Leaf { keyword: kw, exact: ex, pid: u32::MAX })
             }
             other => Err(ParseError::new(format!("unexpected token {other:?}"), self.pos)),
         }
@@ -187,7 +187,7 @@ mod tests {
     #[test]
     fn simple_phrase() {
         let n = parse("\"tax evasion\"").unwrap();
-        assert!(matches!(n, Node::Leaf { keyword, exact: false } if keyword == "tax evasion"));
+        assert!(matches!(n, Node::Leaf { keyword, exact: false, .. } if keyword == "tax evasion"));
     }
 
     #[test]
@@ -250,8 +250,8 @@ mod tests {
                 assert_eq!(fields, vec!["TITLE", "ABS", "KEY"]);
                 match &*child {
                     Node::Group { op, children } if op == "OR" && children.len() == 2 => {
-                        assert!(matches!(&children[0], Node::Leaf { keyword, exact: false } if keyword == "coral reef"));
-                        assert!(matches!(&children[1], Node::Leaf { keyword, exact: true } if keyword == "exact term"));
+                        assert!(matches!(&children[0], Node::Leaf { keyword, exact: false, .. } if keyword == "coral reef"));
+                        assert!(matches!(&children[1], Node::Leaf { keyword, exact: true, .. } if keyword == "exact term"));
                     }
                     other => panic!("expected OR, got {other:?}"),
                 }
@@ -322,7 +322,7 @@ mod tests {
             let n = parse(src).unwrap();
             match &n {
                 Node::Field { child, .. } => match &**child {
-                    Node::Leaf { keyword, exact } => {
+                    Node::Leaf { keyword, exact, .. } => {
                         let inner = src.split('(').nth(1).unwrap().trim_end_matches(')');
                         assert_eq!(keyword, inner, "{src}");
                         assert!(!exact, "{src}");

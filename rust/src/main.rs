@@ -9,10 +9,10 @@
 
 use sdg_tools::ast::Node;
 use sdg_tools::matcher;
-use sdg_tools::matcher::Pattern;
+
 use sdg_tools::paper::Paper;
 use sdg_tools::query::load_queries;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs;
 use std::io::Read;
 use std::path::Path;
@@ -33,7 +33,7 @@ fn usage() -> ! {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let cmd = args.first().map(String::as_str).unwrap_or("");
+    let cmd = args.first().map(AsRef::<str>::as_ref).unwrap_or("");
     let rest = &args[1..];
     let res = match cmd {
         "parse" => cmd_parse(rest),
@@ -62,7 +62,7 @@ struct Row {
 
 fn walk(node: &Node, excluded: bool, fields: &[String], sdg: &str, block_no: usize, logic: &[String], rows: &mut Vec<Row>) {
     match node {
-        Node::Leaf { keyword, exact } => rows.push(Row {
+        Node::Leaf { keyword, exact, .. } => rows.push(Row {
             sdg: sdg.to_string(),
             inc_exc: if excluded { "exclude".to_string() } else { "include".to_string() },
             where_to_look: if fields.is_empty() { String::new() } else { fields.join("-") },
@@ -207,22 +207,26 @@ fn cmd_match(args: &[String]) -> Result<(), String> {
         .unwrap_or_else(|| Path::new(&path).file_name().map_or(path.clone(), |n| n.to_string_lossy().into_owned()));
     println!("Paper: {title}\n");
 
-    let queries = load_queries(Path::new(&dir))?;
-    // Precompile every keyword once; scanning is then read-only.
-    let cache = matcher::compile_all(queries.iter().flat_map(|q| q.blocks.iter()));
+    let mut queries = load_queries(Path::new(&dir))?;
+    // Precompile every keyword once into a dense table and resolve each
+    // leaf to its pattern index; scanning is then read-only.
+    let table = matcher::compile_all(queries.iter().flat_map(|q| q.blocks.iter()));
+    for q in &mut queries {
+        matcher::resolve_blocks(&mut q.blocks, &table);
+    }
 
     for q in &queries {
         println!("=== SDG {} ===", q.sdg);
-        let mut matched: Vec<(usize, Vec<String>)> = Vec::new();
-        let mut near: Vec<(usize, Vec<String>, usize, usize)> = Vec::new();
-        let mut excluded_hits: Vec<String> = Vec::new();
+        let mut matched: Vec<(usize, Vec<std::sync::Arc<str>>)> = Vec::new();
+        let mut near: Vec<(usize, Vec<std::sync::Arc<str>>, usize, usize)> = Vec::new();
+        let mut excluded_hits: Vec<std::sync::Arc<str>> = Vec::new();
 
         for (bno, block) in q.blocks.iter().enumerate() {
-            let scan = matcher::scan_block(block, &paper, &cache);
+            let scan = matcher::scan_block(block, &paper, &table);
             excluded_hits.extend(scan.excluded_hits.iter().cloned());
             let n_hit = scan.hits.len();
             let n_miss = scan.misses.len();
-            if matcher::eval(block, None, &paper, &cache) {
+            if matcher::eval(block, None, &paper, &table) {
                 matched.push((bno, scan.hits));
             } else {
                 near.push((bno, scan.misses, n_hit, n_miss));
@@ -234,7 +238,7 @@ fn cmd_match(args: &[String]) -> Result<(), String> {
             println!("  MATCHED  none");
         } else {
             for (bno, hits) in &matched {
-                let shown: Vec<&str> = hits.iter().take(max_kw).map(String::as_str).collect();
+                let shown: Vec<&str> = hits.iter().take(max_kw).map(AsRef::<str>::as_ref).collect();
                 let more = hits.len() - shown.len();
                 println!(
                     "  MATCHED  block {bno}: {} keyword(s) hit: {}{}",
@@ -250,7 +254,7 @@ fn cmd_match(args: &[String]) -> Result<(), String> {
         } else {
             println!("  NEAR MISSES (missing keywords -> add any of these to qualify):");
             for (bno, misses, n_hit, n_miss) in near.iter().take(top) {
-                let shown: Vec<&str> = misses.iter().take(max_kw).map(String::as_str).collect();
+                let shown: Vec<&str> = misses.iter().take(max_kw).map(AsRef::<str>::as_ref).collect();
                 let more = n_miss - shown.len();
                 println!(
                     "    block {bno}: {n_hit} hit, missing {n_miss} of {}: {}{}",
@@ -262,7 +266,7 @@ fn cmd_match(args: &[String]) -> Result<(), String> {
         }
 
         if !excluded_hits.is_empty() {
-            let mut u: Vec<&str> = excluded_hits.iter().map(String::as_str).collect();
+            let mut u: Vec<&str> = excluded_hits.iter().map(AsRef::<str>::as_ref).collect();
             u.sort_unstable();
             u.dedup();
             println!("  EXCLUDED terms found in text (can disqualify a match): {}", u.join(", "));

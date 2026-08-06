@@ -1,15 +1,57 @@
 //! Paper matching: evaluate the AST against a paper, with SIMD pattern search.
 
 use crate::ast::Node;
-use crate::paper::{Paper, ALL_FIELDS, F_ABS, F_ANY, F_AUTHKEY, F_KEY, F_TITLE};
+use crate::paper::{Paper, ALL_FIELDS, F_ANY};
 use crate::simd::find;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 pub struct Pattern {
-    pub raw: String,
+    pub raw: Arc<str>,
     lower_raw: Vec<u8>,
     parts: Vec<Vec<u8>>, // literal parts split on '*' (empty if the term has '?')
     no_wildcard: bool,
+}
+
+/// Per-text presence index: every 4-byte window (quad), every 2-byte window
+/// (bigram) and every byte of a buffer. Built once per request per distinct
+/// buffer, then each pattern does O(1) set lookups to prove it *cannot*
+/// match (skipping the SIMD search entirely). Exact: no false negatives.
+pub struct TextIndex {
+    quads: std::collections::HashSet<u32>,
+    bigrams: std::collections::HashSet<u16>,
+    bytes: [bool; 256],
+}
+
+impl TextIndex {
+    pub fn build(text: &[u8]) -> TextIndex {
+        let n = text.len();
+        let mut quads = std::collections::HashSet::with_capacity(n.saturating_sub(3));
+        let mut bigrams = std::collections::HashSet::with_capacity(n.saturating_sub(1));
+        let mut bytes = [false; 256];
+        for w in text.windows(4) {
+            quads.insert(u32::from_le_bytes([w[0], w[1], w[2], w[3]]));
+        }
+        for w in text.windows(2) {
+            bigrams.insert(u16::from_le_bytes([w[0], w[1]]));
+        }
+        for &b in text {
+            bytes[b as usize] = true;
+        }
+        TextIndex { quads, bigrams, bytes }
+    }
+
+    /// True if the literal part *could* appear in the indexed text. Uses the
+    /// first 4 bytes (or fewer for short parts) which any occurrence must
+    /// contain, so a false return is a hard no.
+    pub fn could_contain(&self, part: &[u8]) -> bool {
+        match part.len() {
+            0 => true,
+            1 => self.bytes[part[0] as usize],
+            2..=3 => self.bigrams.contains(&u16::from_le_bytes([part[0], part[1]])),
+            _ => self.quads.contains(&u32::from_le_bytes([part[0], part[1], part[2], part[3]])),
+        }
+    }
 }
 
 fn compile_pattern(kw: &str) -> Pattern {
@@ -22,20 +64,20 @@ fn compile_pattern(kw: &str) -> Pattern {
     let has_q = lower.contains('?');
     if !has_star && !has_q {
         Pattern {
-            raw: kw.to_string(),
+            raw: Arc::from(kw),
             lower_raw: lower.clone().into_bytes(),
             parts: vec![lower.into_bytes()],
             no_wildcard: true,
         }
     } else if !has_q {
         Pattern {
-            raw: kw.to_string(),
+            raw: Arc::from(kw),
             lower_raw: lower.clone().into_bytes(),
             parts: lower.split('*').filter(|p| !p.is_empty()).map(|p| p.as_bytes().to_vec()).collect(),
             no_wildcard: false,
         }
     } else {
-        Pattern { raw: kw.to_string(), lower_raw: lower.into_bytes(), parts: Vec::new(), no_wildcard: false }
+        Pattern { raw: Arc::from(kw), lower_raw: lower.into_bytes(), parts: Vec::new(), no_wildcard: false }
     }
 }
 
@@ -52,21 +94,58 @@ fn collect_leaves<'a>(node: &'a Node, out: &mut Vec<&'a str>) {
     }
 }
 
-/// Precompile every keyword in a set of AST blocks. The returned map is
-/// immutable after construction, so it can be shared across requests:
-/// matching a paper used to recompile ~21k patterns per request, which
-/// dominated the per-request cost (~60 ms of the ~70 ms fixed time).
-pub fn compile_all<'a>(blocks: impl Iterator<Item = &'a Node>) -> HashMap<String, Pattern> {
-    let mut out = HashMap::new();
+/// Precompile every keyword in a set of AST blocks into a dense table.
+/// The table is immutable after construction and shared across requests;
+/// leaves are then resolved to table indices (`resolve_blocks`) so matching
+/// never hashes keyword strings. Matching a paper used to recompile ~21k
+/// patterns per request, which dominated the per-request cost.
+pub fn compile_all<'a>(blocks: impl Iterator<Item = &'a Node>) -> Vec<Pattern> {
+    let mut table: Vec<Pattern> = Vec::new();
+    let mut seen: HashMap<String, usize> = HashMap::new();
     let mut leaves = Vec::new();
     for b in blocks {
         leaves.clear();
         collect_leaves(b, &mut leaves);
         for kw in leaves.drain(..) {
-            out.entry(kw.to_string()).or_insert_with(|| compile_pattern(kw));
+            if !seen.contains_key(kw) {
+                let idx = table.len();
+                table.push(compile_pattern(kw));
+                seen.insert(kw.to_string(), idx);
+            }
         }
     }
-    out
+    table
+}
+
+/// Stamp every leaf with its pattern index in `table`. Call once at boot
+/// after `compile_all`; matching then resolves leaves by array indexing.
+pub fn resolve_blocks(blocks: &mut [Node], table: &[Pattern]) {
+    let mut map: HashMap<&str, usize> = HashMap::with_capacity(table.len());
+    for (i, p) in table.iter().enumerate() {
+        map.insert(p.raw.as_ref(), i);
+    }
+    for b in blocks {
+        resolve_node(b, &map);
+    }
+}
+
+fn resolve_node(node: &mut Node, map: &HashMap<&str, usize>) {
+    match node {
+        Node::Leaf { keyword, pid, .. } => {
+            // compile_pattern trims keywords (data artifact in SDG07), so
+            // the lookup must trim too.
+            *pid = *map
+                .get(keyword.trim())
+                .expect("leaf keyword missing from pattern table") as u32;
+        }
+        Node::Field { child, .. } => resolve_node(child, map),
+        Node::Not { child } => resolve_node(child, map),
+        Node::Group { children, .. } => {
+            for c in children {
+                resolve_node(c, map);
+            }
+        }
+    }
 }
 
 #[inline]
@@ -120,6 +199,16 @@ fn glob_match(pat: &[u8], text: &[u8]) -> bool {
 }
 
 impl Pattern {
+    /// Cheap pre-filter: every literal part of the pattern must be present
+    /// in the indexed text, otherwise `matches` cannot succeed. Glob ('?')
+    /// patterns have no literal parts and always pass.
+    pub fn could_match(&self, idx: &TextIndex) -> bool {
+        if self.parts.is_empty() {
+            return true;
+        }
+        self.parts.iter().all(|p| idx.could_contain(p))
+    }
+
     pub fn matches(&self, text: &[u8]) -> bool {
         if self.no_wildcard {
             find_boundary(text, &self.parts[0])
@@ -176,95 +265,116 @@ fn same_buf(a: &[u8], b: &[u8]) -> bool {
     a.as_ptr() == b.as_ptr() && a.len() == b.len()
 }
 
-fn term_hit(paper: &Paper, pat: &Pattern, fields: &[u8]) -> bool {
-    // Multiple fields often resolve to the same buffer (missing sections
-    // fall back to the full text), so scan each distinct buffer once.
-    let mut bufs: [&[u8]; 4] = [&[]; 4];
-    let mut nb = 0usize;
-    for &f in fields {
-        let t = paper.text_lower(f);
-        if !bufs[..nb].iter().any(|&b| same_buf(b, t)) {
-            bufs[nb] = t;
-            nb += 1;
-        }
-    }
-    bufs[..nb].iter().any(|&t| pat.matches(t))
-}
-
 /// Per-request memo of term results, keyed by (pattern address, field mask).
 /// The same keyword appears ~4.4x across the 17 SDG query sets, so memoizing
-/// avoids re-searching the text for every duplicated leaf.
-pub struct Memo(HashMap<(usize, u8), bool>);
+/// avoids re-searching the text for every duplicated leaf. Also caches the
+/// per-buffer `TextIndex` (built once per distinct buffer) used to prove
+/// most patterns cannot match before running a SIMD search.
+pub struct Memo {
+    terms: HashMap<(usize, u8), bool>,
+    indexes: HashMap<(usize, usize), TextIndex>,
+}
 
 impl Memo {
     pub fn new() -> Memo {
-        Memo(HashMap::new())
+        Memo { terms: HashMap::new(), indexes: HashMap::new() }
+    }
+
+    fn index(&mut self, buf: &[u8]) -> &TextIndex {
+        let key = (buf.as_ptr() as usize, buf.len());
+        self.indexes.entry(key).or_insert_with(|| TextIndex::build(buf))
     }
 
     fn term_hit(&mut self, paper: &Paper, pat: &Pattern, fields: &[u8]) -> bool {
-        let mut mask = 0u8;
-        for &f in fields {
-            mask |= 1 << (f & 7);
-        }
+        let mask = field_mask(fields);
         let key = (pat as *const Pattern as usize, mask);
-        if let Some(&v) = self.0.get(&key) {
+        if let Some(&v) = self.terms.get(&key) {
             return v;
         }
-        let v = term_hit(paper, pat, fields);
-        self.0.insert(key, v);
+        // Multiple fields often resolve to the same buffer (missing sections
+        // fall back to the full text), so scan each distinct buffer once.
+        let mut bufs: [&[u8]; 4] = [&[]; 4];
+        let mut nb = 0usize;
+        for &f in fields {
+            let t = paper.text_lower(f);
+            if !bufs[..nb].iter().any(|&b| same_buf(b, t)) {
+                bufs[nb] = t;
+                nb += 1;
+            }
+        }
+        let mut v = false;
+        for &b in &bufs[..nb] {
+            // Filter first: if a literal part of the pattern is absent from
+            // this buffer, the SIMD search is guaranteed to fail.
+            if pat.could_match(self.index(b)) && pat.matches(b) {
+                v = true;
+                break;
+            }
+        }
+        self.terms.insert(key, v);
         v
     }
 }
 
-fn pat<'a>(cache: &'a HashMap<String, Pattern>, kw: &str) -> &'a Pattern {
-    // Callers are expected to precompile via `compile_all` (the web server
-    // does this once at boot); a missing keyword is a programming error.
-    cache
-        .get(kw)
-        .expect("keyword not found in precompiled pattern cache")
+fn pat<'a>(table: &'a [Pattern], node: &Node) -> &'a Pattern {
+    match node {
+        Node::Leaf { pid, .. } => &table[*pid as usize],
+        _ => unreachable!("pat called on non-leaf"),
+    }
 }
 
 /// Boolean evaluation of the AST against the paper (Scopus semantics:
 /// NOT > AND/W-n > OR; W/n requires presence only).
-pub fn eval(node: &Node, fields: Option<&[u8]>, paper: &Paper, cache: &HashMap<String, Pattern>) -> bool {
+pub fn eval(node: &Node, fields: Option<&[u8]>, paper: &Paper, table: &[Pattern]) -> bool {
+    let mut memo = Memo::new();
+    eval_memo(node, fields, paper, table, &mut memo)
+}
+
+fn eval_memo(
+    node: &Node,
+    fields: Option<&[u8]>,
+    paper: &Paper,
+    table: &[Pattern],
+    memo: &mut Memo,
+) -> bool {
     match node {
-        Node::Leaf { keyword, .. } => {
-            let p = pat(cache, keyword);
-            term_hit(paper, p, fields.unwrap_or(&ALL_FIELDS))
+        Node::Leaf { .. } => {
+            let p = pat(table, node);
+            memo.term_hit(paper, p, fields.unwrap_or(&ALL_FIELDS))
         }
-        Node::Field { fields: fs, child } => eval(child, Some(&field_ids(fs)), paper, cache),
-        Node::Not { child } => !eval(child, fields, paper, cache),
+        Node::Field { fields: fs, child } => eval_memo(child, Some(&field_ids(fs)), paper, table, memo),
+        Node::Not { child } => !eval_memo(child, fields, paper, table, memo),
         Node::Group { op, children } => {
             if op == "OR" {
-                children.iter().any(|c| eval(c, fields, paper, cache))
+                children.iter().any(|c| eval_memo(c, fields, paper, table, memo))
             } else {
-                children.iter().all(|c| eval(c, fields, paper, cache))
+                children.iter().all(|c| eval_memo(c, fields, paper, table, memo))
             }
         }
     }
 }
 
 pub struct BlockScan {
-    pub hits: Vec<String>,
-    pub misses: Vec<String>,
-    pub excluded_hits: Vec<String>,
+    pub hits: Vec<Arc<str>>,
+    pub misses: Vec<Arc<str>>,
+    pub excluded_hits: Vec<Arc<str>>,
+}
+
+/// Compact mask of a field list (bit 0-3 = TITLE/ABS/KEY/AUTHKEY, bit 7 = ANY).
+fn field_mask(fields: &[u8]) -> u8 {
+    let mut mask = 0u8;
+    for &f in fields {
+        mask |= 1 << (f & 7);
+    }
+    mask
 }
 
 /// Per-keyword detail for a block: include terms hit/missed, excluded terms hit.
-pub fn scan_block(block: &Node, paper: &Paper, cache: &HashMap<String, Pattern>) -> BlockScan {
+pub fn scan_block(block: &Node, paper: &Paper, table: &[Pattern]) -> BlockScan {
     let mut out = BlockScan { hits: Vec::new(), misses: Vec::new(), excluded_hits: Vec::new() };
-    rec(block, None, false, paper, cache, &mut out);
+    let mut memo = Memo::new();
+    rec(block, None, false, paper, table, &mut memo, &mut out);
     out
-}
-
-fn field_name(f: u8) -> &'static str {
-    match f {
-        F_TITLE => "TITLE",
-        F_ABS => "ABS",
-        F_KEY => "KEY",
-        F_AUTHKEY => "AUTHKEY",
-        _ => "TITLE-ABS-KEY",
-    }
 }
 
 /// Like `scan_block`, but each hit/miss also carries the field(s) the term is
@@ -278,13 +388,13 @@ fn field_name(f: u8) -> &'static str {
 pub fn scan_with_fields(
     block: &Node,
     paper: &Paper,
-    cache: &HashMap<String, Pattern>,
+    table: &[Pattern],
     memo: &mut Memo,
-) -> (Vec<(String, String)>, Vec<(String, String)>, Vec<String>, bool) {
+) -> (Vec<(Arc<str>, u8)>, Vec<(Arc<str>, u8)>, Vec<Arc<str>>, bool) {
     let mut hits = Vec::new();
     let mut misses = Vec::new();
     let mut ex_hits = Vec::new();
-    let matched = rec_fields(block, None, false, paper, cache, memo, &mut hits, &mut misses, &mut ex_hits);
+    let matched = rec_fields(block, None, false, paper, table, memo, &mut hits, &mut misses, &mut ex_hits);
     (hits, misses, ex_hits, matched)
 }
 
@@ -293,47 +403,45 @@ fn rec_fields(
     fields: Option<&[u8]>,
     excluded: bool,
     paper: &Paper,
-    cache: &HashMap<String, Pattern>,
+    table: &[Pattern],
     memo: &mut Memo,
-    hits: &mut Vec<(String, String)>,
-    misses: &mut Vec<(String, String)>,
-    ex_hits: &mut Vec<String>,
+    hits: &mut Vec<(Arc<str>, u8)>,
+    misses: &mut Vec<(Arc<str>, u8)>,
+    ex_hits: &mut Vec<Arc<str>>,
 ) -> bool {
     match node {
-        Node::Leaf { keyword, .. } => {
-            let p = pat(cache, keyword);
+        Node::Leaf { .. } => {
+            let p = pat(table, node);
             let found = memo.term_hit(paper, p, fields.unwrap_or(&ALL_FIELDS));
-            let fname = fields.map_or(String::new(), |f| {
-                f.iter().map(|&x| field_name(x)).collect::<Vec<_>>().join(",")
-            });
+            let mask = field_mask(fields.unwrap_or(&ALL_FIELDS));
             if excluded {
                 if found {
-                    ex_hits.push(keyword.clone());
+                    ex_hits.push(p.raw.clone());
                 }
             } else if found {
-                hits.push((keyword.clone(), fname));
+                hits.push((p.raw.clone(), mask));
             } else {
-                misses.push((keyword.clone(), fname));
+                misses.push((p.raw.clone(), mask));
             }
             found
         }
         Node::Field { fields: fs, child } => {
-            rec_fields(child, Some(&field_ids(fs)), excluded, paper, cache, memo, hits, misses, ex_hits)
+            rec_fields(child, Some(&field_ids(fs)), excluded, paper, table, memo, hits, misses, ex_hits)
         }
         Node::Not { child } => {
-            !rec_fields(child, fields, !excluded, paper, cache, memo, hits, misses, ex_hits)
+            !rec_fields(child, fields, !excluded, paper, table, memo, hits, misses, ex_hits)
         }
         Node::Group { op, children } => {
             if op == "OR" {
                 let mut acc = false;
                 for c in children {
-                    acc |= rec_fields(c, fields, excluded, paper, cache, memo, hits, misses, ex_hits);
+                    acc |= rec_fields(c, fields, excluded, paper, table, memo, hits, misses, ex_hits);
                 }
                 acc
             } else {
                 let mut acc = true;
                 for c in children {
-                    acc &= rec_fields(c, fields, excluded, paper, cache, memo, hits, misses, ex_hits);
+                    acc &= rec_fields(c, fields, excluded, paper, table, memo, hits, misses, ex_hits);
                 }
                 acc
             }
@@ -341,33 +449,55 @@ fn rec_fields(
     }
 }
 
+/// Human-readable field names for a mask ('' = default TITLE-ABS-KEY).
+pub fn field_names(mask: u8) -> String {
+    if mask == 0 || mask == field_mask(&ALL_FIELDS) {
+        return String::new();
+    }
+    if mask == 1 << (F_ANY & 7) {
+        return "TITLE-ABS-KEY".to_string();
+    }
+    let mut out = String::new();
+    for (bit, name) in [(0u8, "TITLE"), (1, "ABS"), (2, "KEY"), (3, "AUTHKEY")] {
+        if mask & (1 << bit) != 0 {
+            if !out.is_empty() {
+                out.push(',');
+            }
+            out.push_str(name);
+        }
+    }
+    out
+}
+
+
 fn rec(
     node: &Node,
     fields: Option<&[u8]>,
     excluded: bool,
     paper: &Paper,
-    cache: &HashMap<String, Pattern>,
+    table: &[Pattern],
+    memo: &mut Memo,
     out: &mut BlockScan,
 ) {
     match node {
-        Node::Leaf { keyword, .. } => {
-            let p = pat(cache, keyword);
-            let found = term_hit(paper, p, fields.unwrap_or(&ALL_FIELDS));
+        Node::Leaf { .. } => {
+            let p = pat(table, node);
+            let found = memo.term_hit(paper, p, fields.unwrap_or(&ALL_FIELDS));
             if excluded {
                 if found {
-                    out.excluded_hits.push(keyword.clone());
+                    out.excluded_hits.push(p.raw.clone());
                 }
             } else if found {
-                out.hits.push(keyword.clone());
+                out.hits.push(p.raw.clone());
             } else {
-                out.misses.push(keyword.clone());
+                out.misses.push(p.raw.clone());
             }
         }
-        Node::Field { fields: fs, child } => rec(child, Some(&field_ids(fs)), excluded, paper, cache, out),
-        Node::Not { child } => rec(child, fields, !excluded, paper, cache, out),
+        Node::Field { fields: fs, child } => rec(child, Some(&field_ids(fs)), excluded, paper, table, memo, out),
+        Node::Not { child } => rec(child, fields, !excluded, paper, table, memo, out),
         Node::Group { children, .. } => {
             for c in children {
-                rec(c, fields, excluded, paper, cache, out);
+                rec(c, fields, excluded, paper, table, memo, out);
             }
         }
     }

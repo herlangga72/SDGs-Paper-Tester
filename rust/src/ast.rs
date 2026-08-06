@@ -3,7 +3,9 @@
 #[derive(Debug, Clone)]
 pub enum Node {
     /// A single search term: `"tax evasion"`, `cereal*`, `{BEPS}`.
-    Leaf { keyword: String, exact: bool },
+    /// `pid` is the index of the precompiled pattern in the global table
+    /// (`u32::MAX` until `matcher::resolve_blocks` runs at boot).
+    Leaf { keyword: String, exact: bool, pid: u32 },
     /// Field prefix wrapping a sub-expression: `TITLE-ABS-KEY(...)`.
     Field { fields: Vec<String>, child: Box<Node> },
     /// `OR`, `AND` or a proximity operator (`W/4`, ...).

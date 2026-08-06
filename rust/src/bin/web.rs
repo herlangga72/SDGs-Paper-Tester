@@ -28,7 +28,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
@@ -99,30 +99,41 @@ fn queries_dir() -> PathBuf {
 // a few ms here thanks to the SIMD matcher)
 // ---------------------------------------------------------------------------
 
-static QUERIES: OnceLock<Vec<Query>> = OnceLock::new();
-static PATTERNS: OnceLock<HashMap<String, Pattern>> = OnceLock::new();
+static APP: OnceLock<(Vec<Query>, Vec<Pattern>)> = OnceLock::new();
 
-fn get_queries() -> &'static Vec<Query> {
-    QUERIES.get_or_init(|| match query::load_queries(&queries_dir()) {
-        Ok(q) => q,
-        Err(e) => {
-            eprintln!("[web] warning: could not load queries: {e}");
-            Vec::new()
+fn app() -> &'static (Vec<Query>, Vec<Pattern>) {
+    APP.get_or_init(|| {
+        let mut queries = match query::load_queries(&queries_dir()) {
+            Ok(q) => q,
+            Err(e) => {
+                eprintln!("[web] warning: could not load queries: {e}");
+                Vec::new()
+            }
+        };
+        let t = Instant::now();
+        // Precompile every keyword once into a dense table and stamp each
+        // AST leaf with its pattern index; matching then never hashes
+        // keyword strings. (Previously ~21k patterns were recompiled per
+        // request, which dominated the per-request cost.)
+        let table = matcher::compile_all(queries.iter().flat_map(|q| q.blocks.iter()));
+        for q in &mut queries {
+            matcher::resolve_blocks(&mut q.blocks, &table);
         }
+        eprintln!(
+            "[web] precompiled {} patterns in {:.1} ms",
+            table.len(),
+            t.elapsed().as_secs_f64() * 1000.0
+        );
+        (queries, table)
     })
 }
 
-/// Pattern cache built once at boot and shared across all requests (read-only).
-/// Precompiling here (instead of per request) removed the dominant per-request
-/// cost: ~21k keywords were being recompiled every time a paper was matched.
-fn get_patterns() -> &'static HashMap<String, Pattern> {
-    PATTERNS.get_or_init(|| {
-        let q = get_queries();
-        let t = Instant::now();
-        let pats = matcher::compile_all(q.iter().flat_map(|query| query.blocks.iter()));
-        eprintln!("[web] precompiled {} patterns in {:.1} ms", pats.len(), t.elapsed().as_secs_f64() * 1000.0);
-        pats
-    })
+fn get_queries() -> &'static Vec<Query> {
+    &app().0
+}
+
+fn get_patterns() -> &'static Vec<Pattern> {
+    &app().1
 }
 
 // ---------------------------------------------------------------------------
@@ -131,10 +142,10 @@ fn get_patterns() -> &'static HashMap<String, Pattern> {
 
 struct SdgReport {
     sdg: String,
-    matched: Vec<(usize, Vec<(String, String)>)>,
-    near: Vec<(usize, Vec<(String, String)>, usize)>,
+    matched: Vec<(usize, Vec<(Arc<str>, u8)>)>,
+    near: Vec<(usize, Vec<(Arc<str>, u8)>, usize)>,
     near_total: usize,
-    excluded: Vec<String>,
+    excluded: Vec<Arc<str>>,
     max_kw: usize,
 }
 
@@ -142,7 +153,7 @@ struct SdgReport {
 /// once at boot), and each block is scanned in a single traversal that also
 /// yields the boolean verdict.
 fn match_report(paper: &Paper, top: usize, max_kw: usize) -> Vec<SdgReport> {
-    let cache = get_patterns();
+    let table = get_patterns();
     // One memo per request: keywords repeated across SDG blocks (~4.4x in
     // the corpus) are evaluated once instead of once per occurrence.
     let mut memo = matcher::Memo::new();
@@ -150,9 +161,9 @@ fn match_report(paper: &Paper, top: usize, max_kw: usize) -> Vec<SdgReport> {
     for q in get_queries() {
         let mut matched = Vec::new();
         let mut near = Vec::new();
-        let mut ex: Vec<String> = Vec::new();
+        let mut ex: Vec<Arc<str>> = Vec::new();
         for (bno, block) in q.blocks.iter().enumerate() {
-            let (hits, misses, ex_hits, is_match) = matcher::scan_with_fields(block, paper, cache, &mut memo);
+            let (hits, misses, ex_hits, is_match) = matcher::scan_with_fields(block, paper, table, &mut memo);
             ex.extend(ex_hits);
             if is_match {
                 matched.push((bno, hits));
@@ -328,10 +339,10 @@ fn hl_term_spans(lower: &[u8], kw: &str) -> Vec<(usize, usize)> {
     spans
 }
 
-fn highlight(lower: &[u8], orig: &str, terms: &[String]) -> String {
+fn highlight(lower: &[u8], orig: &str, terms: &[impl AsRef<str>]) -> String {
     let mut spans: Vec<(usize, usize)> = Vec::new();
     for t in terms {
-        spans.extend(hl_term_spans(lower, t));
+        spans.extend(hl_term_spans(lower, t.as_ref()));
     }
     if spans.is_empty() {
         return esc(orig);
@@ -645,18 +656,18 @@ fn fetch_doi(doi: &str) -> Result<String, (u16, String)> {
 // HTML rendering of the match report
 // ---------------------------------------------------------------------------
 
-fn kw_tags(entries: &[(String, String)], cls: &str, max_kw: usize) -> String {
+fn kw_tags<K: AsRef<str>>(entries: &[(K, u8)], cls: &str, max_kw: usize) -> String {
     if entries.is_empty() {
         return "<span class=\"none\">none</span>".to_string();
     }
     let mut out = String::new();
-    for (kw, fields) in entries.iter().take(max_kw) {
-        let field = if fields.is_empty() {
+    for (kw, mask) in entries.iter().take(max_kw) {
+        let field = if *mask == 0 || *mask == field_mask_all() {
             String::new()
         } else {
-            format!("<span class=\"field\">[{fields}]</span>")
+            format!("<span class=\"field\">[{}]</span>", matcher::field_names(*mask))
         };
-        out.push_str(&format!("<span class=\"kw {cls}\">{}{field}</span>", esc(kw)));
+        out.push_str(&format!("<span class=\"kw {cls}\">{}{field}</span>", esc(kw.as_ref())));
     }
     if entries.len() > max_kw {
         out.push_str(&format!(
@@ -665,6 +676,11 @@ fn kw_tags(entries: &[(String, String)], cls: &str, max_kw: usize) -> String {
         ));
     }
     out
+}
+
+/// Mask of the default TITLE-ABS-KEY search (all four section fields).
+fn field_mask_all() -> u8 {
+    (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3)
 }
 
 fn render_results(report: &[SdgReport], paper: &Paper, meta: &Meta, ms: f64) -> String {
@@ -778,8 +794,7 @@ fn render_results(report: &[SdgReport], paper: &Paper, meta: &Meta, ms: f64) -> 
         }
         if !r.excluded.is_empty() {
             body.push_str("<div class=\"block\"><h4>Excluded terms found in the text (can disqualify a match)</h4>");
-            let entries: Vec<(String, String)> =
-                r.excluded.iter().map(|k| (k.clone(), String::new())).collect();
+            let entries: Vec<(Arc<str>, u8)> = r.excluded.iter().map(|k| (k.clone(), 0)).collect();
             body.push_str(&kw_tags(&entries, "ex", r.max_kw));
             body.push_str("</div>");
         }
@@ -796,7 +811,7 @@ fn render_results(report: &[SdgReport], paper: &Paper, meta: &Meta, ms: f64) -> 
     }
 
     // highlight all matched keywords in the full paper text
-    let mut terms: Vec<String> = Vec::new();
+    let mut terms: Vec<Arc<str>> = Vec::new();
     for r in &matched_sdgs {
         for (_, hits) in &r.matched {
             for (kw, _) in hits {
@@ -1247,13 +1262,13 @@ fn api_match(headers: &[(String, String)], body: &[u8]) -> Resp {
                     let matched: Vec<serde_json::Value> = r.matched.iter().map(|(bno, hits)| {
                         serde_json::json!({
                             "block": bno,
-                            "keywords": hits.iter().map(|(kw, f)| serde_json::json!({"keyword": kw, "fields": f})).collect::<Vec<_>>(),
+                            "keywords": hits.iter().map(|(kw, f)| serde_json::json!({"keyword": kw.as_ref(), "fields": matcher::field_names(*f)})).collect::<Vec<_>>(),
                         })
                     }).collect();
                     let near: Vec<serde_json::Value> = r.near.iter().map(|(bno, misses, nh)| {
                         serde_json::json!({
                             "block": bno,
-                            "missing": misses.iter().map(|(kw, f)| serde_json::json!({"keyword": kw, "fields": f})).collect::<Vec<_>>(),
+                            "missing": misses.iter().map(|(kw, f)| serde_json::json!({"keyword": kw.as_ref(), "fields": matcher::field_names(*f)})).collect::<Vec<_>>(),
                             "hits": nh,
                         })
                     }).collect();
@@ -1262,7 +1277,7 @@ fn api_match(headers: &[(String, String)], body: &[u8]) -> Resp {
                         "matched": matched,
                         "near": near,
                         "near_total": r.near_total,
-                        "excluded": r.excluded,
+                        "excluded": r.excluded.iter().map(|e| e.as_ref()).collect::<Vec<_>>(),
                     })
                 }).collect::<Vec<_>>(),
             });
