@@ -6,8 +6,9 @@ search queries that Scopus uses for its research classification.
 Paste a paper (title / abstract / keywords), upload a file, or auto-fill from
 a DOI — and see **which SDGs the paper matches**, **which are near misses**
 (exact missing keywords to add), and **which excluded (NOT) terms** appear
-in the text. The web server and matching engine are Rust with SIMD (AVX2)
-acceleration; the Python engine is kept as a reference implementation.
+in the text. The web server and matching engine are Rust with SIMD
+acceleration (AVX-512/AVX2 on x86_64, NEON on ARM64); the Python engine is
+kept as a reference implementation.
 
 ![stack](https://img.shields.io/badge/dependencies-none-19486A)
 
@@ -29,7 +30,8 @@ sdg-paper-matcher/
     ├── src/lib.rs           #   engine modules (parser, matcher, SIMD)
     ├── src/main.rs          #   CLI: sdg_tools parse / match
     ├── src/bin/web.rs       #   HTTP server: API + report rendering (was web/app.py)
-    └── src/simd.rs          #   AVX2 lowercasing + substring search (scalar fallback)
+    └── src/simd.rs          #   AVX-512/AVX2 (x86_64) + NEON (arm64)
+                               #   lowercasing + substring search (scalar fallback)
 ```
 
 **Engine** = the brains: parses the Elsevier Scopus SDG query files into an
@@ -72,9 +74,10 @@ The legacy Python server still works if you prefer it:
   add, excluded terms found in the text, and all matched keywords
   highlighted in the paper text.
 - **Official UN colors** for the 17 SDGs throughout the UI.
-- **SIMD-accelerated matching**: AVX2 case folding and substring search
-  (with portable scalar fallback) speed up the hot paths — a paper that
-  took ~0.9 s in Python matches in ~80 ms.
+- **SIMD-accelerated matching**: case folding and substring search run on
+  AVX-512 (64-byte) then AVX2 (32-byte) vectors on x86_64 (runtime-detected)
+  and NEON (16-byte) vectors on ARM64, with a portable scalar fallback — a
+  paper that took ~0.9 s in Python matches in ~80 ms.
 - Matching semantics identical to Scopus: `NOT > AND/W-n > OR` precedence,
   whole-word matching, `*`/`?` wildcards — implemented the same way in the
   Rust engine and the reference Python engine.
