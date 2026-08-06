@@ -1,23 +1,20 @@
-//! SIMD helpers with runtime dispatch:
-//!   - x86_64: AVX-512 (64-byte vectors, `avx512f`+`avx512bw`, runtime-detected),
-//!     then AVX2 (32-byte vectors, runtime-detected), then the SSE ladder
-//!     (16-byte vectors, runtime-detected): SSE4.2 (`pcmpistri` string
-//!     instructions), SSE4.1 (`pcmpeqq` quads + `ptest`), SSSE3 (`pshufb`
-//!     nibble lookups), SSE3 (16-byte baseline), then scalar
-//!   - aarch64: NEON (16-byte vectors; baseline on ARMv8, no detection needed)
-//!   - everything else: portable scalar
+//! SIMD helpers with runtime dispatch (x86_64 only):
+//!   - AVX-512 (64-byte vectors, `avx512f`+`avx512bw`, runtime-detected),
+//!   - AVX2 (32-byte vectors, runtime-detected),
+//!   - SSE ladder (16-byte vectors, runtime-detected): SSE4.2 (`pcmpistri`
+//!     string instructions), SSE4.1 (`pcmpeqq` quads + `ptest`), SSSE3
+//!     (`pshufb` two-table membership), SSE3 (16-byte baseline),
+//!   - portable scalar fallback (non-x86_64 targets, or CPUs without SSE3)
 //!
 //! Hot paths:
-//!   - `lower_ascii`   : case folding for paper texts (range trick)
+//!   - `lower_ascii`   : case folding for paper texts (two-compare mask)
 //!   - `find`          : substring search (1-byte broadcast, 4-byte quad trick)
+//!   - `any_ws`        : whitespace scan for wildcard gap checks
 //!   - `next_special`  : quoted/braced scanning in the tokenizer
 //!   - `skip_ws`       : whitespace runs in the tokenizer
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
-
-#[cfg(target_arch = "aarch64")]
-use std::arch::aarch64::*;
 
 // ---------------------------------------------------------------------------
 // Case folding
@@ -38,11 +35,7 @@ pub fn lower_ascii(s: &[u8]) -> Vec<u8> {
             return unsafe { lower_ascii_sse3(s) };
         }
     }
-    #[cfg(target_arch = "aarch64")]
-    {
-        return unsafe { lower_ascii_neon(s) };
-    }
-    // Scalar fallback: non-SIMD targets, and x86_64 CPUs without SSE3.
+    // Scalar fallback: non-x86_64 targets, and x86_64 CPUs without SSE3.
     {
         let mut out = Vec::with_capacity(s.len());
         for &c in s {
@@ -98,28 +91,6 @@ unsafe fn lower_ascii_avx2(s: &[u8]) -> Vec<u8> {
     out
 }
 
-#[cfg(target_arch = "aarch64")]
-unsafe fn lower_ascii_neon(s: &[u8]) -> Vec<u8> {
-    let mut out = s.to_vec();
-    let n = out.len();
-    let mut i = 0;
-    while i + 16 <= n {
-        let chunk = vld1q_u8(out.as_ptr().add(i));
-        // t = saturating(chunk - 'A' + 1); upper-case iff 1 <= t <= 26
-        let t = vqsubq_u8(chunk, vdupq_n_u8(b'A' - 1));
-        let le26 = vceqq_u8(vminq_u8(t, vdupq_n_u8(26)), t);
-        let pos = vcgtq_s8(vreinterpretq_s8_u8(t), vdupq_n_s8(0));
-        let upper = vandq_u8(le26, pos);
-        let lc = vaddq_u8(chunk, vandq_u8(upper, vdupq_n_u8(32)));
-        vst1q_u8(out.as_mut_ptr().add(i), lc);
-        i += 16;
-    }
-    for c in out[i..].iter_mut() {
-        *c = c.to_ascii_lowercase();
-    }
-    out
-}
-
 // ---------------------------------------------------------------------------
 // Substring search
 // ---------------------------------------------------------------------------
@@ -158,18 +129,10 @@ pub fn find(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
             return unsafe { find_sse3(rem, needle).map(|k| k + from) };
         }
     }
-    #[cfg(target_arch = "aarch64")]
-    {
-        // NEON handles every needle length (quad filter + scalar verify).
-        return unsafe { find_neon(rem, needle).map(|k| k + from) };
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        find_scalar(rem, needle).map(|k| k + from)
-    }
+    // Scalar fallback for non-x86_64 targets.
+    find_scalar(rem, needle).map(|k| k + from)
 }
 
-#[cfg(not(target_arch = "aarch64"))]
 fn find_scalar(hay: &[u8], needle: &[u8]) -> Option<usize> {
     let (n, m) = (hay.len(), needle.len());
     if m == 0 || m > n {
@@ -267,71 +230,67 @@ unsafe fn find_avx512(hay: &[u8], needle: &[u8]) -> Option<usize> {
 // out AVX2 for longer needles on Zen+. Every AVX2 CPU also has SSE4.2, so
 // the AVX2 find rung was unreachable in practice.
 
-#[cfg(target_arch = "aarch64")]
-unsafe fn find_neon(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    let n = hay.len();
-    let m = needle.len();
-    let mut i = 0usize;
-    match m {
-        // One byte: broadcast-compare every 16-byte chunk.
-        1 => {
-            let v = vdupq_n_u8(needle[0]);
-            while i + 16 <= n {
-                let chunk = vld1q_u8(hay.as_ptr().add(i));
-                let mask = neon_movemask(vceqq_u8(chunk, v));
-                if mask != 0 {
-                    return Some(i + (mask.trailing_zeros() / 4) as usize);
-                }
-                i += 16;
-            }
+// ---------------------------------------------------------------------------
+// Whitespace scan (wildcard gap checks in the matcher)
+// ---------------------------------------------------------------------------
+
+/// True if any byte in `s` is ASCII whitespace. Used by the matcher's
+/// wildcard semantics (Scopus `*` matches within a word only), replacing a
+/// per-byte scalar scan with a SIMD compare-OR.
+pub fn any_ws(s: &[u8]) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("sse4.2") && s.len() >= 16 {
+            return unsafe { any_ws_sse42(s) };
         }
-        // 2-3 bytes: first-byte candidates + scalar verify.
-        2..=3 => {
-            let v = vdupq_n_u8(needle[0]);
-            while i + 16 <= n {
-                let chunk = vld1q_u8(hay.as_ptr().add(i));
-                let mut bits = neon_movemask(vceqq_u8(chunk, v));
-                while bits != 0 {
-                    let off = (bits.trailing_zeros() / 4) as usize;
-                    let cand = i + off;
-                    if cand + m <= n && &hay[cand..cand + m] == needle {
-                        return Some(cand);
-                    }
-                    // NEON masks use a 4-bit window per byte; clear the
-                    // whole window so the loop terminates.
-                    bits &= !(0xF << bits.trailing_zeros());
-                }
-                i += 16;
-            }
-        }
-        // 4+ bytes: 4-byte window filter at offsets 0..3 (the quad trick),
-        // then scalar verify of the full needle at rare candidate positions.
-        _ => {
-            let first4 = u32::from_le_bytes([needle[0], needle[1], needle[2], needle[3]]);
-            let v = vdupq_n_u32(first4);
-            while i + 19 <= n {
-                // Candidate positions are scanned in ascending order: a
-                // naive off/lane nesting can verify a later match first.
-                let mut masks = [0u64; 4];
-                for off in 0..4usize {
-                    let chunk = vld1q_u8(hay.as_ptr().add(i + off));
-                    let eq = vceqq_u32(vreinterpretq_u32_u8(chunk), v);
-                    // 0xFFFF per matching u32 lane, packed into 64 bits
-                    masks[off] = vget_lane_u64(vreinterpret_u64_u16(vshrn_n_u32(eq, 4)), 0);
-                }
-                for pos in 0..16usize {
-                    if (masks[pos % 4] >> ((pos / 4) * 16)) & 0xFFFF != 0 {
-                        let cand = i + pos;
-                        if cand + m <= n && &hay[cand..cand + m] == needle {
-                            return Some(cand);
-                        }
-                    }
-                }
-                i += 16;
-            }
+        if is_x86_feature_detected!("sse3") && s.len() >= 16 {
+            return unsafe { any_ws_sse3(s) };
         }
     }
-    find_scalar_from(hay, needle, i)
+    s.iter().any(|c| c.is_ascii_whitespace())
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse4.2")]
+unsafe fn any_ws_sse42(s: &[u8]) -> bool {
+    let n = s.len();
+    // EQUAL_ANY: index of the first byte IN the ws set (NUL-terminated).
+    let ws = _mm_setr_epi8(
+        b' ' as i8,
+        b'\t' as i8,
+        b'\n' as i8,
+        b'\r' as i8,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    );
+    let mut i = 0;
+    while i + 16 <= n {
+        let chunk = _mm_loadu_si128(s.as_ptr().add(i) as *const __m128i);
+        let idx = _mm_cmpistri(ws, chunk, _SIDD_UBYTE_OPS | _SIDD_CMP_EQUAL_ANY);
+        if idx < 16 {
+            return true;
+        }
+        i += 16;
+    }
+    s[i..].iter().any(|c| c.is_ascii_whitespace())
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse3")]
+unsafe fn any_ws_sse3(s: &[u8]) -> bool {
+    let n = s.len();
+    let mut i = 0;
+    while i + 16 <= n {
+        let chunk = _mm_loadu_si128(s.as_ptr().add(i) as *const __m128i);
+        let ws = _mm_cmpeq_epi8(chunk, _mm_set1_epi8(b' ' as i8));
+        let ws = _mm_or_si128(ws, _mm_cmpeq_epi8(chunk, _mm_set1_epi8(b'\t' as i8)));
+        let ws = _mm_or_si128(ws, _mm_cmpeq_epi8(chunk, _mm_set1_epi8(b'\n' as i8)));
+        let ws = _mm_or_si128(ws, _mm_cmpeq_epi8(chunk, _mm_set1_epi8(b'\r' as i8)));
+        if _mm_movemask_epi8(ws) != 0 {
+            return true;
+        }
+        i += 16;
+    }
+    s[i..].iter().any(|c| c.is_ascii_whitespace())
 }
 
 // ---------------------------------------------------------------------------
@@ -367,11 +326,7 @@ pub fn next_special(text: &[u8], from: usize, chars: &[u8]) -> Option<usize> {
             return unsafe { next_special_sse3(text, from, chars) };
         }
     }
-    #[cfg(target_arch = "aarch64")]
-    {
-        return unsafe { next_special_neon(text, from, chars) };
-    }
-    #[cfg(not(target_arch = "aarch64"))]
+    // Scalar fallback for non-x86_64 targets.
     {
         let n = text.len();
         let mut i = from;
@@ -436,30 +391,6 @@ unsafe fn next_special_avx2(text: &[u8], from: usize, chars: &[u8]) -> Option<us
     None
 }
 
-#[cfg(target_arch = "aarch64")]
-unsafe fn next_special_neon(text: &[u8], from: usize, chars: &[u8]) -> Option<usize> {
-    let n = text.len();
-    let mut i = from;
-    while i + 16 <= n {
-        let chunk = vld1q_u8(text.as_ptr().add(i));
-        let mut mask: u64 = 0;
-        for &c in chars {
-            mask |= neon_movemask(vceqq_u8(chunk, vdupq_n_u8(c)));
-        }
-        if mask != 0 {
-            return Some(i + (mask.trailing_zeros() / 4) as usize);
-        }
-        i += 16;
-    }
-    while i < n {
-        if chars.contains(&text[i]) {
-            return Some(i);
-        }
-        i += 1;
-    }
-    None
-}
-
 /// Skip a run of ASCII whitespace starting at `from`; returns first non-ws index.
 pub fn skip_ws(text: &[u8], from: usize) -> usize {
     #[cfg(target_arch = "x86_64")]
@@ -479,11 +410,7 @@ pub fn skip_ws(text: &[u8], from: usize) -> usize {
             return unsafe { skip_ws_sse3(text, from) };
         }
     }
-    #[cfg(target_arch = "aarch64")]
-    {
-        return unsafe { skip_ws_neon(text, from) };
-    }
-    #[cfg(not(target_arch = "aarch64"))]
+    // Scalar fallback for non-x86_64 targets.
     {
         let mut i = from;
         while i < text.len() && text[i].is_ascii_whitespace() {
@@ -530,30 +457,6 @@ unsafe fn skip_ws_avx2(text: &[u8], mut i: usize) -> usize {
             return i + notws.trailing_zeros() as usize;
         }
         i += 32;
-    }
-    while i < n && text[i].is_ascii_whitespace() {
-        i += 1;
-    }
-    i
-}
-
-#[cfg(target_arch = "aarch64")]
-unsafe fn skip_ws_neon(text: &[u8], mut i: usize) -> usize {
-    let n = text.len();
-    while i + 16 <= n {
-        let chunk = vld1q_u8(text.as_ptr().add(i));
-        let ws = vorrq_u8(
-            vorrq_u8(
-                vorrq_u8(vceqq_u8(chunk, vdupq_n_u8(b' ')), vceqq_u8(chunk, vdupq_n_u8(b'\t'))),
-                vceqq_u8(chunk, vdupq_n_u8(b'\n')),
-            ),
-            vceqq_u8(chunk, vdupq_n_u8(b'\r')),
-        );
-        let notws = !neon_movemask(ws);
-        if notws != 0 {
-            return i + (notws.trailing_zeros() / 4) as usize;
-        }
-        i += 16;
     }
     while i < n && text[i].is_ascii_whitespace() {
         i += 1;
@@ -898,22 +801,6 @@ unsafe fn skip_ws_sse42(text: &[u8], mut i: usize) -> usize {
         i += 1;
     }
     i
-}
-
-// ---------------------------------------------------------------------------
-// aarch64 helpers
-// ---------------------------------------------------------------------------
-
-/// Compact 64-bit match mask for a 16-byte NEON compare result.
-///
-/// Each original byte occupies a 4-bit window: byte 2k -> bits [4k, 4k+4),
-/// byte 2k+1 -> bits [4k+4, 4k+8). `trailing_zeros() / 4` recovers the
-/// index of the first matching byte.
-#[cfg(target_arch = "aarch64")]
-#[inline]
-unsafe fn neon_movemask(v: uint8x16_t) -> u64 {
-    let v = vshrn_n_u16(vreinterpretq_u16_u8(v), 4);
-    vget_lane_u64(vreinterpret_u64_u8(v), 0)
 }
 
 // ---------------------------------------------------------------------------
@@ -1303,6 +1190,32 @@ mod tests {
                 i = wstext.iter().skip(i).position(|b| b.is_ascii_whitespace()).map(|k| i + k).unwrap_or(wstext.len());
             }
         });
+    }
+
+    #[test]
+    fn any_ws_matches_scalar() {
+        let cases: [&[u8]; 7] = [
+            b"",
+            b"loremipsum",
+            b"lorem ipsum",
+            b"a\tb",
+            b"\n",
+            b"no-ws-here-123",
+            b"line1\nline2",
+        ];
+        for c in &cases {
+            let want = c.iter().any(|b| b.is_ascii_whitespace());
+            assert_eq!(any_ws(c), want, "any_ws mismatch for {:?}", String::from_utf8_lossy(c));
+        }
+        // Long inputs exercise the vector loop and its tail.
+        let long: Vec<u8> = b"abcdefgh".repeat(20); // 160 bytes, no ws
+        assert!(!any_ws(&long));
+        let mut with_ws = long.clone();
+        with_ws[150] = b'\t';
+        assert!(any_ws(&with_ws));
+        let mut ws_at_end = long.clone();
+        ws_at_end.push(b' ');
+        assert!(any_ws(&ws_at_end));
     }
 
     #[test]

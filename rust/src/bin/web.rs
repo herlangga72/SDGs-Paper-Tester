@@ -100,6 +100,7 @@ fn queries_dir() -> PathBuf {
 // ---------------------------------------------------------------------------
 
 static QUERIES: OnceLock<Vec<Query>> = OnceLock::new();
+static PATTERNS: OnceLock<HashMap<String, Pattern>> = OnceLock::new();
 
 fn get_queries() -> &'static Vec<Query> {
     QUERIES.get_or_init(|| match query::load_queries(&queries_dir()) {
@@ -108,6 +109,19 @@ fn get_queries() -> &'static Vec<Query> {
             eprintln!("[web] warning: could not load queries: {e}");
             Vec::new()
         }
+    })
+}
+
+/// Pattern cache built once at boot and shared across all requests (read-only).
+/// Precompiling here (instead of per request) removed the dominant per-request
+/// cost: ~21k keywords were being recompiled every time a paper was matched.
+fn get_patterns() -> &'static HashMap<String, Pattern> {
+    PATTERNS.get_or_init(|| {
+        let q = get_queries();
+        let t = Instant::now();
+        let pats = matcher::compile_all(q.iter().flat_map(|query| query.blocks.iter()));
+        eprintln!("[web] precompiled {} patterns in {:.1} ms", pats.len(), t.elapsed().as_secs_f64() * 1000.0);
+        pats
     })
 }
 
@@ -124,19 +138,23 @@ struct SdgReport {
     max_kw: usize,
 }
 
-/// Full report: one entry per SDG. The pattern cache is shared across all
-/// SDGs so each keyword is compiled once per request.
+/// Full report: one entry per SDG. The pattern cache is global (precompiled
+/// once at boot), and each block is scanned in a single traversal that also
+/// yields the boolean verdict.
 fn match_report(paper: &Paper, top: usize, max_kw: usize) -> Vec<SdgReport> {
-    let mut cache: HashMap<String, Pattern> = HashMap::new();
+    let cache = get_patterns();
+    // One memo per request: keywords repeated across SDG blocks (~4.4x in
+    // the corpus) are evaluated once instead of once per occurrence.
+    let mut memo = matcher::Memo::new();
     let mut out = Vec::new();
     for q in get_queries() {
         let mut matched = Vec::new();
         let mut near = Vec::new();
         let mut ex: Vec<String> = Vec::new();
         for (bno, block) in q.blocks.iter().enumerate() {
-            let (hits, misses, ex_hits) = matcher::scan_with_fields(block, paper, &mut cache);
+            let (hits, misses, ex_hits, is_match) = matcher::scan_with_fields(block, paper, cache, &mut memo);
             ex.extend(ex_hits);
-            if matcher::eval(block, None, paper, &mut cache) {
+            if is_match {
                 matched.push((bno, hits));
             } else {
                 near.push((bno, misses, hits.len()));
@@ -1150,7 +1168,16 @@ fn route_get(path: &str, qs: &str) -> Resp {
     }
 }
 
-fn route_match(headers: &[(String, String)], body: &[u8]) -> Resp {
+struct MatchOutcome {
+    paper: Paper,
+    meta: Meta,
+    report: Vec<SdgReport>,
+    ms: f64,
+}
+
+/// Parse the /match form (urlencoded or multipart), build the paper, and run
+/// the report. Shared by the HTML endpoint and the JSON API.
+fn run_match(headers: &[(String, String)], body: &[u8]) -> Result<MatchOutcome, String> {
     let t0 = Instant::now();
     let ctype = headers
         .iter()
@@ -1185,9 +1212,11 @@ fn route_match(headers: &[(String, String)], body: &[u8]) -> Resp {
             }
         }
         if text.trim().is_empty() {
-            let msg = "No paper entered — fill in the form (Title / Abstract / Keywords), \
-                       paste raw text, or upload a file.";
-            return Resp::html(200, error_box(msg));
+            return Err(
+                "No paper entered — fill in the form (Title / Abstract / Keywords), \
+                 paste raw text, or upload a file."
+                    .to_string(),
+            );
         }
         Paper::from_text_with_meta(&text)
     };
@@ -1196,8 +1225,51 @@ fn route_match(headers: &[(String, String)], body: &[u8]) -> Resp {
     let max_kw = clamp_int(fields.get("maxkw").map(String::as_str), 10, 1, 50);
     let report = match_report(&paper, top, max_kw);
     let ms = t0.elapsed().as_secs_f64() * 1000.0;
-    Resp::html(200, render_results(&report, &paper, &meta, ms))
-        .with_header("X-Processing-Time", &format!("{ms:.1} ms"))
+    Ok(MatchOutcome { paper, meta, report, ms })
+}
+
+fn route_match(headers: &[(String, String)], body: &[u8]) -> Resp {
+    match run_match(headers, body) {
+        Err(msg) => Resp::html(200, error_box(&msg)),
+        Ok(m) => Resp::html(200, render_results(&m.report, &m.paper, &m.meta, m.ms))
+            .with_header("X-Processing-Time", &format!("{:.1} ms", m.ms)),
+    }
+}
+
+/// POST /api/match — same input as /match, JSON report out (for scripts/CLI).
+fn api_match(headers: &[(String, String)], body: &[u8]) -> Resp {
+    match run_match(headers, body) {
+        Err(msg) => Resp::json(400, format!("{{\"error\":{}}}", jstr(&msg))),
+        Ok(m) => {
+            let out = serde_json::json!({
+                "ms": m.ms,
+                "sdgs": m.report.iter().map(|r| {
+                    let matched: Vec<serde_json::Value> = r.matched.iter().map(|(bno, hits)| {
+                        serde_json::json!({
+                            "block": bno,
+                            "keywords": hits.iter().map(|(kw, f)| serde_json::json!({"keyword": kw, "fields": f})).collect::<Vec<_>>(),
+                        })
+                    }).collect();
+                    let near: Vec<serde_json::Value> = r.near.iter().map(|(bno, misses, nh)| {
+                        serde_json::json!({
+                            "block": bno,
+                            "missing": misses.iter().map(|(kw, f)| serde_json::json!({"keyword": kw, "fields": f})).collect::<Vec<_>>(),
+                            "hits": nh,
+                        })
+                    }).collect();
+                    serde_json::json!({
+                        "sdg": r.sdg,
+                        "matched": matched,
+                        "near": near,
+                        "near_total": r.near_total,
+                        "excluded": r.excluded,
+                    })
+                }).collect::<Vec<_>>(),
+            });
+            Resp::json(200, out.to_string())
+                .with_header("X-Processing-Time", &format!("{:.1} ms", m.ms))
+        }
+    }
 }
 
 fn route(method: &str, target: &str, headers: &[(String, String)], body: &[u8]) -> Resp {
@@ -1208,7 +1280,37 @@ fn route(method: &str, target: &str, headers: &[(String, String)], body: &[u8]) 
     match method {
         "GET" => route_get(path, qs),
         "POST" if path == "/match" => route_match(headers, body),
+        "POST" if path == "/api/match" => api_match(headers, body),
         _ => Resp::not_found(),
+    }
+}
+
+fn accepts_gzip(headers: &[(String, String)]) -> bool {
+    headers
+        .iter()
+        .find(|(k, _)| k == "accept-encoding")
+        .map_or(false, |(_, v)| v.to_ascii_lowercase().contains("gzip"))
+}
+
+fn compressible(ctype: &str) -> bool {
+    ctype.starts_with("text/")
+        || ctype.contains("json")
+        || ctype.contains("javascript")
+        || ctype.contains("svg")
+}
+
+fn maybe_gzip(resp: &mut Resp, headers: &[(String, String)]) {
+    if resp.body.len() < 512 || !accepts_gzip(headers) || !compressible(&resp.ctype) {
+        return;
+    }
+    use std::io::Write;
+    let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    if enc.write_all(&resp.body).is_ok() {
+        if let Ok(gz) = enc.finish() {
+            resp.body = gz;
+            resp.headers.push(("Content-Encoding".into(), "gzip".into()));
+            resp.headers.push(("Vary".into(), "Accept-Encoding".into()));
+        }
     }
 }
 
@@ -1262,7 +1364,8 @@ fn handle_conn(stream: &mut TcpStream) {
     }
     body.truncate(content_length);
 
-    let resp = route(&method, &target, &headers, &body);
+    let mut resp = route(&method, &target, &headers, &body);
+    maybe_gzip(&mut resp, &headers);
     let mut out = Vec::with_capacity(resp.body.len() + 256);
     let mut head = format!(
         "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\

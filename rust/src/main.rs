@@ -208,7 +208,8 @@ fn cmd_match(args: &[String]) -> Result<(), String> {
     println!("Paper: {title}\n");
 
     let queries = load_queries(Path::new(&dir))?;
-    let mut cache: HashMap<String, Pattern> = HashMap::new();
+    // Precompile every keyword once; scanning is then read-only.
+    let cache = matcher::compile_all(queries.iter().flat_map(|q| q.blocks.iter()));
 
     for q in &queries {
         println!("=== SDG {} ===", q.sdg);
@@ -217,11 +218,11 @@ fn cmd_match(args: &[String]) -> Result<(), String> {
         let mut excluded_hits: Vec<String> = Vec::new();
 
         for (bno, block) in q.blocks.iter().enumerate() {
-            let scan = matcher::scan_block(block, &paper, &mut cache);
+            let scan = matcher::scan_block(block, &paper, &cache);
             excluded_hits.extend(scan.excluded_hits.iter().cloned());
             let n_hit = scan.hits.len();
             let n_miss = scan.misses.len();
-            if matcher::eval(block, None, &paper, &mut cache) {
+            if matcher::eval(block, None, &paper, &cache) {
                 matched.push((bno, scan.hits));
             } else {
                 near.push((bno, scan.misses, n_hit, n_miss));

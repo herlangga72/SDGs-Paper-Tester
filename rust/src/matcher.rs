@@ -39,6 +39,36 @@ fn compile_pattern(kw: &str) -> Pattern {
     }
 }
 
+fn collect_leaves<'a>(node: &'a Node, out: &mut Vec<&'a str>) {
+    match node {
+        Node::Leaf { keyword, .. } => out.push(keyword),
+        Node::Field { child, .. } => collect_leaves(child, out),
+        Node::Not { child } => collect_leaves(child, out),
+        Node::Group { children, .. } => {
+            for c in children {
+                collect_leaves(c, out);
+            }
+        }
+    }
+}
+
+/// Precompile every keyword in a set of AST blocks. The returned map is
+/// immutable after construction, so it can be shared across requests:
+/// matching a paper used to recompile ~21k patterns per request, which
+/// dominated the per-request cost (~60 ms of the ~70 ms fixed time).
+pub fn compile_all<'a>(blocks: impl Iterator<Item = &'a Node>) -> HashMap<String, Pattern> {
+    let mut out = HashMap::new();
+    let mut leaves = Vec::new();
+    for b in blocks {
+        leaves.clear();
+        collect_leaves(b, &mut leaves);
+        for kw in leaves.drain(..) {
+            out.entry(kw.to_string()).or_insert_with(|| compile_pattern(kw));
+        }
+    }
+    out
+}
+
 #[inline]
 fn is_word(c: u8) -> bool {
     c.is_ascii_alphanumeric() || c == b'_'
@@ -112,7 +142,7 @@ impl Pattern {
                     let mut p = from;
                     loop {
                         match find(text, part, p) {
-                            Some(x) if !text[from..x].iter().any(|c| c.is_ascii_whitespace()) => {
+                            Some(x) if !crate::simd::any_ws(&text[from..x]) => {
                                 from = x + part.len();
                                 break;
                             }
@@ -140,17 +170,63 @@ pub fn field_ids(fields: &[String]) -> Vec<u8> {
         .collect()
 }
 
-fn term_hit(paper: &Paper, pat: &Pattern, fields: &[u8]) -> bool {
-    fields.iter().any(|&f| pat.matches(paper.text_lower(f)))
+/// Same underlying buffer (pointer + length), used to avoid scanning the
+/// same text multiple times when several fields fall back to the full text.
+fn same_buf(a: &[u8], b: &[u8]) -> bool {
+    a.as_ptr() == b.as_ptr() && a.len() == b.len()
 }
 
-fn pat<'a>(cache: &'a mut HashMap<String, Pattern>, kw: &str) -> &'a Pattern {
-    cache.entry(kw.to_string()).or_insert_with(|| compile_pattern(kw))
+fn term_hit(paper: &Paper, pat: &Pattern, fields: &[u8]) -> bool {
+    // Multiple fields often resolve to the same buffer (missing sections
+    // fall back to the full text), so scan each distinct buffer once.
+    let mut bufs: [&[u8]; 4] = [&[]; 4];
+    let mut nb = 0usize;
+    for &f in fields {
+        let t = paper.text_lower(f);
+        if !bufs[..nb].iter().any(|&b| same_buf(b, t)) {
+            bufs[nb] = t;
+            nb += 1;
+        }
+    }
+    bufs[..nb].iter().any(|&t| pat.matches(t))
+}
+
+/// Per-request memo of term results, keyed by (pattern address, field mask).
+/// The same keyword appears ~4.4x across the 17 SDG query sets, so memoizing
+/// avoids re-searching the text for every duplicated leaf.
+pub struct Memo(HashMap<(usize, u8), bool>);
+
+impl Memo {
+    pub fn new() -> Memo {
+        Memo(HashMap::new())
+    }
+
+    fn term_hit(&mut self, paper: &Paper, pat: &Pattern, fields: &[u8]) -> bool {
+        let mut mask = 0u8;
+        for &f in fields {
+            mask |= 1 << (f & 7);
+        }
+        let key = (pat as *const Pattern as usize, mask);
+        if let Some(&v) = self.0.get(&key) {
+            return v;
+        }
+        let v = term_hit(paper, pat, fields);
+        self.0.insert(key, v);
+        v
+    }
+}
+
+fn pat<'a>(cache: &'a HashMap<String, Pattern>, kw: &str) -> &'a Pattern {
+    // Callers are expected to precompile via `compile_all` (the web server
+    // does this once at boot); a missing keyword is a programming error.
+    cache
+        .get(kw)
+        .expect("keyword not found in precompiled pattern cache")
 }
 
 /// Boolean evaluation of the AST against the paper (Scopus semantics:
 /// NOT > AND/W-n > OR; W/n requires presence only).
-pub fn eval(node: &Node, fields: Option<&[u8]>, paper: &Paper, cache: &mut HashMap<String, Pattern>) -> bool {
+pub fn eval(node: &Node, fields: Option<&[u8]>, paper: &Paper, cache: &HashMap<String, Pattern>) -> bool {
     match node {
         Node::Leaf { keyword, .. } => {
             let p = pat(cache, keyword);
@@ -175,7 +251,7 @@ pub struct BlockScan {
 }
 
 /// Per-keyword detail for a block: include terms hit/missed, excluded terms hit.
-pub fn scan_block(block: &Node, paper: &Paper, cache: &mut HashMap<String, Pattern>) -> BlockScan {
+pub fn scan_block(block: &Node, paper: &Paper, cache: &HashMap<String, Pattern>) -> BlockScan {
     let mut out = BlockScan { hits: Vec::new(), misses: Vec::new(), excluded_hits: Vec::new() };
     rec(block, None, false, paper, cache, &mut out);
     out
@@ -194,17 +270,22 @@ fn field_name(f: u8) -> &'static str {
 /// Like `scan_block`, but each hit/miss also carries the field(s) the term is
 /// searched in ('' -> the default TITLE-ABS-KEY). Used by the web server,
 /// which renders `[TITLE,ABS]` chips next to every keyword.
-/// Returns (hits, misses, excluded_hits).
+/// `memo` is the per-request term-result cache (pass the same Memo across all
+/// blocks of a request so duplicated keywords are searched once).
+/// Returns (hits, misses, excluded_hits, matched): `matched` is the block's
+/// boolean verdict, computed in the same single traversal (previously the
+/// web server ran a separate `eval` pass over the whole AST per block).
 pub fn scan_with_fields(
     block: &Node,
     paper: &Paper,
-    cache: &mut HashMap<String, Pattern>,
-) -> (Vec<(String, String)>, Vec<(String, String)>, Vec<String>) {
+    cache: &HashMap<String, Pattern>,
+    memo: &mut Memo,
+) -> (Vec<(String, String)>, Vec<(String, String)>, Vec<String>, bool) {
     let mut hits = Vec::new();
     let mut misses = Vec::new();
     let mut ex_hits = Vec::new();
-    rec_fields(block, None, false, paper, cache, &mut hits, &mut misses, &mut ex_hits);
-    (hits, misses, ex_hits)
+    let matched = rec_fields(block, None, false, paper, cache, memo, &mut hits, &mut misses, &mut ex_hits);
+    (hits, misses, ex_hits, matched)
 }
 
 fn rec_fields(
@@ -212,15 +293,16 @@ fn rec_fields(
     fields: Option<&[u8]>,
     excluded: bool,
     paper: &Paper,
-    cache: &mut HashMap<String, Pattern>,
+    cache: &HashMap<String, Pattern>,
+    memo: &mut Memo,
     hits: &mut Vec<(String, String)>,
     misses: &mut Vec<(String, String)>,
     ex_hits: &mut Vec<String>,
-) {
+) -> bool {
     match node {
         Node::Leaf { keyword, .. } => {
             let p = pat(cache, keyword);
-            let found = term_hit(paper, p, fields.unwrap_or(&ALL_FIELDS));
+            let found = memo.term_hit(paper, p, fields.unwrap_or(&ALL_FIELDS));
             let fname = fields.map_or(String::new(), |f| {
                 f.iter().map(|&x| field_name(x)).collect::<Vec<_>>().join(",")
             });
@@ -233,16 +315,27 @@ fn rec_fields(
             } else {
                 misses.push((keyword.clone(), fname));
             }
+            found
         }
         Node::Field { fields: fs, child } => {
-            rec_fields(child, Some(&field_ids(fs)), excluded, paper, cache, hits, misses, ex_hits)
+            rec_fields(child, Some(&field_ids(fs)), excluded, paper, cache, memo, hits, misses, ex_hits)
         }
         Node::Not { child } => {
-            rec_fields(child, fields, !excluded, paper, cache, hits, misses, ex_hits)
+            !rec_fields(child, fields, !excluded, paper, cache, memo, hits, misses, ex_hits)
         }
-        Node::Group { children, .. } => {
-            for c in children {
-                rec_fields(c, fields, excluded, paper, cache, hits, misses, ex_hits);
+        Node::Group { op, children } => {
+            if op == "OR" {
+                let mut acc = false;
+                for c in children {
+                    acc |= rec_fields(c, fields, excluded, paper, cache, memo, hits, misses, ex_hits);
+                }
+                acc
+            } else {
+                let mut acc = true;
+                for c in children {
+                    acc &= rec_fields(c, fields, excluded, paper, cache, memo, hits, misses, ex_hits);
+                }
+                acc
             }
         }
     }
@@ -253,7 +346,7 @@ fn rec(
     fields: Option<&[u8]>,
     excluded: bool,
     paper: &Paper,
-    cache: &mut HashMap<String, Pattern>,
+    cache: &HashMap<String, Pattern>,
     out: &mut BlockScan,
 ) {
     match node {
