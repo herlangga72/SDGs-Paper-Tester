@@ -6,7 +6,7 @@ services:
   - type: web
     name: sdg-paper-matcher
     runtime: docker
-    repo: https://github.com/herlangga72/sdg-paper-matcher
+    repo: https://github.com/herlangga72/SDGs-Paper-Tester
     plan: free
     dockerfilePath: ./Dockerfile
     healthCheckPath: /health
