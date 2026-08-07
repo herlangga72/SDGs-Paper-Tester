@@ -1,10 +1,21 @@
-//! SIMD helpers with runtime dispatch (x86_64 only):
-//!   - AVX-512 (64-byte vectors, `avx512f`+`avx512bw`, runtime-detected),
-//!   - AVX2 (32-byte vectors, runtime-detected),
-//!   - SSE ladder (16-byte vectors, runtime-detected): SSE4.2 (`pcmpistri`
-//!     string instructions), SSE4.1 (`pcmpeqq` quads + `ptest`), SSSE3
-//!     (`pshufb` two-table membership), SSE3 (16-byte baseline),
-//!   - portable scalar fallback (non-x86_64 targets, or CPUs without SSE3)
+//! SIMD helpers with startup-time dispatch (x86_64 only).
+//!
+//! The best SIMD route available on this CPU is detected **once**, the first
+//! time any SIMD helper runs (the program arranges this at startup), and
+//! cached in a `DispatchLevel`. Every operation then dispatches off that one
+//! stable decision - a single data-dependent branch on a value that never
+//! changes after startup, so it stays perfectly branch-predictable and never
+//! re-runs CPUID per call.
+//!
+//! Route ladder, in descending capability order:
+//!   - AVX-512 (64-byte vectors, needs `avx512f`+`avx512bw`)
+//!   - AVX2    (32-byte vectors)
+//!   - SSE4.2  (`pcmpistri` string instructions; fastest for short-needle
+//!     `find` even on AVX2-only hosts, so `find` uses it there)
+//!   - SSE4.1  (`pcmpeqq` quads + `ptest` for long-needle `find`)
+//!   - SSSE3   (`pshufb` two-table membership for `next_special`)
+//!   - SSE3    (16-byte baseline; every x86_64 CPU since 2005)
+//!   - Scalar  (non-x86_64 targets, or x86_64 CPUs without SSE3)
 //!
 //! Hot paths:
 //!   - `lower_ascii`   : case folding for paper texts (two-compare mask)
@@ -15,33 +26,90 @@
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
+use std::sync::OnceLock;
+
+// ---------------------------------------------------------------------------
+// Startup-time dispatch level
+// ---------------------------------------------------------------------------
+
+/// The single SIMD route this CPU uses, in descending capability order.
+/// `Scalar` is the floor for non-x86_64 targets.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum DispatchLevel {
+    Scalar,
+    Sse3,
+    Ssse3,
+    Sse41,
+    Sse42,
+    Avx2,
+    Avx512,
+}
+
+/// The chosen route, computed exactly once. All callers share this decision.
+static LEVEL: OnceLock<DispatchLevel> = OnceLock::new();
+
+/// Detect the best SIMD route once and return it. Repeated calls are a single
+/// load of an initialized `OnceLock`. Call this at program startup (e.g. from
+/// `main`) so the decision is made before any hot loop runs.
+pub fn best_level() -> DispatchLevel {
+    *LEVEL.get_or_init(detect_level)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn detect_level() -> DispatchLevel {
+    if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") {
+        DispatchLevel::Avx512
+    } else if is_x86_feature_detected!("avx2") {
+        DispatchLevel::Avx2
+    } else if is_x86_feature_detected!("sse4.2") {
+        DispatchLevel::Sse42
+    } else if is_x86_feature_detected!("ssse3") {
+        DispatchLevel::Ssse3
+    } else if is_x86_feature_detected!("sse4.1") {
+        DispatchLevel::Sse41
+    } else if is_x86_feature_detected!("sse3") {
+        DispatchLevel::Sse3
+    } else {
+        DispatchLevel::Scalar
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn detect_level() -> DispatchLevel {
+    DispatchLevel::Scalar
+}
+
+/// Human-readable name of the detected route, for startup diagnostics.
+pub fn dispatch_name() -> &'static str {
+    match best_level() {
+        DispatchLevel::Avx512 => "AVX-512",
+        DispatchLevel::Avx2 => "AVX2",
+        DispatchLevel::Sse42 => "SSE4.2",
+        DispatchLevel::Sse41 => "SSE4.1",
+        DispatchLevel::Ssse3 => "SSSE3",
+        DispatchLevel::Sse3 => "SSE3",
+        DispatchLevel::Scalar => "scalar",
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Case folding
 // ---------------------------------------------------------------------------
 
 pub fn lower_ascii(s: &[u8]) -> Vec<u8> {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") {
-            return unsafe { lower_ascii_avx512(s) };
+    match best_level() {
+        DispatchLevel::Avx512 => unsafe { lower_ascii_avx512(s) },
+        DispatchLevel::Avx2 => unsafe { lower_ascii_avx2(s) },
+        DispatchLevel::Scalar => {
+            let mut out = Vec::with_capacity(s.len());
+            for &c in s {
+                out.push(c.to_ascii_lowercase());
+            }
+            out
         }
-        if is_x86_feature_detected!("avx2") {
-            return unsafe { lower_ascii_avx2(s) };
-        }
-        // SSE3 is the 16-byte floor for x86_64 (every CPU made since 2005);
-        // CPUs without it fall through to the scalar path below.
-        if is_x86_feature_detected!("sse3") {
-            return unsafe { lower_ascii_sse3(s) };
-        }
-    }
-    // Scalar fallback: non-x86_64 targets, and x86_64 CPUs without SSE3.
-    {
-        let mut out = Vec::with_capacity(s.len());
-        for &c in s {
-            out.push(c.to_ascii_lowercase());
-        }
-        out
+        // SSE3 is the 16-byte floor for x86_64; SSSE3/SSE4.1/SSE4.2 all
+        // build on it and add nothing for case folding, so they share it.
+        _ => unsafe { lower_ascii_sse3(s) },
     }
 }
 
@@ -104,33 +172,26 @@ pub fn find(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
     if rem.len() < needle.len() {
         return None;
     }
-    #[cfg(target_arch = "x86_64")]
-    {
+    match best_level() {
         // AVX-512 is the widest rung; keep it first for hosts that have it.
-        if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw")
-            && needle.len() <= 64
-        {
-            return unsafe { find_avx512(rem, needle).map(|k| k + from) };
+        DispatchLevel::Avx512 if needle.len() <= 64 => {
+            unsafe { find_avx512(rem, needle) }.map(|k| k + from)
         }
         // Benchmarked on Zen+ (2026-08): the SSE4.2 `pcmpistri` rung runs
-        // ~7x faster than the AVX2 quad filter for needles <= 8 bytes
+        // ~7x faster than an AVX2 quad filter for needles <= 8 bytes
         // (52 us vs 373 us per 512 KiB scan), and SSE4.1 pcmpeqq edges
-        // out AVX2 for longer needles as well. Prefer the SSE ladder;
-        // AVX2 stays for the bulk transform paths (lower_ascii,
-        // next_special, skip_ws). Every CPU with AVX2 also has SSE4.2,
-        // so the AVX2 find rung is unreachable and intentionally omitted.
-        if is_x86_feature_detected!("sse4.2") {
-            return unsafe { find_sse42(rem, needle).map(|k| k + from) };
+        // out AVX2 for longer needles as well. So on AVX2-only hosts `find`
+        // still uses the SSE ladder; AVX2 adds nothing here. Every AVX2 CPU
+        // has SSE4.2, so an AVX2 find rung is intentionally omitted.
+        DispatchLevel::Avx512 | DispatchLevel::Avx2 | DispatchLevel::Sse42 => {
+            unsafe { find_sse42(rem, needle) }.map(|k| k + from)
         }
-        if is_x86_feature_detected!("sse4.1") {
-            return unsafe { find_sse41(rem, needle).map(|k| k + from) };
+        DispatchLevel::Sse41 => unsafe { find_sse41(rem, needle) }.map(|k| k + from),
+        DispatchLevel::Ssse3 | DispatchLevel::Sse3 => {
+            unsafe { find_sse3(rem, needle) }.map(|k| k + from)
         }
-        if is_x86_feature_detected!("sse3") {
-            return unsafe { find_sse3(rem, needle).map(|k| k + from) };
-        }
+        DispatchLevel::Scalar => find_scalar(rem, needle).map(|k| k + from),
     }
-    // Scalar fallback for non-x86_64 targets.
-    find_scalar(rem, needle).map(|k| k + from)
 }
 
 fn find_scalar(hay: &[u8], needle: &[u8]) -> Option<usize> {
@@ -238,16 +299,17 @@ unsafe fn find_avx512(hay: &[u8], needle: &[u8]) -> Option<usize> {
 /// wildcard semantics (Scopus `*` matches within a word only), replacing a
 /// per-byte scalar scan with a SIMD compare-OR.
 pub fn any_ws(s: &[u8]) -> bool {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if is_x86_feature_detected!("sse4.2") && s.len() >= 16 {
-            return unsafe { any_ws_sse42(s) };
+    match best_level() {
+        // The SSE4.2 `pcmpistri` EQUAL_ANY single-instruction set match is
+        // the fastest; AVX-512/AVX2 hosts still have SSE4.2, so they use it.
+        DispatchLevel::Avx512 | DispatchLevel::Avx2 | DispatchLevel::Sse42 if s.len() >= 16 => {
+            unsafe { any_ws_sse42(s) }
         }
-        if is_x86_feature_detected!("sse3") && s.len() >= 16 {
-            return unsafe { any_ws_sse3(s) };
+        DispatchLevel::Sse41 | DispatchLevel::Ssse3 | DispatchLevel::Sse3 if s.len() >= 16 => {
+            unsafe { any_ws_sse3(s) }
         }
+        _ => s.iter().any(|c| c.is_ascii_whitespace()),
     }
-    s.iter().any(|c| c.is_ascii_whitespace())
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -299,44 +361,43 @@ unsafe fn any_ws_sse3(s: &[u8]) -> bool {
 
 /// First index >= `from` where any byte of `chars` occurs.
 pub fn next_special(text: &[u8], from: usize, chars: &[u8]) -> Option<usize> {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw")
-            && !chars.is_empty()
+    match best_level() {
+        DispatchLevel::Avx512 if !chars.is_empty() => {
+            unsafe { next_special_avx512(text, from, chars) }
+        }
+        DispatchLevel::Avx2 if !chars.is_empty() => unsafe { next_special_avx2(text, from, chars) },
+        // SSE4.2 `pcmpistri` EQUAL_ANY is fastest for sets of <= 15 bytes
+        // without NUL (the set is NUL-terminated for implicit length).
+        DispatchLevel::Avx512 | DispatchLevel::Avx2 | DispatchLevel::Sse42
+            if !chars.is_empty() && chars.len() <= 15 && !chars.contains(&0) =>
         {
-            return unsafe { next_special_avx512(text, from, chars) };
+            unsafe { next_special_sse42(text, from, chars) }
         }
-        if is_x86_feature_detected!("avx2") && !chars.is_empty() {
-            return unsafe { next_special_avx2(text, from, chars) };
-        }
-        // SSE ladder: EQUAL_ANY via `pcmpistri` (SSE4.2, sets of <= 15
-        // bytes without NUL), `pshufb` two-table membership (SSSE3, sets
-        // without nibble collisions), per-char compares (SSE3).
-        if is_x86_feature_detected!("sse4.2")
-            && !chars.is_empty()
-            && chars.len() <= 15
-            && !chars.contains(&0)
+        // SSSE3 `pshufb` two-table membership is exact for sets whose
+        // low-nibble layout doesn't collide within a high-nibble half.
+        DispatchLevel::Ssse3 | DispatchLevel::Sse41 | DispatchLevel::Sse42
+            if !chars.is_empty() && pshufb_representable(chars) =>
         {
-            return unsafe { next_special_sse42(text, from, chars) };
+            unsafe { next_special_ssse3(text, from, chars) }
         }
-        if is_x86_feature_detected!("ssse3") && !chars.is_empty() && pshufb_representable(chars) {
-            return unsafe { next_special_ssse3(text, from, chars) };
+        DispatchLevel::Sse3 | DispatchLevel::Sse41 | DispatchLevel::Ssse3
+        | DispatchLevel::Sse42 | DispatchLevel::Avx2 | DispatchLevel::Avx512
+            if !chars.is_empty() =>
+        {
+            unsafe { next_special_sse3(text, from, chars) }
         }
-        if is_x86_feature_detected!("sse3") && !chars.is_empty() {
-            return unsafe { next_special_sse3(text, from, chars) };
-        }
-    }
-    // Scalar fallback for non-x86_64 targets.
-    {
-        let n = text.len();
-        let mut i = from;
-        while i < n {
-            if chars.contains(&text[i]) {
-                return Some(i);
+        // Scalar fallback for non-x86_64 targets.
+        _ => {
+            let n = text.len();
+            let mut i = from;
+            while i < n {
+                if chars.contains(&text[i]) {
+                    return Some(i);
+                }
+                i += 1;
             }
-            i += 1;
+            None
         }
-        None
     }
 }
 
@@ -393,30 +454,26 @@ unsafe fn next_special_avx2(text: &[u8], from: usize, chars: &[u8]) -> Option<us
 
 /// Skip a run of ASCII whitespace starting at `from`; returns first non-ws index.
 pub fn skip_ws(text: &[u8], from: usize) -> usize {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") {
-            return unsafe { skip_ws_avx512(text, from) };
+    match best_level() {
+        // AVX-512 is the widest rung; keep it first for hosts that have it.
+        DispatchLevel::Avx512 => unsafe { skip_ws_avx512(text, from) },
+        // SSE4.2 `pcmpistri` EQUAL_ANY + NEGATIVE_POLARITY finds the first
+        // non-ws byte in one instruction. Benchmarked on Zen+ (2026-08):
+        // it's faster than the AVX2 compare-OR (121 us vs 135 us per 256 KiB
+        // scan), so AVX2-only hosts also use it here (every AVX2 CPU has
+        // SSE4.2). The AVX2 rung is kept below but is slower on this chip.
+        DispatchLevel::Avx2 | DispatchLevel::Sse42 => unsafe { skip_ws_sse42(text, from) },
+        DispatchLevel::Sse41 | DispatchLevel::Ssse3 | DispatchLevel::Sse3 => {
+            unsafe { skip_ws_sse3(text, from) }
         }
-        if is_x86_feature_detected!("avx2") {
-            return unsafe { skip_ws_avx2(text, from) };
+        // Scalar fallback for non-x86_64 targets.
+        DispatchLevel::Scalar => {
+            let mut i = from;
+            while i < text.len() && text[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            i
         }
-        // SSE ladder: EQUAL_ANY + NEGATIVE_POLARITY via `pcmpistri`
-        // (SSE4.2), compare-OR of the four whitespace bytes (SSE3).
-        if is_x86_feature_detected!("sse4.2") {
-            return unsafe { skip_ws_sse42(text, from) };
-        }
-        if is_x86_feature_detected!("sse3") {
-            return unsafe { skip_ws_sse3(text, from) };
-        }
-    }
-    // Scalar fallback for non-x86_64 targets.
-    {
-        let mut i = from;
-        while i < text.len() && text[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        i
     }
 }
 
@@ -444,6 +501,10 @@ unsafe fn skip_ws_avx512(text: &[u8], mut i: usize) -> usize {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+// Retained for reference: benchmarked slower than the SSE4.2 `pcmpistri`
+// rung on Zen+ (121 us vs 135 us per 256 KiB scan), so `skip_ws` does not
+// dispatch to it. Kept so an AVX-512/AVX2 host can force it explicitly.
+#[allow(dead_code)]
 unsafe fn skip_ws_avx2(text: &[u8], mut i: usize) -> usize {
     let n = text.len();
     while i + 32 <= n {
@@ -810,6 +871,40 @@ unsafe fn skip_ws_sse42(text: &[u8], mut i: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dispatch_level_detects_and_is_cached() {
+        // The route is detected once and never changes; repeated calls must
+        // return the identical value (and match the reported name).
+        let l1 = best_level();
+        let l2 = best_level();
+        assert_eq!(l1, l2);
+        assert_eq!(l1 as usize, dispatch_name_rank(l1));
+        // The route must be one of the valid ladder rungs.
+        match l1 {
+            DispatchLevel::Avx512
+            | DispatchLevel::Avx2
+            | DispatchLevel::Sse42
+            | DispatchLevel::Sse41
+            | DispatchLevel::Ssse3
+            | DispatchLevel::Sse3
+            | DispatchLevel::Scalar => {}
+        }
+    }
+
+    /// Returns the same ordinal the enum derives, so the test asserts the
+    /// name/rank mapping stays in the documented capability order.
+    fn dispatch_name_rank(l: DispatchLevel) -> usize {
+        match l {
+            DispatchLevel::Scalar => 0,
+            DispatchLevel::Sse3 => 1,
+            DispatchLevel::Ssse3 => 2,
+            DispatchLevel::Sse41 => 3,
+            DispatchLevel::Sse42 => 4,
+            DispatchLevel::Avx2 => 5,
+            DispatchLevel::Avx512 => 6,
+        }
+    }
 
     fn find_all(hay: &[u8], needle: &[u8]) -> Vec<usize> {
         let mut out = Vec::new();

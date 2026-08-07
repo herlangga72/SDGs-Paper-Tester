@@ -32,6 +32,10 @@ fn usage() -> ! {
 }
 
 fn main() {
+    // Detect the best SIMD route once at startup; every SIMD helper then
+    // dispatches off this single cached decision (see simd::best_level).
+    eprintln!("sdg_tools: using {} SIMD route", sdg_tools::simd::dispatch_name());
+
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cmd = args.first().map(AsRef::<str>::as_ref).unwrap_or("");
     let rest = &args[1..];
