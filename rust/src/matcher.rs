@@ -351,19 +351,65 @@ fn push_buf<'a>(bufs: &mut [&'a [u8]; 4], nb: &mut usize, t: &'a [u8]) {
     }
 }
 
+/// Fast non-cryptographic hasher for the per-request caches. The hot path
+/// does ~10^5 HashMap lookups per request; std's default SipHash (RandomState)
+/// is deliberately DoS-resistant but ~10x slower than a multiplicative hash.
+/// Keys here are only (pattern address, field mask) tuples - not user-supplied
+/// adversarial strings - so a trivial hash is safe. Zero-dependency.
+struct FastHasher(u64);
+
+impl std::hash::Hasher for FastHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0 ^ u64::from(b)).wrapping_mul(0x100_0000_01B3);
+        }
+    }
+    #[inline]
+    fn write_u64(&mut self, n: u64) {
+        self.0 = (self.0 ^ n).wrapping_mul(0x100_0000_01B3);
+    }
+    #[inline]
+    fn write_u8(&mut self, n: u8) {
+        self.write_u64(u64::from(n));
+    }
+    #[inline]
+    fn write_usize(&mut self, n: usize) {
+        self.write_u64(n as u64);
+    }
+}
+
+impl std::hash::BuildHasher for FastHasher {
+    type Hasher = FastHasher;
+    #[inline]
+    fn build_hasher(&self) -> FastHasher {
+        FastHasher(0xcbf2_9ce4_8422_2325)
+    }
+}
+
+type FastMap<K, V> = HashMap<K, V, FastHasher>;
+
+fn new_fast_map<K, V>() -> FastMap<K, V> {
+    HashMap::with_capacity_and_hasher(16, FastHasher(0xcbf2_9ce4_8422_2325))
+}
+
 /// Per-request memo of term results, keyed by (pattern address, field mask).
 /// The same keyword appears ~4.4x across the 17 SDG query sets, so memoizing
 /// avoids re-searching the text for every duplicated leaf. Also caches the
 /// per-buffer `TextIndex` (built once per distinct buffer) used to prove
 /// most patterns cannot match before running a SIMD search.
 pub struct Memo {
-    terms: HashMap<(usize, u8), bool>,
-    indexes: HashMap<(usize, usize), TextIndex>,
+    terms: FastMap<(usize, u8), bool>,
+    indexes: FastMap<(usize, usize), TextIndex>,
 }
 
 impl Memo {
     pub fn new() -> Memo {
-        Memo { terms: HashMap::new(), indexes: HashMap::new() }
+        Memo { terms: new_fast_map(), indexes: new_fast_map() }
     }
 
     fn index(&mut self, buf: &[u8]) -> &TextIndex {
