@@ -177,35 +177,65 @@ pub fn compile_all<'a>(blocks: impl Iterator<Item = &'a Node>) -> Vec<Pattern> {
     table
 }
 
-/// Stamp every leaf with its pattern index in `table`. Call once at boot
-/// after `compile_all`; matching then resolves leaves by array indexing.
-pub fn resolve_blocks(blocks: &mut [Node], table: &[Pattern]) {
+/// Stamp every leaf with its pattern index, effective field mask, and dense
+/// memo slot. Call once at boot after `compile_all`; matching then resolves
+/// leaves by array indexing and never hashes keyword strings or
+/// `(pattern, mask)` keys.
+///
+/// The effective mask is static per leaf (determined by its enclosing `Field`
+/// nodes), so it is threaded down here rather than recomputed at match time.
+/// `slot` is a dense index over the live `(pid, mask)` pairs; the per-request
+/// memo is a `Vec<u8>` of `nslots` entries (see `Memo::with_slots`).
+/// Returns the number of distinct `(pid, mask)` slots assigned.
+pub fn resolve_blocks(blocks: &mut [Node], table: &[Pattern]) -> usize {
     let mut map: HashMap<&str, usize> = HashMap::with_capacity(table.len());
     for (i, p) in table.iter().enumerate() {
         map.insert(p.raw.as_ref(), i);
     }
-    for b in blocks {
-        resolve_node(b, &map);
-    }
-}
-
-fn resolve_node(node: &mut Node, map: &HashMap<&str, usize>) {
-    match node {
-        Node::Leaf { keyword, pid, .. } => {
-            // compile_pattern trims keywords (data artifact in SDG07), so
-            // the lookup must trim too.
-            *pid = *map
-                .get(keyword.trim())
-                .expect("leaf keyword missing from pattern table") as u32;
-        }
-        Node::Field { child, .. } => resolve_node(child, map),
-        Node::Not { child } => resolve_node(child, map),
-        Node::Group { children, .. } => {
-            for c in children {
-                resolve_node(c, map);
+    // Slot ids: dense over the seen (pid, mask) pairs, assigned in first-seen
+    // order. `pid` is already dense over the table, so keying the memo array
+    // on `pid` alone would be too coarse (the same pattern under different
+    // field masks can give different results) — hence a (pid, mask) slot.
+    let mut slot_of: HashMap<(u32, u8), u32> = HashMap::new();
+    let mut nslots = 0u32;
+    fn assign(
+        node: &mut Node,
+        mask: u8,
+        map: &HashMap<&str, usize>,
+        slot_of: &mut HashMap<(u32, u8), u32>,
+        nslots: &mut u32,
+    ) {
+        match node {
+            Node::Leaf { keyword, pid, mask: lm, slot, .. } => {
+                let pidv = *map.get(keyword.trim()).expect("leaf keyword missing from pattern table") as u32;
+                *pid = pidv;
+                *lm = mask;
+                *slot = match slot_of.get(&(pidv, mask)) {
+                    Some(&s) => s,
+                    None => {
+                        let s = *nslots;
+                        *nslots += 1;
+                        slot_of.insert((pidv, mask), s);
+                        s
+                    }
+                };
+            }
+            Node::Field { fields, child } => {
+                assign(child, field_mask_from_strings(fields), map, slot_of, nslots)
+            }
+            Node::Not { child } => assign(child, mask, map, slot_of, nslots),
+            Node::Group { children, .. } => {
+                for c in children {
+                    assign(c, mask, map, slot_of, nslots);
+                }
             }
         }
     }
+    let default_mask = field_mask(&ALL_FIELDS);
+    for b in blocks {
+        assign(b, default_mask, &map, &mut slot_of, &mut nslots);
+    }
+    nslots as usize
 }
 
 #[inline]
@@ -397,19 +427,21 @@ fn new_fast_map<K, V>() -> FastMap<K, V> {
     HashMap::with_capacity_and_hasher(16, FastHasher(0xcbf2_9ce4_8422_2325))
 }
 
-/// Per-request memo of term results, keyed by (pattern address, field mask).
-/// The same keyword appears ~4.4x across the 17 SDG query sets, so memoizing
-/// avoids re-searching the text for every duplicated leaf. Also caches the
-/// per-buffer `TextIndex` (built once per distinct buffer) used to prove
-/// most patterns cannot match before running a SIMD search.
+/// Per-request memo of term results, keyed by the leaf's precomputed dense
+/// `slot` (see `resolve_blocks`): `terms[slot]` is 0 (unset), 1 (false) or
+/// 2 (true). Slots are dense over the live `(pattern, mask)` pairs, so the
+/// hot path is a single `Vec<u8>` read/write instead of a hashed
+/// `(pattern*, mask)` lookup. Also caches the per-buffer `TextIndex` (built
+/// once per distinct buffer) used to prove most patterns cannot match before
+/// running a SIMD search.
 pub struct Memo {
-    terms: FastMap<(usize, u8), bool>,
+    terms: Vec<u8>,
     indexes: FastMap<(usize, usize), TextIndex>,
 }
 
 impl Memo {
     pub fn new() -> Memo {
-        Memo { terms: new_fast_map(), indexes: new_fast_map() }
+        Memo { terms: Vec::new(), indexes: new_fast_map() }
     }
 
     fn index(&mut self, buf: &[u8]) -> &TextIndex {
@@ -417,17 +449,31 @@ impl Memo {
         self.indexes.entry(key).or_insert_with(|| TextIndex::build(buf))
     }
 
-    fn term_hit(&mut self, paper: &Paper, pat: &Pattern, mask: u8) -> bool {
+    /// Evaluate `pat` under field `mask`, memoized at dense `slot`. The mask
+    /// and slot are both precomputed and stamped on the leaf by
+    /// `resolve_blocks`, so the caller passes them straight through.
+    fn term_hit(&mut self, paper: &Paper, pat: &Pattern, mask: u8, slot: usize) -> bool {
+        if let Some(&v) = self.terms.get(slot) {
+            // 0 = unset; anything else is the cached verdict.
+            return v == 2;
+        }
+        let v = self.compute(paper, pat, mask);
+        // Grow on demand so `Memo::new()` needs no slot count (resizes once
+        // to the max slot of the request, then is a single write below).
+        if slot >= self.terms.len() {
+            self.terms.resize(slot + 1, 0);
+        }
+        self.terms[slot] = if v { 2 } else { 1 };
+        v
+    }
+
+    /// Actual search for `pat` under `mask` (uncached). Decodes the mask into
+    /// the section buffers (bits 0-3) plus the full text (bit 7). Multiple
+    /// fields often resolve to the same buffer (missing sections fall back to
+    /// the full text), so scan each distinct buffer once.
+    fn compute(&mut self, paper: &Paper, pat: &Pattern, mask: u8) -> bool {
         // A zero mask means "no field scoping" -> the default TITLE-ABS-KEY.
         let mask = if mask == 0 { field_mask(&ALL_FIELDS) } else { mask };
-        let key = (pat as *const Pattern as usize, mask);
-        if let Some(&v) = self.terms.get(&key) {
-            return v;
-        }
-        // Decode the mask into the section buffers (bits 0-3) plus the full
-        // text (bit 7). Multiple fields often resolve to the same buffer
-        // (missing sections fall back to the full text), so scan each
-        // distinct buffer once.
         let mut bufs: [&[u8]; 4] = [&[]; 4];
         let mut nb = 0usize;
         for f in 0..4u8 {
@@ -447,7 +493,6 @@ impl Memo {
                 break;
             }
         }
-        self.terms.insert(key, v);
         v
     }
 }
@@ -468,9 +513,9 @@ pub fn eval(node: &Node, fields: Option<&[u8]>, paper: &Paper, table: &[Pattern]
 
 fn eval_memo(node: &Node, mask: u8, paper: &Paper, table: &[Pattern], memo: &mut Memo) -> bool {
     match node {
-        Node::Leaf { .. } => {
+        Node::Leaf { mask, slot, .. } => {
             let p = pat(table, node);
-            memo.term_hit(paper, p, mask)
+            memo.term_hit(paper, p, *mask, *slot as usize)
         }
         Node::Field { fields: fs, child } => eval_memo(child, field_mask_from_strings(fs), paper, table, memo),
         Node::Not { child } => !eval_memo(child, mask, paper, table, memo),
@@ -552,17 +597,17 @@ fn rec_fields(
     ex_hits: &mut Vec<Arc<str>>,
 ) -> bool {
     match node {
-        Node::Leaf { .. } => {
+        Node::Leaf { mask, slot, .. } => {
             let p = pat(table, node);
-            let found = memo.term_hit(paper, p, mask);
+            let found = memo.term_hit(paper, p, *mask, *slot as usize);
             if excluded {
                 if found {
                     ex_hits.push(p.raw.clone());
                 }
             } else if found {
-                hits.push((p.raw.clone(), mask));
+                hits.push((p.raw.clone(), *mask));
             } else {
-                misses.push((p.raw.clone(), mask));
+                misses.push((p.raw.clone(), *mask));
             }
             found
         }
@@ -623,9 +668,9 @@ fn rec(
     out: &mut BlockScan,
 ) -> bool {
     match node {
-        Node::Leaf { .. } => {
+        Node::Leaf { mask, slot, .. } => {
             let p = pat(table, node);
-            let found = memo.term_hit(paper, p, mask);
+            let found = memo.term_hit(paper, p, *mask, *slot as usize);
             if excluded {
                 if found {
                     out.excluded_hits.push(p.raw.clone());

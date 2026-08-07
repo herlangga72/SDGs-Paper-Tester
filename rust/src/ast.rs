@@ -5,7 +5,11 @@ pub enum Node {
     /// A single search term: `"tax evasion"`, `cereal*`, `{BEPS}`.
     /// `pid` is the index of the precompiled pattern in the global table
     /// (`u32::MAX` until `matcher::resolve_blocks` runs at boot).
-    Leaf { keyword: String, exact: bool, pid: u32 },
+    /// `mask` is the effective field mask the leaf is searched under,
+    /// stamped once at boot from its enclosing `Field` nodes.
+    /// `slot` is the dense index into the per-request memo array for
+    /// `(pid, mask)`, so matching reads a plain `Vec<u8>` instead of hashing.
+    Leaf { keyword: String, exact: bool, pid: u32, mask: u8, slot: u32 },
     /// Field prefix wrapping a sub-expression: `TITLE-ABS-KEY(...)`.
     Field { fields: Vec<String>, child: Box<Node> },
     /// `OR`, `AND` or a proximity operator (`W/4`, ...).

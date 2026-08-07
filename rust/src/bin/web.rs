@@ -1398,11 +1398,12 @@ fn handle_conn(stream: &mut TcpStream) {
     let mut out = Vec::with_capacity(resp.body.len() + 256);
     let mut head = format!(
         "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\
-         Cache-Control: no-store\r\n",
+         Cache-Control: no-store\r\nX-SIMD-Usage: {}\r\n",
         resp.code,
         resp.reason,
         resp.ctype,
-        resp.body.len()
+        resp.body.len(),
+        sdg_tools::simd::dispatch_name()
     );
     for (k, v) in &resp.headers {
         head.push_str(&format!("{k}: {v}\r\n"));

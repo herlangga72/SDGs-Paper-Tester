@@ -153,7 +153,7 @@ impl Parser {
                     kw.push(' ');
                     kw.push_str(&v);
                 }
-                Ok(Node::Leaf { keyword: kw, exact: ex, pid: u32::MAX })
+                Ok(Node::Leaf { keyword: kw, exact: ex, pid: u32::MAX, mask: 0, slot: u32::MAX })
             }
             other => Err(ParseError::new(format!("unexpected token {other:?}"), self.pos)),
         }
