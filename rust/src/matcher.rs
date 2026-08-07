@@ -17,28 +17,68 @@ pub struct Pattern {
 /// (bigram) and every byte of a buffer. Built once per request per distinct
 /// buffer, then each pattern does O(1) set lookups to prove it *cannot*
 /// match (skipping the SIMD search entirely). Exact: no false negatives.
+///
+/// Memory layout is chosen to be branch-predictable, cache-resident and
+/// SIMD-friendly rather than hash-table based:
+///   - `bytes`   : one bit per byte value (256 B).
+///   - `bigrams` : dense 256x256 bit matrix (8 KiB) indexed by `a<<8|b` for
+///                 the first two bytes of a part. A single load + shift +
+///                 mask, no probing.
+///   - `quads`   : a two-hash Bloom filter over the first four bytes of a
+///                 part, sized ~16 bits per window. Two independent
+///                 multiplicative hashes into a power-of-two bit array keep
+///                 the false-positive rate low while remaining a handful of
+///                 branch-free bit operations. Bloom filters have no false
+///                 negatives, which is all this pre-filter needs.
+/// The old `HashSet`-based index paid for hash-table allocation/rehashing to
+/// build (lots of transient memory movement) and walked probe chains on every
+/// lookup (unpredictable branches). Dense bit arrays are built in a single
+/// sequential pass and answer with two loads at most.
 pub struct TextIndex {
-    quads: std::collections::HashSet<u32>,
-    bigrams: std::collections::HashSet<u16>,
     bytes: [bool; 256],
+    bigrams: [u64; 1024],
+    quads: Vec<u64>,
+    quad_mask: u32, // power-of-two capacity minus one
+}
+
+/// Two independent multiplicative hashes into a `mask`-bounded bit array.
+/// Deterministic (a quad always maps to the same two bits), so the index has
+/// no false negatives; collisions are harmless false positives.
+#[inline]
+fn bloom_hashes(q: u32, mask: u32) -> (u32, u32) {
+    let h1 = q.wrapping_mul(0x9E37_79B1) & mask;
+    let h2 = (q.wrapping_mul(0x85EB_CA6B) ^ q.rotate_left(11)) & mask;
+    (h1, h2)
 }
 
 impl TextIndex {
     pub fn build(text: &[u8]) -> TextIndex {
         let n = text.len();
-        let mut quads = std::collections::HashSet::with_capacity(n.saturating_sub(3));
-        let mut bigrams = std::collections::HashSet::with_capacity(n.saturating_sub(1));
         let mut bytes = [false; 256];
-        for w in text.windows(4) {
-            quads.insert(u32::from_le_bytes([w[0], w[1], w[2], w[3]]));
-        }
+        let mut bigrams = [0u64; 1024];
+        // ~16 bits of Bloom per window bounds the combined false-positive
+        // rate to ~(1/16)^2 even when every window is distinct. Minimum 64K
+        // bits (8 KiB) keeps tiny inputs cheap.
+        let qbits = (n.saturating_sub(3).saturating_mul(16)).next_power_of_two().max(1 << 16);
+        let mut quads = vec![0u64; (qbits >> 6) as usize];
+        let quad_mask = (qbits as u32) - 1;
+
         for w in text.windows(2) {
-            bigrams.insert(u16::from_le_bytes([w[0], w[1]]));
+            let a = w[0] as usize;
+            let b = w[1] as usize;
+            // bit index = a*256 + b
+            bigrams[(a << 2) | (b >> 6)] |= 1u64 << (b & 63);
+        }
+        for w in text.windows(4) {
+            let q = u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
+            let (h1, h2) = bloom_hashes(q, quad_mask);
+            quads[(h1 >> 6) as usize] |= 1u64 << (h1 & 63);
+            quads[(h2 >> 6) as usize] |= 1u64 << (h2 & 63);
         }
         for &b in text {
             bytes[b as usize] = true;
         }
-        TextIndex { quads, bigrams, bytes }
+        TextIndex { bytes, bigrams, quads, quad_mask }
     }
 
     /// True if the literal part *could* appear in the indexed text. Uses the
@@ -48,8 +88,17 @@ impl TextIndex {
         match part.len() {
             0 => true,
             1 => self.bytes[part[0] as usize],
-            2..=3 => self.bigrams.contains(&u16::from_le_bytes([part[0], part[1]])),
-            _ => self.quads.contains(&u32::from_le_bytes([part[0], part[1], part[2], part[3]])),
+            2..=3 => {
+                let a = part[0] as usize;
+                let b = part[1] as usize;
+                (self.bigrams[(a << 2) | (b >> 6)] >> (b & 63)) & 1 != 0
+            }
+            _ => {
+                let q = u32::from_le_bytes([part[0], part[1], part[2], part[3]]);
+                let (h1, h2) = bloom_hashes(q, self.quad_mask);
+                ((self.quads[(h1 >> 6) as usize] >> (h1 & 63)) & 1) != 0
+                    && ((self.quads[(h2 >> 6) as usize] >> (h2 & 63)) & 1) != 0
+            }
         }
     }
 }
@@ -259,10 +308,36 @@ pub fn field_ids(fields: &[String]) -> Vec<u8> {
         .collect()
 }
 
+/// Compact mask of a field-name list (bit 0-3 = TITLE/ABS/KEY/AUTHKEY, bit 7
+/// = ANY). Computed once at each `Field` node instead of allocating a `Vec`
+/// of field ids per evaluation.
+fn field_mask_from_strings(fields: &[String]) -> u8 {
+    let mut mask = 0u8;
+    for f in fields {
+        let id = match f.as_str() {
+            "TITLE" => 0,
+            "ABS" => 1,
+            "KEY" => 2,
+            "AUTHKEY" => 3,
+            _ => F_ANY,
+        };
+        mask |= 1 << (id & 7);
+    }
+    mask
+}
+
 /// Same underlying buffer (pointer + length), used to avoid scanning the
 /// same text multiple times when several fields fall back to the full text.
 fn same_buf(a: &[u8], b: &[u8]) -> bool {
     a.as_ptr() == b.as_ptr() && a.len() == b.len()
+}
+
+/// Append `t` to `bufs` if it is not already present (dedup by identity).
+fn push_buf<'a>(bufs: &mut [&'a [u8]; 4], nb: &mut usize, t: &'a [u8]) {
+    if !bufs[..*nb].iter().any(|&b| same_buf(b, t)) {
+        bufs[*nb] = t;
+        *nb += 1;
+    }
 }
 
 /// Per-request memo of term results, keyed by (pattern address, field mask).
@@ -285,22 +360,26 @@ impl Memo {
         self.indexes.entry(key).or_insert_with(|| TextIndex::build(buf))
     }
 
-    fn term_hit(&mut self, paper: &Paper, pat: &Pattern, fields: &[u8]) -> bool {
-        let mask = field_mask(fields);
+    fn term_hit(&mut self, paper: &Paper, pat: &Pattern, mask: u8) -> bool {
+        // A zero mask means "no field scoping" -> the default TITLE-ABS-KEY.
+        let mask = if mask == 0 { field_mask(&ALL_FIELDS) } else { mask };
         let key = (pat as *const Pattern as usize, mask);
         if let Some(&v) = self.terms.get(&key) {
             return v;
         }
-        // Multiple fields often resolve to the same buffer (missing sections
-        // fall back to the full text), so scan each distinct buffer once.
+        // Decode the mask into the section buffers (bits 0-3) plus the full
+        // text (bit 7). Multiple fields often resolve to the same buffer
+        // (missing sections fall back to the full text), so scan each
+        // distinct buffer once.
         let mut bufs: [&[u8]; 4] = [&[]; 4];
         let mut nb = 0usize;
-        for &f in fields {
-            let t = paper.text_lower(f);
-            if !bufs[..nb].iter().any(|&b| same_buf(b, t)) {
-                bufs[nb] = t;
-                nb += 1;
+        for f in 0..4u8 {
+            if mask & (1 << f) != 0 {
+                push_buf(&mut bufs, &mut nb, paper.text_lower(f));
             }
+        }
+        if mask & (1 << (F_ANY & 7)) != 0 {
+            push_buf(&mut bufs, &mut nb, paper.text_lower(F_ANY));
         }
         let mut v = false;
         for &b in &bufs[..nb] {
@@ -327,28 +406,22 @@ fn pat<'a>(table: &'a [Pattern], node: &Node) -> &'a Pattern {
 /// NOT > AND/W-n > OR; W/n requires presence only).
 pub fn eval(node: &Node, fields: Option<&[u8]>, paper: &Paper, table: &[Pattern]) -> bool {
     let mut memo = Memo::new();
-    eval_memo(node, fields, paper, table, &mut memo)
+    eval_memo(node, field_mask(fields.unwrap_or(&ALL_FIELDS)), paper, table, &mut memo)
 }
 
-fn eval_memo(
-    node: &Node,
-    fields: Option<&[u8]>,
-    paper: &Paper,
-    table: &[Pattern],
-    memo: &mut Memo,
-) -> bool {
+fn eval_memo(node: &Node, mask: u8, paper: &Paper, table: &[Pattern], memo: &mut Memo) -> bool {
     match node {
         Node::Leaf { .. } => {
             let p = pat(table, node);
-            memo.term_hit(paper, p, fields.unwrap_or(&ALL_FIELDS))
+            memo.term_hit(paper, p, mask)
         }
-        Node::Field { fields: fs, child } => eval_memo(child, Some(&field_ids(fs)), paper, table, memo),
-        Node::Not { child } => !eval_memo(child, fields, paper, table, memo),
+        Node::Field { fields: fs, child } => eval_memo(child, field_mask_from_strings(fs), paper, table, memo),
+        Node::Not { child } => !eval_memo(child, mask, paper, table, memo),
         Node::Group { op, children } => {
             if op == "OR" {
-                children.iter().any(|c| eval_memo(c, fields, paper, table, memo))
+                children.iter().any(|c| eval_memo(c, mask, paper, table, memo))
             } else {
-                children.iter().all(|c| eval_memo(c, fields, paper, table, memo))
+                children.iter().all(|c| eval_memo(c, mask, paper, table, memo))
             }
         }
     }
@@ -371,10 +444,22 @@ fn field_mask(fields: &[u8]) -> u8 {
 
 /// Per-keyword detail for a block: include terms hit/missed, excluded terms hit.
 pub fn scan_block(block: &Node, paper: &Paper, table: &[Pattern]) -> BlockScan {
-    let mut out = BlockScan { hits: Vec::new(), misses: Vec::new(), excluded_hits: Vec::new() };
     let mut memo = Memo::new();
-    rec(block, None, false, paper, table, &mut memo, &mut out);
-    out
+    scan_block_shared(block, paper, table, &mut memo).0
+}
+
+/// `scan_block` with a caller-owned `Memo` (share it across all blocks of a
+/// request so each distinct (pattern, field-mask) is searched once) and the
+/// block's boolean verdict computed in the same single traversal.
+pub fn scan_block_shared(
+    block: &Node,
+    paper: &Paper,
+    table: &[Pattern],
+    memo: &mut Memo,
+) -> (BlockScan, bool) {
+    let mut out = BlockScan { hits: Vec::new(), misses: Vec::new(), excluded_hits: Vec::new() };
+    let matched = rec(block, field_mask(&ALL_FIELDS), false, paper, table, memo, &mut out);
+    (out, matched)
 }
 
 /// Like `scan_block`, but each hit/miss also carries the field(s) the term is
@@ -394,13 +479,13 @@ pub fn scan_with_fields(
     let mut hits = Vec::new();
     let mut misses = Vec::new();
     let mut ex_hits = Vec::new();
-    let matched = rec_fields(block, None, false, paper, table, memo, &mut hits, &mut misses, &mut ex_hits);
+    let matched = rec_fields(block, field_mask(&ALL_FIELDS), false, paper, table, memo, &mut hits, &mut misses, &mut ex_hits);
     (hits, misses, ex_hits, matched)
 }
 
 fn rec_fields(
     node: &Node,
-    fields: Option<&[u8]>,
+    mask: u8,
     excluded: bool,
     paper: &Paper,
     table: &[Pattern],
@@ -412,8 +497,7 @@ fn rec_fields(
     match node {
         Node::Leaf { .. } => {
             let p = pat(table, node);
-            let found = memo.term_hit(paper, p, fields.unwrap_or(&ALL_FIELDS));
-            let mask = field_mask(fields.unwrap_or(&ALL_FIELDS));
+            let found = memo.term_hit(paper, p, mask);
             if excluded {
                 if found {
                     ex_hits.push(p.raw.clone());
@@ -426,22 +510,24 @@ fn rec_fields(
             found
         }
         Node::Field { fields: fs, child } => {
-            rec_fields(child, Some(&field_ids(fs)), excluded, paper, table, memo, hits, misses, ex_hits)
+            rec_fields(child, field_mask_from_strings(fs), excluded, paper, table, memo, hits, misses, ex_hits)
         }
         Node::Not { child } => {
-            !rec_fields(child, fields, !excluded, paper, table, memo, hits, misses, ex_hits)
+            !rec_fields(child, mask, !excluded, paper, table, memo, hits, misses, ex_hits)
         }
         Node::Group { op, children } => {
+            // Accumulate without short-circuiting so every leaf is still
+            // reported as a hit/miss/excluded term.
             if op == "OR" {
                 let mut acc = false;
                 for c in children {
-                    acc |= rec_fields(c, fields, excluded, paper, table, memo, hits, misses, ex_hits);
+                    acc |= rec_fields(c, mask, excluded, paper, table, memo, hits, misses, ex_hits);
                 }
                 acc
             } else {
                 let mut acc = true;
                 for c in children {
-                    acc &= rec_fields(c, fields, excluded, paper, table, memo, hits, misses, ex_hits);
+                    acc &= rec_fields(c, mask, excluded, paper, table, memo, hits, misses, ex_hits);
                 }
                 acc
             }
@@ -472,17 +558,17 @@ pub fn field_names(mask: u8) -> String {
 
 fn rec(
     node: &Node,
-    fields: Option<&[u8]>,
+    mask: u8,
     excluded: bool,
     paper: &Paper,
     table: &[Pattern],
     memo: &mut Memo,
     out: &mut BlockScan,
-) {
+) -> bool {
     match node {
         Node::Leaf { .. } => {
             let p = pat(table, node);
-            let found = memo.term_hit(paper, p, fields.unwrap_or(&ALL_FIELDS));
+            let found = memo.term_hit(paper, p, mask);
             if excluded {
                 if found {
                     out.excluded_hits.push(p.raw.clone());
@@ -492,12 +578,25 @@ fn rec(
             } else {
                 out.misses.push(p.raw.clone());
             }
+            found
         }
-        Node::Field { fields: fs, child } => rec(child, Some(&field_ids(fs)), excluded, paper, table, memo, out),
-        Node::Not { child } => rec(child, fields, !excluded, paper, table, memo, out),
-        Node::Group { children, .. } => {
-            for c in children {
-                rec(c, fields, excluded, paper, table, memo, out);
+        Node::Field { fields: fs, child } => rec(child, field_mask_from_strings(fs), excluded, paper, table, memo, out),
+        Node::Not { child } => !rec(child, mask, !excluded, paper, table, memo, out),
+        Node::Group { op, children } => {
+            // Accumulate without short-circuiting so every leaf is still
+            // reported in `out`.
+            if op == "OR" {
+                let mut acc = false;
+                for c in children {
+                    acc |= rec(c, mask, excluded, paper, table, memo, out);
+                }
+                acc
+            } else {
+                let mut acc = true;
+                for c in children {
+                    acc &= rec(c, mask, excluded, paper, table, memo, out);
+                }
+                acc
             }
         }
     }

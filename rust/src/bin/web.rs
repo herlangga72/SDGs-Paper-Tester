@@ -838,8 +838,9 @@ fn render_results(report: &[SdgReport], paper: &Paper, meta: &Meta, ms: f64) -> 
     if !terms.is_empty() {
         let text = paper.full_text().trim();
         if !text.is_empty() {
-            let lower = paper.text_lower(F_ANY).to_vec();
-            let hl_text = highlight(&lower, text, &terms);
+            // Pass the lowercased buffer by reference: no need to copy the
+            // whole text just to highlight matching substrings.
+            let hl_text = highlight(paper.text_lower(F_ANY), text, &terms);
             hl = format!(
                 "<div class=\"card highlight-card\">\n  <h3>Matched keywords highlighted in the \
                  paper text ({})</h3>\n  <div class=\"papertext\">{hl_text}</div>\n</div>",

@@ -215,6 +215,12 @@ fn cmd_match(args: &[String]) -> Result<(), String> {
         matcher::resolve_blocks(&mut q.blocks, &table);
     }
 
+    // One shared memo for the whole scan: buffers are indexed once and each
+    // distinct (pattern, field-mask) is searched once. Without this the CLI
+    // rebuilt a TextIndex and re-evaluated every term for every block, which
+    // is ~60x slower on large papers.
+    let mut memo = matcher::Memo::new();
+
     for q in &queries {
         println!("=== SDG {} ===", q.sdg);
         let mut matched: Vec<(usize, Vec<std::sync::Arc<str>>)> = Vec::new();
@@ -222,11 +228,11 @@ fn cmd_match(args: &[String]) -> Result<(), String> {
         let mut excluded_hits: Vec<std::sync::Arc<str>> = Vec::new();
 
         for (bno, block) in q.blocks.iter().enumerate() {
-            let scan = matcher::scan_block(block, &paper, &table);
+            let (scan, is_match) = matcher::scan_block_shared(block, &paper, &table, &mut memo);
             excluded_hits.extend(scan.excluded_hits.iter().cloned());
             let n_hit = scan.hits.len();
             let n_miss = scan.misses.len();
-            if matcher::eval(block, None, &paper, &table) {
+            if is_match {
                 matched.push((bno, scan.hits));
             } else {
                 near.push((bno, scan.misses, n_hit, n_miss));
