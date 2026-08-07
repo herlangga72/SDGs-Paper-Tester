@@ -81,9 +81,12 @@ impl TextIndex {
         TextIndex { bytes, bigrams, quads, quad_mask }
     }
 
-    /// True if the literal part *could* appear in the indexed text. Uses the
-    /// first 4 bytes (or fewer for short parts) which any occurrence must
-    /// contain, so a false return is a hard no.
+    /// True if the literal part *could* appear in the indexed text. Any
+    /// occurrence of `part` must contain every one of its internal 4-byte
+    /// windows, so we require all of them to be present. Checking all quads
+    /// (not just the first) rejects e.g. a part whose first 4 bytes appear
+    /// but whose full word does not, which is the common false-positive
+    /// driving wasted SIMD scans. A false return is still a hard no.
     pub fn could_contain(&self, part: &[u8]) -> bool {
         match part.len() {
             0 => true,
@@ -94,10 +97,18 @@ impl TextIndex {
                 (self.bigrams[(a << 2) | (b >> 6)] >> (b & 63)) & 1 != 0
             }
             _ => {
-                let q = u32::from_le_bytes([part[0], part[1], part[2], part[3]]);
-                let (h1, h2) = bloom_hashes(q, self.quad_mask);
-                ((self.quads[(h1 >> 6) as usize] >> (h1 & 63)) & 1) != 0
-                    && ((self.quads[(h2 >> 6) as usize] >> (h2 & 63)) & 1) != 0
+                let mut w = 0;
+                while w + 4 <= part.len() {
+                    let q = u32::from_le_bytes([part[w], part[w + 1], part[w + 2], part[w + 3]]);
+                    let (h1, h2) = bloom_hashes(q, self.quad_mask);
+                    if ((self.quads[(h1 >> 6) as usize] >> (h1 & 63)) & 1) == 0
+                        || ((self.quads[(h2 >> 6) as usize] >> (h2 & 63)) & 1) == 0
+                    {
+                        return false;
+                    }
+                    w += 1;
+                }
+                true
             }
         }
     }
