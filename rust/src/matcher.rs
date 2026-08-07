@@ -186,8 +186,16 @@ pub fn compile_all<'a>(blocks: impl Iterator<Item = &'a Node>) -> Vec<Pattern> {
 /// nodes), so it is threaded down here rather than recomputed at match time.
 /// `slot` is a dense index over the live `(pid, mask)` pairs; the per-request
 /// memo is a `Vec<u8>` of `nslots` entries (see `Memo::with_slots`).
-/// Returns the number of distinct `(pid, mask)` slots assigned.
-pub fn resolve_blocks(blocks: &mut [Node], table: &[Pattern]) -> usize {
+///
+/// The slot space is GLOBAL across every `resolve_blocks` call: pass a shared
+/// `&mut u32` counter and increment it as new `(pid, mask)` pairs are seen.
+/// Callers that scan multiple queries with a single shared `Memo` MUST use one
+/// counter for the whole loop (web.rs, main.rs) — otherwise leaves in different
+/// queries get colliding slot ids and share memo entries, corrupting results.
+///
+/// Returns the total number of distinct `(pid, mask)` slots assigned so far
+/// (after this call).
+pub fn resolve_blocks(blocks: &mut [Node], table: &[Pattern], nslots: &mut u32) -> usize {
     let mut map: HashMap<&str, usize> = HashMap::with_capacity(table.len());
     for (i, p) in table.iter().enumerate() {
         map.insert(p.raw.as_ref(), i);
@@ -196,8 +204,9 @@ pub fn resolve_blocks(blocks: &mut [Node], table: &[Pattern]) -> usize {
     // order. `pid` is already dense over the table, so keying the memo array
     // on `pid` alone would be too coarse (the same pattern under different
     // field masks can give different results) — hence a (pid, mask) slot.
+    // `slot_of` is local per call, but `nslots` is the GLOBAL running counter
+    // so slots never collide across queries that share one Memo.
     let mut slot_of: HashMap<(u32, u8), u32> = HashMap::new();
-    let mut nslots = 0u32;
     fn assign(
         node: &mut Node,
         mask: u8,
@@ -233,9 +242,9 @@ pub fn resolve_blocks(blocks: &mut [Node], table: &[Pattern]) -> usize {
     }
     let default_mask = field_mask(&ALL_FIELDS);
     for b in blocks {
-        assign(b, default_mask, &map, &mut slot_of, &mut nslots);
+        assign(b, default_mask, &map, &mut slot_of, &mut *nslots);
     }
-    nslots as usize
+    *nslots as usize
 }
 
 #[inline]
@@ -453,9 +462,15 @@ impl Memo {
     /// and slot are both precomputed and stamped on the leaf by
     /// `resolve_blocks`, so the caller passes them straight through.
     fn term_hit(&mut self, paper: &Paper, pat: &Pattern, mask: u8, slot: usize) -> bool {
-        if let Some(&v) = self.terms.get(slot) {
-            // 0 = unset; anything else is the cached verdict.
-            return v == 2;
+        // 0 = unset. A slot present but still 0 is NOT a cached verdict, so
+        // recompute (slots are global across all blocks, and traversal may
+        // resize the vec to a high slot before a lower slot is first visited).
+        if slot < self.terms.len() {
+            match self.terms[slot] {
+                1 => return false,
+                2 => return true,
+                _ => {}
+            }
         }
         let v = self.compute(paper, pat, mask);
         // Grow on demand so `Memo::new()` needs no slot count (resizes once

@@ -215,8 +215,9 @@ fn cmd_match(args: &[String]) -> Result<(), String> {
     // Precompile every keyword once into a dense table and resolve each
     // leaf to its pattern index; scanning is then read-only.
     let table = matcher::compile_all(queries.iter().flat_map(|q| q.blocks.iter()));
+    let mut nslots = 0u32;
     for q in &mut queries {
-        matcher::resolve_blocks(&mut q.blocks, &table);
+        matcher::resolve_blocks(&mut q.blocks, &table, &mut nslots);
     }
 
     // One shared memo for the whole scan: buffers are indexed once and each

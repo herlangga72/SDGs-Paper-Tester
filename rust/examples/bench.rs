@@ -12,8 +12,9 @@ fn main() {
     let mut queries =
         load_queries(Path::new("/home/server/Downloads/sdg-paper-matcher/engine/data/queries")).unwrap();
     let table = matcher::compile_all(queries.iter().flat_map(|q| q.blocks.iter()));
+    let mut nslots = 0u32;
     for q in &mut queries {
-        matcher::resolve_blocks(&mut q.blocks, &table);
+        matcher::resolve_blocks(&mut q.blocks, &table, &mut nslots);
     }
     let n_blocks: usize = queries.iter().map(|q| q.blocks.len()).sum();
     for round in 0..3 {

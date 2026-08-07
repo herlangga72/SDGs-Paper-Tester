@@ -32,8 +32,9 @@ fn main() {
     let mut q =
         load_queries(Path::new("/home/server/Downloads/sdg-paper-matcher/engine/data/queries")).unwrap();
     let t = matcher::compile_all(q.iter().flat_map(|x| x.blocks.iter()));
+    let mut nslots = 0u32;
     for x in &mut q {
-        matcher::resolve_blocks(&mut x.blocks, &t);
+        matcher::resolve_blocks(&mut x.blocks, &t, &mut nslots);
     }
     let mut pairs = HashSet::new();
     let mut masks = HashSet::new();

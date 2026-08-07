@@ -116,8 +116,9 @@ fn app() -> &'static (Vec<Query>, Vec<Pattern>) {
         // keyword strings. (Previously ~21k patterns were recompiled per
         // request, which dominated the per-request cost.)
         let table = matcher::compile_all(queries.iter().flat_map(|q| q.blocks.iter()));
+        let mut nslots = 0u32;
         for q in &mut queries {
-            matcher::resolve_blocks(&mut q.blocks, &table);
+            matcher::resolve_blocks(&mut q.blocks, &table, &mut nslots);
         }
         eprintln!(
             "[web] precompiled {} patterns in {:.1} ms",
