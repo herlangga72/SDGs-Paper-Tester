@@ -40,7 +40,9 @@ sdg-paper-matcher/
 **Engine** = the brains: parses the Elsevier Scopus SDG query files into an
 AST and evaluates a paper against the ASTs. Two implementations with
 identical semantics: the Rust engine (`rust/src/lib.rs`, SIMD-accelerated)
-and the reference Python engine (`engine/`).
+and the reference Python engine (`engine/`). `tests/parity_check.py` runs
+both engines over the sample papers and fails on any block-level
+disagreement.
 
 **Webserver** = the face: a threaded HTTP server written in Rust
 (`rust/src/bin/web.rs`) that serves a browser UI (form, paste, samples,
