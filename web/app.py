@@ -258,7 +258,47 @@ def highlight(text: str, terms: list[str]) -> str:
 
 CROSSREF_URL = "https://api.crossref.org/works/{}"
 CROSSREF_UA = "sdg-paper-matcher/2.0 (local paper-matching app)"
+_LANDING_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+               "(KHTML, like Gecko) Chrome/120.0 Safari/537.36")
 _JATS_TAG = re.compile(r"<[^>]+>")
+
+
+def _split_keywords(s: str) -> list[str]:
+    """Split a keywords string on commas/semicolons: trim, drop empties, dedupe."""
+    out: list[str] = []
+    for part in re.split(r"[;,]", s):
+        t = part.strip()
+        if t and t not in out:
+            out.append(t)
+    return out
+
+
+def _landing_page_keywords(doi: str) -> list[str]:
+    """Best-effort author keywords from the DOI landing page, used when
+    Crossref has no `subject`. Tries the Google-Scholar `citation_keywords`
+    meta tag first (Springer/Elsevier/IEEE/...), then the
+    `Keywords</strong><div class="txt">` markup used by Business
+    Perspectives. Never fails the DOI lookup: on any network error, timeout
+    or parse miss it returns an empty list.
+    """
+    url = f"https://doi.org/{urllib.parse.quote(doi, safe='')}"
+    req = urllib.request.Request(url, headers={"User-Agent": _LANDING_UA, "Accept": "text/html"})
+    try:
+        with urllib.request.urlopen(req, timeout=12) as r:
+            page = r.read().decode("utf-8", "replace")
+    except Exception:
+        return []
+    m = re.search(
+        r'<meta\s+name=["\']citation_keywords["\']\s+content=["\']([^"\']*)["\']',
+        page, re.I)
+    if m:
+        kws = _split_keywords(html.unescape(m.group(1)))
+        if kws:
+            return kws
+    m = re.search(r"Keywords</strong>\s*<div class=\"txt\">(.*?)</div>", page, re.I | re.S)
+    if m:
+        return _split_keywords(html.unescape(_JATS_TAG.sub(" ", m.group(1))))
+    return []
 
 
 def fetch_doi(doi: str) -> dict:
@@ -315,6 +355,10 @@ def fetch_doi(doi: str) -> dict:
     subjects = [html.unescape(s).strip() for s in msg.get("subject", []) if s.strip()]
     if subjects:  # publisher subjects are the closest thing Crossref has to keywords
         out["keywords"] = subjects
+    else:  # no Crossref subject: fall back to the DOI landing page (best-effort)
+        kws = _landing_page_keywords(doi)
+        if kws:
+            out["keywords"] = kws
     return out
 
 

@@ -504,6 +504,8 @@ fn strip_tags_collapse(s: &str) -> String {
 // ---------------------------------------------------------------------------
 
 const CROSSREF_UA: &str = "sdg-paper-matcher/2.0 (local paper-matching app, Rust)";
+const LANDING_UA: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \
+(KHTML, like Gecko) Chrome/120.0 Safari/537.36";
 
 fn normalize_doi(doi: &str) -> String {
     let mut d = doi.trim();
@@ -537,6 +539,147 @@ fn valid_doi(doi: &str) -> bool {
     }
     i += 1;
     i < b.len() && b[i..].iter().all(|c| !c.is_ascii_whitespace())
+}
+
+/// Value of the `key` attribute inside a single tag, with either quote
+/// style (or bare); `None` when absent. The value keeps its original case
+/// (byte offsets are identical in the lowercased copy).
+fn attr_value_of(tag: &str, key: &str) -> Option<String> {
+    let lower = tag.to_ascii_lowercase();
+    let mut from = 0usize;
+    while let Some(rel) = lower[from..].find(key) {
+        let mut j = from + rel + key.len();
+        while j < lower.len() && (lower.as_bytes()[j] as char).is_whitespace() {
+            j += 1;
+        }
+        if j >= lower.len() || lower.as_bytes()[j] != b'=' {
+            from = j + 1;
+            continue;
+        }
+        j += 1;
+        while j < lower.len() && (lower.as_bytes()[j] as char).is_whitespace() {
+            j += 1;
+        }
+        if j >= lower.len() {
+            return None;
+        }
+        let (s, e) = match lower.as_bytes()[j] {
+            b'"' => {
+                let s = j + 1;
+                (s, lower[s..].find('"').map(|x| s + x).unwrap_or(lower.len()))
+            }
+            b'\'' => {
+                let s = j + 1;
+                (s, lower[s..].find('\'').map(|x| s + x).unwrap_or(lower.len()))
+            }
+            _ => {
+                let s = j;
+                (
+                    s,
+                    lower[s..]
+                        .find(|c: char| c.is_whitespace() || c == '>')
+                        .map(|x| s + x)
+                        .unwrap_or(lower.len()),
+                )
+            }
+        };
+        if e > s {
+            return Some(tag[s..e].to_string());
+        }
+        from = e + 1;
+    }
+    None
+}
+
+/// Value of `<meta name="NAME" content="...">` (name matched case-insensitively).
+fn meta_tag_content(html: &str, name: &str) -> Option<String> {
+    let lower = html.to_ascii_lowercase(); // same byte length as `html`
+    let mut from = 0usize;
+    while let Some(rel) = lower[from..].find("<meta") {
+        let start = from + rel;
+        let tag_end = lower[start..].find('>').map(|x| start + x).unwrap_or(lower.len());
+        if attr_value_of(&lower[start..tag_end], "name").as_deref() == Some(name) {
+            if let Some(v) = attr_value_of(&html[start..tag_end], "content") {
+                let v = html_unescape(&v).trim().to_string();
+                if !v.is_empty() {
+                    return Some(v);
+                }
+            }
+        }
+        from = start + 1;
+    }
+    None
+}
+
+/// Split a keywords string on commas/semicolons: trim, drop empties, dedupe.
+fn split_keywords(s: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for part in s.split([',', ';']) {
+        let t = part.trim();
+        if !t.is_empty() && seen.insert(t.to_string()) {
+            out.push(t.to_string());
+        }
+    }
+    out
+}
+
+/// Text of the `<div class="txt">` that follows a `Keywords` label
+/// (Business Perspectives renders author keywords that way).
+fn keywords_label_content(html: &str) -> Option<String> {
+    let mut from = 0usize;
+    while let Some(rel) = html[from..].find("Keywords") {
+        let i = from + rel;
+        let tail = &html[i + "Keywords".len()..];
+        if let Some(d) = tail.find("<div class=\"txt\">") {
+            let content = &tail[d + "<div class=\"txt\">".len()..];
+            let end = content.find("</div>").unwrap_or(content.len());
+            let text = strip_tags_collapse(&content[..end]);
+            if !text.is_empty() {
+                return Some(text);
+            }
+        }
+        from = i + 1;
+    }
+    None
+}
+
+/// Best-effort author keywords from the DOI landing page, used when
+/// Crossref has no `subject` (the closest thing it usually has to
+/// keywords). Tries the Google-Scholar `citation_keywords` meta tag first
+/// (Springer/Elsevier/IEEE/…), then the `Keywords</strong><div class="txt">`
+/// markup used by Business Perspectives. Never fails the DOI lookup: on any
+/// network error, timeout or parse miss it returns an empty list.
+fn fetch_landing_keywords(doi: &str) -> Vec<String> {
+    let url = format!("https://doi.org/{}", percent_encode(doi));
+    let agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(12)))
+        .max_redirects(10)
+        .build()
+        .new_agent();
+    let mut resp = match agent
+        .get(&url)
+        .header("User-Agent", LANDING_UA)
+        .header("Accept", "text/html")
+        .call()
+    {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    let html = match resp.body_mut().read_to_string() {
+        Ok(h) => h,
+        Err(_) => return Vec::new(),
+    };
+    if let Some(v) = meta_tag_content(&html, "citation_keywords") {
+        let kws = split_keywords(&v);
+        if !kws.is_empty() {
+            return kws;
+        }
+    }
+    if let Some(v) = keywords_label_content(&html) {
+        return split_keywords(&v);
+    }
+    Vec::new()
 }
 
 fn percent_encode(s: &str) -> String {
@@ -653,7 +796,17 @@ fn fetch_doi(doi: &str) -> Result<String, (u16, String)> {
         .map_err(|e| (502, format!("network error: {e}")))?;
     let v: serde_json::Value =
         serde_json::from_str(&body).map_err(|e| (502, format!("bad Crossref response: {e}")))?;
-    Ok(crossref_json(&v, &d))
+    let mut body = crossref_json(&v, &d);
+    if !body.contains("\"keywords\"") {
+        // Crossref has no subject for this DOI: fall back to the DOI
+        // landing page's author keywords (best-effort, never fails).
+        let kws = fetch_landing_keywords(&d);
+        if !kws.is_empty() {
+            let arr: Vec<String> = kws.iter().map(|s| jstr(s)).collect();
+            body = format!("{},\"keywords\":[{}]}}", &body[..body.len() - 1], arr.join(","));
+        }
+    }
+    Ok(body)
 }
 
 // ---------------------------------------------------------------------------
@@ -1612,5 +1765,47 @@ mod tests {
         assert_eq!(glob_match_span(b"a?b", b"ab", &mut budget), None);
         // star matches zero bytes
         assert_eq!(glob_match_span(b"ab*", b"ab", &mut budget), Some((0, 2)));
+    }
+}
+
+#[cfg(test)]
+mod keyword_parse_tests {
+    use super::*;
+
+    #[test]
+    fn meta_citation_keywords() {
+        let html = "<html><head>\
+            <meta name=\"citation_keywords\" content=\"climate change; green finance\">\
+            <meta name=\"keywords\" content=\"junk site keywords\">\
+            </head></html>";
+        assert_eq!(meta_tag_content(html, "citation_keywords").as_deref(),
+                   Some("climate change; green finance"));
+        assert_eq!(meta_tag_content(html, "keywords").as_deref(), Some("junk site keywords"));
+        assert_eq!(meta_tag_content("<meta name='citation_keywords' content='a; b'>", "citation_keywords"),
+                   Some("a; b".to_string()));
+        assert_eq!(meta_tag_content("<meta name=\"keywords\">", "keywords"), None);
+    }
+
+    #[test]
+    fn keywords_label_div_txt() {
+        let html = "<li><strong class=\"title\">Keywords</strong>\
+            <div class=\"txt\"><a href=\"/tag/a\">descriptive analysis</a>, \
+            <a href=\"/tag/b\">Islamic finance</a></div></li>";
+        let txt = keywords_label_content(html).expect("label keywords");
+        assert_eq!(split_keywords(&txt), vec!["descriptive analysis", "Islamic finance"]);
+        // no label -> nothing
+        assert_eq!(keywords_label_content("<p>no keywords here</p>"), None);
+    }
+
+    #[test]
+    fn split_keywords_commas_and_semicolons() {
+        assert_eq!(split_keywords("a, b; c , d"), vec!["a", "b", "c", "d"]);
+        assert_eq!(split_keywords("a, a, b"), vec!["a", "b"]);
+        assert_eq!(split_keywords(", ; "), Vec::<String>::new());
+    }
+
+    #[test]
+    fn meta_tag_not_found_returns_none() {
+        assert_eq!(meta_tag_content("<meta name=\"description\" content=\"x\">", "citation_keywords"), None);
     }
 }

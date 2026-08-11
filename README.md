@@ -71,8 +71,11 @@ The legacy Python server still works if you prefer it:
   Journal, DOI, Keywords, Abstract), raw YAML-frontmatter paste, sample
   papers, or file upload.
 - **Auto-fill from DOI**: paste a DOI or `https://doi.org/...` link — the
-  app queries the free Crossref API and fills title, authors, year, journal
-  and (when the publisher provides it) the abstract.
+  app queries the free Crossref API and fills title, authors, year, journal,
+  abstract and keywords. When Crossref has no `subject` for a DOI it falls
+  back to the DOI landing page for the author keywords (the Google Scholar
+  `citation_keywords` meta tag, or the publisher's Keywords block), because
+  the Scopus SDG queries also search author keywords.
 - **Per-SDG report**: matched query blocks with the keywords that hit (and
   the field Scopus looks at), near-miss blocks with the exact keywords to
   add, excluded terms found in the text, and all matched keywords
@@ -90,8 +93,10 @@ The legacy Python server still works if you prefer it:
 - **Gzip responses**: HTML/JSON are compressed when the client sends
   `Accept-Encoding: gzip`.
 - Matching semantics identical to Scopus: `NOT > AND/W-n > OR` precedence,
-  whole-word matching, `*`/`?` wildcards — implemented the same way in the
-  Rust engine and the reference Python engine.
+  whole-word matching, `*`/`?` wildcards (`*` matches within a word only, so
+  `financ* cris*` needs "financial crisis", not "financ … crisis" anywhere
+  in the text) — implemented the same way in the Rust engine and the
+  reference Python engine.
 
 ## Deploy for free
 
@@ -110,7 +115,7 @@ Step-by-step instructions: [DEPLOY.md](DEPLOY.md).
 | `GET /static/<file>` | CSS / JS |
 | `GET /samples` | JSON list of sample papers |
 | `GET /sample?name=X&format=json` | parsed fields of a sample |
-| `GET /doi?doi=…` | Crossref lookup → JSON fields |
+| `GET /doi?doi=…` | Crossref lookup → JSON fields (keywords fall back to the DOI landing page) |
 | `POST /match` | form fields or `paper` text / `file` upload → HTML report |
 | `POST /api/match` | same input → JSON report (see [Web API](#web-api)) |
 | `GET /health` | liveness |

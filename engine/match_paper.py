@@ -70,7 +70,7 @@ import re
 import sqlite3
 import sys
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # repo root
@@ -83,28 +83,76 @@ DEFAULT_DB = "sdg_queries.sqlite3"  # built by sdg2sqlite.py
 # Matching primitives
 # --------------------------------------------------------------------------
 
-_PAT_CACHE: dict[str, re.Pattern] = {}
+_PAT_CACHE: dict[str, object] = {}
+
+_WS = " \t\n\r\x0b\x0c"  # ASCII whitespace (same set as Rust is_ascii_whitespace)
 
 
-def term_pattern(term: str) -> re.Pattern:
-    """'*'/'?' wildcards -> regex; plain terms are matched as whole words
-    (Scopus phrase semantics)."""
+class GlobStar:
+    """Scopus `*` semantics for terms without `?`: the literal parts must
+    appear in order and only non-whitespace may sit between them, so `*`
+    matches within a word only. `financ* cris*` therefore requires
+    "financial crisis" and NOT "financ … crisis" anywhere in the text
+    (mirrors the Rust engine's `Pattern::matches`; Scopus semantics).
+
+    The first part must start at its *first* occurrence, like the Rust
+    implementation, so results stay identical between the engines.
+    """
+
+    __slots__ = ("parts",)
+
+    def __init__(self, term: str):
+        self.parts = [p for p in term.lower().split("*") if p]
+
+    def search(self, text: str) -> bool:
+        """`text` must already be lowercased."""
+        parts = self.parts
+        if not parts:  # bare '*' (or empty term) matches anything
+            return True
+        i = text.find(parts[0])
+        if i < 0:
+            return False
+        i += len(parts[0])
+        for part in parts[1:]:
+            while True:
+                j = text.find(part, i)
+                if j < 0:
+                    return False
+                if not any(c in _WS for c in text[i:j]):
+                    i = j + len(part)
+                    break
+                i = j + 1
+        return True
+
+
+def term_pattern(term: str):
+    """'*'/'?' wildcards -> matcher; plain terms are matched as whole words
+    (Scopus phrase semantics).
+
+    Terms with '*' but no '?' use GlobStar (word-internal `*`, like Scopus
+    and the Rust engine). Terms with '?' keep the regex glob: `?` matches a
+    single character and, like the Rust glob fallback, `*` in such terms may
+    span anything.
+    """
     pat = _PAT_CACHE.get(term)
     if pat is not None:
         return pat
-    out = []
-    for piece in re.split(r"([*?])", term):
-        if piece == "*":
-            out.append(".*")
-        elif piece == "?":
-            out.append(".")
-        else:
-            out.append(re.escape(piece))
-    rx = rf"\b{''.join(out)}\b" if "*" not in term and "?" not in term else "".join(out)
-    # DOTALL: the paper fields join YAML block-scalar lines with '\n';
-    # a phrase like "foreign* trad*" must match across line breaks
-    # (Scopus treats all whitespace alike).
-    pat = re.compile(rx, re.IGNORECASE | re.DOTALL)
+    if "*" in term and "?" not in term:
+        pat = GlobStar(term)
+    else:
+        out = []
+        for piece in re.split(r"([*?])", term):
+            if piece == "*":
+                out.append(".*")
+            elif piece == "?":
+                out.append(".")
+            else:
+                out.append(re.escape(piece))
+        rx = rf"\b{''.join(out)}\b" if "*" not in term and "?" not in term else "".join(out)
+        # DOTALL: the paper fields join YAML block-scalar lines with '\n';
+        # '?' globs (and '*' in terms that also contain '?') may span line
+        # breaks, like the Rust glob fallback.
+        pat = re.compile(rx, re.IGNORECASE | re.DOTALL)
     _PAT_CACHE[term] = pat
     return pat
 
@@ -114,18 +162,30 @@ class Paper:
     """Field texts. Missing fields fall back to the full text."""
     sections: dict[str, str]
     full_text: str
+    _lowered: dict[str, str] = field(default_factory=dict)
 
     def text_for(self, field: str) -> str:
         if field in self.sections and self.sections[field].strip():
             return self.sections[field]
         return self.full_text
 
+    def lowered(self, field: str) -> str:
+        """Lowercased field text, cached per paper (GlobStar matches on it)."""
+        lt = self._lowered.get(field)
+        if lt is None:
+            lt = self.text_for(field).lower()
+            self._lowered[field] = lt
+        return lt
+
 
 def term_hit(term: str, fields: tuple[str, ...], paper: Paper) -> bool:
     pat = term_pattern(term)
     field_set = set(fields) if fields else {"TITLE", "ABS", "KEY", "AUTHKEY"}
     for f in field_set:
-        if pat.search(paper.text_for(f)):
+        if isinstance(pat, GlobStar):
+            if pat.search(paper.lowered(f)):
+                return True
+        elif pat.search(paper.text_for(f)):
             return True
     return False
 
