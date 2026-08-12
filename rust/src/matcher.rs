@@ -596,15 +596,15 @@ impl<'a> Memo<'a> {
             return idx;
         }
         let mut cap = 0usize;
-        for k in 0..n {
-            cap += self.bufs[ids[k] as usize].len();
+        for &id in &ids[..n] {
+            cap += self.bufs[id as usize].len();
         }
         let mut buf = Vec::with_capacity(cap + n);
         let mut segs = [(0usize, 0usize); 5];
         let mut nsegs = 0usize;
-        for k in 0..n {
-            let b = self.bufs[ids[k] as usize];
-            if k > 0 {
+        for &id in &ids[..n] {
+            let b = self.bufs[id as usize];
+            if nsegs > 0 {
                 buf.push(b'\n');
             }
             let start = buf.len();
@@ -837,6 +837,43 @@ pub fn flatten_block(block: &Node, table: &[Pattern]) -> FlatBlock {
     fb
 }
 
+/// Tiny boolean stack: 32 inline slots plus a heap fallback. 2974 of the
+/// 2975 corpus blocks never exceed depth 32 (measured 2026-08), so the
+/// per-block stack allocation of the previous `Vec::with_capacity(8)` is
+/// gone; only pathological deep spines (SDG07 b1 reaches 611) touch the
+/// heap.
+struct BoolStack {
+    buf: [bool; 32],
+    sp: usize,
+    extra: Vec<bool>,
+}
+
+impl BoolStack {
+    fn new() -> BoolStack {
+        BoolStack { buf: [false; 32], sp: 0, extra: Vec::new() }
+    }
+    #[inline]
+    fn push(&mut self, v: bool) {
+        if self.sp < 32 {
+            self.buf[self.sp] = v;
+            self.sp += 1;
+        } else {
+            self.extra.push(v);
+        }
+    }
+    #[inline]
+    fn pop(&mut self) -> bool {
+        if let Some(v) = self.extra.pop() {
+            return v;
+        }
+        if self.sp == 0 {
+            return false;
+        }
+        self.sp -= 1;
+        self.buf[self.sp]
+    }
+}
+
 /// Scan a flattened block: evaluate the postfix program for the verdict and
 /// classify every leaf occurrence. Same output contract as `scan_with_fields`
 /// (hits/misses/excluded lists with per-leaf field masks, duplicates kept),
@@ -872,7 +909,7 @@ pub fn scan_flat_into<'a, 'b>(
     let report = !prof::skip_report();
     #[cfg(not(feature = "prof"))]
     let report = true;
-    let mut stack: Vec<bool> = Vec::with_capacity(8);
+    let mut stack = BoolStack::new();
     for op in &flat.prog {
         match *op {
             Op::Push(i) => {
@@ -899,22 +936,22 @@ pub fn scan_flat_into<'a, 'b>(
             Op::True => stack.push(true),
             Op::False => stack.push(false),
             Op::Not => {
-                let t = stack.pop().unwrap_or(false);
+                let t = stack.pop();
                 stack.push(!t);
             }
             Op::And => {
-                let b = stack.pop().unwrap_or(false);
-                let a = stack.pop().unwrap_or(false);
+                let b = stack.pop();
+                let a = stack.pop();
                 stack.push(a && b);
             }
             Op::Or => {
-                let b = stack.pop().unwrap_or(false);
-                let a = stack.pop().unwrap_or(false);
+                let b = stack.pop();
+                let a = stack.pop();
                 stack.push(a || b);
             }
         }
     }
-    stack.pop().unwrap_or(false)
+    stack.pop()
 }
 
 /// Compact mask of a field list (bit 0-3 = TITLE/ABS/KEY/AUTHKEY, bit 7 = ANY).
