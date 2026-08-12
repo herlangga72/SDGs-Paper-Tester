@@ -1121,6 +1121,72 @@ mod tests {
         }
     }
 
+    /// Frontmatter + body papers take the `full_covers_sections = false`
+    /// path (per-field buffers, body is the full text). Flat and AST scans
+    /// must still agree, and a body-only term must not leak into a
+    /// TITLE-scoped search.
+    #[test]
+    fn flat_matches_ast_with_body_text() {
+        use crate::query::{load_queries, Query};
+        use std::path::Path;
+
+        let text = "---
+title: \"Climate finance and energy poverty\"
+abstract: |
+  We study climate finance flows to developing countries.
+keywords: [energy poverty]
+---
+This is the body. It discusses carbon markets and debt relief at length.";
+        let paper = Paper::from_text(text);
+        assert!(!paper.full_covers_sections, "body text must disable full-text folding");
+
+        let qdir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../engine/data/queries");
+        let mut queries = load_queries(&qdir).unwrap();
+        let table = compile_all(queries.iter().flat_map(|q| q.blocks.iter()));
+        let mut nslots = 0u32;
+        for q in &mut queries {
+            resolve_blocks(&mut q.blocks, &table, &mut nslots);
+        }
+        let flats: Vec<Vec<FlatBlock>> = queries
+            .iter()
+            .map(|q| q.blocks.iter().map(|b| flatten_block(b, &table)).collect())
+            .collect();
+        let mut memo = Memo::new(&paper, nslots);
+        for (qi, q) in queries.iter().enumerate() {
+            for (bi, b) in q.blocks.iter().enumerate() {
+                let ast = scan_with_fields(b, &paper, &table, &mut memo);
+                let flat = scan_flat(&flats[qi][bi], &table, &mut memo);
+                assert_eq!(flat.3, ast.3, "verdict mismatch q{qi} b{bi}");
+                assert_eq!(
+                    flat.0.iter().map(|(s, m)| ((*s).to_owned(), *m)).collect::<Vec<_>>(),
+                    ast.0.iter().map(|(s, m)| (s.to_string(), *m)).collect::<Vec<_>>(),
+                    "hits mismatch q{qi} b{bi}"
+                );
+                assert_eq!(
+                    flat.1.iter().map(|(s, m)| ((*s).to_owned(), *m)).collect::<Vec<_>>(),
+                    ast.1.iter().map(|(s, m)| (s.to_string(), *m)).collect::<Vec<_>>(),
+                    "misses mismatch q{qi} b{bi}"
+                );
+            }
+        }
+
+        // A TITLE-scoped term present only in the body must NOT match.
+        let mut q = Query { sdg: "t".into(), blocks: Vec::new() };
+        let root = crate::parser::Parser::new(crate::tokenizer::tokenize("TITLE(carbon markets)").unwrap())
+            .parse()
+            .unwrap();
+        q.blocks = match &root {
+            crate::ast::Node::Group { op, children } if op == "OR" => children.clone(),
+            _ => vec![root],
+        };
+        let table2 = compile_all(q.blocks.iter());
+        let mut nslots2 = 0u32;
+        resolve_blocks(&mut q.blocks, &table2, &mut nslots2);
+        let f = flatten_block(&q.blocks[0], &table2);
+        let mut memo2 = Memo::new(&paper, nslots2);
+        assert!(!scan_flat(&f, &table2, &mut memo2).3, "body text leaked into TITLE scope");
+    }
+
     #[test]
     fn pattern_matches_plain_term() {
         let p = compile_pattern("foreign aid");
