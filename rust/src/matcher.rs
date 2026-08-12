@@ -340,19 +340,46 @@ fn find_boundary(hay: &[u8], needle: &[u8]) -> bool {
     }
 }
 
-/// Classic glob match: `*` = any sequence, `?` = one byte.
+/// Substring glob with Scopus `?` semantics, matching the reference Python
+/// engine (`re.search` with `re.DOTALL`): `?` = any single byte, `*` = any
+/// run (including newlines), and the pattern matches ANY substring of
+/// `text` - not just a match anchored at the start. Runs per field segment
+/// on folded buffers, so a pattern can never span fields.
+///
+/// Only the three corpus patterns containing `?` reach this path, and their
+/// results are memoized per (pattern, mask), so the O(n*m) start-offset
+/// scan is negligible.
 fn glob_match(pat: &[u8], text: &[u8]) -> bool {
+    for start in 0..=text.len() {
+        if glob_match_at(pat, &text[start..]) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Classic iterative glob with star backtracking. Succeeds as soon as the
+/// pattern is fully consumed: leftover text is allowed (substring
+/// semantics), unlike an anchored whole-string match.
+fn glob_match_at(pat: &[u8], text: &[u8]) -> bool {
     let (mut p, mut t) = (0usize, 0usize);
     let (mut star, mut mark) = (None, 0usize);
-    while t < text.len() {
-        if p < pat.len() && (pat[p] == b'?' || pat[p] == text[t]) {
+    while p < pat.len() {
+        if t < text.len() && (pat[p] == b'?' || pat[p] == text[t]) {
             p += 1;
             t += 1;
-        } else if p < pat.len() && pat[p] == b'*' {
+        } else if pat[p] == b'*' {
             star = Some(p);
             mark = t;
             p += 1;
         } else if let Some(sp) = star {
+            // Backtrack: advance the star's end by one. Once it has consumed
+            // the whole text there is nothing left to try (this bound also
+            // prevents `t` from running past the text end forever when the
+            // star's suffix can never match).
+            if mark >= text.len() {
+                return false;
+            }
             p = sp + 1;
             mark += 1;
             t = mark;
@@ -360,10 +387,7 @@ fn glob_match(pat: &[u8], text: &[u8]) -> bool {
             return false;
         }
     }
-    while p < pat.len() && pat[p] == b'*' {
-        p += 1;
-    }
-    p == pat.len()
+    true
 }
 
 impl Pattern {
@@ -1185,6 +1209,120 @@ This is the body. It discusses carbon markets and debt relief at length.";
         let f = flatten_block(&q.blocks[0], &table2);
         let mut memo2 = Memo::new(&paper, nslots2);
         assert!(!scan_flat(&f, &table2, &mut memo2).3, "body text leaked into TITLE scope");
+    }
+
+    /// Edge papers that stress the folded-buffer logic the repo papers do
+    /// not: '?'-glob matches and cross-field non-matches, '*' parts split
+    /// across fields, unicode bytes, empty and whitespace-only papers, and
+    /// a large body. Flat and AST scans must agree block-for-block, and
+    /// cross-field matches must not happen.
+    #[test]
+    fn flat_matches_ast_edge_papers() {
+        use crate::query::load_queries;
+        use std::path::Path;
+
+        let qdir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../engine/data/queries");
+        let mut queries = load_queries(&qdir).unwrap();
+        let table = compile_all(queries.iter().flat_map(|q| q.blocks.iter()));
+        let mut nslots = 0u32;
+        for q in &mut queries {
+            resolve_blocks(&mut q.blocks, &table, &mut nslots);
+        }
+        let flats: Vec<Vec<FlatBlock>> = queries
+            .iter()
+            .map(|q| q.blocks.iter().map(|b| flatten_block(b, &table)).collect())
+            .collect();
+
+        let mut check = |text: &str, label: &str| {
+            let paper = Paper::from_text(text);
+            let mut memo = Memo::new(&paper, nslots);
+            for (qi, q) in queries.iter().enumerate() {
+                for (bi, b) in q.blocks.iter().enumerate() {
+                    let ast = scan_with_fields(b, &paper, &table, &mut memo);
+                    let flat = scan_flat(&flats[qi][bi], &table, &mut memo);
+                    assert_eq!(flat.3, ast.3, "{label}: verdict mismatch q{qi} b{bi}");
+                    assert_eq!(
+                        flat.0.iter().map(|(s, m)| ((*s).to_owned(), *m)).collect::<Vec<_>>(),
+                        ast.0.iter().map(|(s, m)| (s.to_string(), *m)).collect::<Vec<_>>(),
+                        "{label}: hits mismatch q{qi} b{bi}"
+                    );
+                    assert_eq!(
+                        flat.1.iter().map(|(s, m)| ((*s).to_owned(), *m)).collect::<Vec<_>>(),
+                        ast.1.iter().map(|(s, m)| (s.to_string(), *m)).collect::<Vec<_>>(),
+                        "{label}: misses mismatch q{qi} b{bi}"
+                    );
+                }
+            }
+        };
+
+        // '?' patterns from the corpus: "small?sc*", "conditional ?-convergence",
+        // "Accoya? wood" - all in one paper, plus unicode and a large body.
+        let mut big = String::with_capacity(24 << 10);
+        for _ in 0..120 {
+            big.push_str("smallscale farming and conditional convergence in Accoya wood production. ");
+        }
+        check(
+            &format!(
+                "---
+title: \"Accoya wood from smallscale farms\"
+abstract: |
+  Conditional -convergence is observed for smallscale farms growing Accoya wood.
+  São Tomé and Curaçao report similar patterns.
+keywords: [Accoya wood]
+---
+{big}body terms: developing countries, foreign aid, poverty reduction, climate change.",
+            ),
+            "glob+unicode+large",
+        );
+        // Cross-field non-matches: '?' and '*' parts split across fields.
+        check(
+            "---
+title: \"small\"
+abstract: |
+  scale farming is discussed here at length with developing countries.
+keywords: [convergence]
+",
+            "cross-field glob",
+        );
+        check(
+            "---
+title: \"developing\"
+abstract: |
+  countries need aid. Convergence is not conditional.
+",
+            "cross-field star",
+        );
+        // Empty and whitespace-only papers.
+        check("", "empty");
+        check("   \n\t  ", "whitespace");
+        check("---\ntitle: \"x\"\n---\n", "title only");
+    }
+
+    /// '?'-globs match ANY substring (Python re.search parity), '?' matches
+    /// any byte including newlines, '*' any run including newlines.
+    #[test]
+    fn glob_matches_substrings() {
+        assert!(glob_match(b"abc", b"abc"));
+        assert!(glob_match(b"abc", b"xabc"));
+        assert!(glob_match(b"abc", b"xabcyy"));
+        assert!(!glob_match(b"abc", b"abd"));
+        assert!(!glob_match(b"abc", b"ab"));
+        assert!(glob_match(b"a?c", b"xxabc"));
+        assert!(!glob_match(b"a?c", b"xxac"));
+        assert!(glob_match(b"a?b", b"a\nb")); // '?' = any byte (DOTALL)
+        assert!(glob_match(b"a*c", b"ac"));
+        assert!(glob_match(b"a*c", b"xaZZZcy"));
+        assert!(!glob_match(b"a*c", b"ca"));
+        assert!(glob_match(b"a*b", b"xaaybz")); // star backtracking
+        assert!(glob_match(b"*", b"anything"));
+        assert!(glob_match(b"", b""));
+        assert!(glob_match(b"", b"x"));
+        // The three corpus '?' patterns against realistic text.
+        assert!(glob_match(b"conditional ?-convergence", b"herds sustain smallxscales. conditional --convergence is observed"));
+        assert!(glob_match(b"small?sc*", b"herds sustain smallxscales of production"));
+        assert!(glob_match(b"accoya? wood", b"accoyax wood remains a niche"));
+        assert!(!glob_match(b"accoya? wood", b"accoya wood")); // needs a char before the space
+        assert!(!glob_match(b"small?sc*", b"smallscale")); // needs small + X + sc
     }
 
     #[test]
