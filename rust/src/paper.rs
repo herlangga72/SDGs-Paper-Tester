@@ -168,6 +168,9 @@ pub struct Paper {
     full_text: String,
     lower_sections: [Option<Vec<u8>>; 4],
     lower_full: Vec<u8>,
+    /// True when `lower_full` is the join of the section buffers (no body
+    /// text), so every field search can use the full text alone.
+    pub(crate) full_covers_sections: bool,
 }
 
 impl Paper {
@@ -249,7 +252,13 @@ impl Paper {
             sections[2].as_ref().map(|s| lower_ascii(s.as_bytes())),
             sections[3].as_ref().map(|s| lower_ascii(s.as_bytes())),
         ];
-        Paper { title, lower_full, lower_sections, full_text: full }
+        Paper {
+            title,
+            lower_full,
+            lower_sections,
+            full_text: full,
+            full_covers_sections: body.trim().is_empty(),
+        }
     }
 
     /// Parse text and also return the frontmatter metadata (web server).
@@ -272,7 +281,28 @@ impl Paper {
             sections[3].as_ref().map(|s| lower_ascii(s.as_bytes())),
         ];
         let title = sections[F_TITLE as usize].clone();
-        Paper { title, lower_full, lower_sections, full_text: full }
+        Paper { title, lower_full, lower_sections, full_text: full, full_covers_sections: true }
+    }
+
+    /// Byte ranges of each present section within `text_lower(F_ANY)`.
+    /// Valid only when `full_covers_sections` (full = sections joined with
+    /// '\n'); the ranges are the join positions, so per-segment glob
+    /// matching keeps per-field semantics.
+    pub(crate) fn full_section_ranges(&self) -> [(usize, usize); 4] {
+        let mut out = [(0usize, 0usize); 4];
+        let mut pos = 0usize;
+        let mut first = true;
+        for (f, s) in self.lower_sections.iter().enumerate() {
+            if let Some(sec) = s {
+                if !first {
+                    pos += 1; // the join separator byte (newline)
+                }
+                out[f] = (pos, pos + sec.len());
+                pos += sec.len();
+                first = false;
+            }
+        }
+        out
     }
 
     /// Original (un-lowercased) full text; byte offsets in it are 1:1 with

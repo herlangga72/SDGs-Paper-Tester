@@ -29,7 +29,7 @@ fn main() {
     matcher::resolve_blocks(&mut q2.blocks, &table, &mut nslots);
 
     let paper = Paper::from_text("tax evasion is a serious concern in many countries");
-    let mut memo = Memo::new();
+    let mut memo = Memo::new(&paper, 0);
     let r1 = matcher::scan_with_fields(&q1.blocks[0], &paper, &table, &mut memo);
     let r2 = matcher::scan_with_fields(&q2.blocks[0], &paper, &table, &mut memo);
     println!("q1 match={} hits={:?}", r1.3, r1.0.iter().map(|(s, _)| s.clone()).collect::<Vec<_>>());

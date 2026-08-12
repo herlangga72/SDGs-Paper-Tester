@@ -224,7 +224,7 @@ fn cmd_match(args: &[String]) -> Result<(), String> {
     // distinct (pattern, field-mask) is searched once. Without this the CLI
     // rebuilt a TextIndex and re-evaluated every term for every block, which
     // is ~60x slower on large papers.
-    let mut memo = matcher::Memo::new();
+    let mut memo = matcher::Memo::new(&paper, nslots);
 
     for q in &queries {
         println!("=== SDG {} ===", q.sdg);

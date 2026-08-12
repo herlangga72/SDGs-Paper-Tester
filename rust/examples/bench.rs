@@ -10,20 +10,24 @@ fn main() {
     let path = std::env::args().nth(1).unwrap();
     let paper = Paper::from_text(&std::fs::read_to_string(&path).unwrap());
     let mut queries =
-        load_queries(Path::new("/home/server/Downloads/sdg-paper-matcher/engine/data/queries")).unwrap();
+        load_queries(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../engine/data/queries")).unwrap();
     let table = matcher::compile_all(queries.iter().flat_map(|q| q.blocks.iter()));
     let mut nslots = 0u32;
     for q in &mut queries {
         matcher::resolve_blocks(&mut q.blocks, &table, &mut nslots);
     }
-    let n_blocks: usize = queries.iter().map(|q| q.blocks.len()).sum();
+    let flats: Vec<Vec<matcher::FlatBlock>> = queries
+        .iter()
+        .map(|q| q.blocks.iter().map(|b| matcher::flatten_block(b, &table)).collect())
+        .collect();
+    let n_blocks: usize = flats.iter().map(|q| q.len()).sum();
     for round in 0..3 {
-        let mut memo = matcher::Memo::new();
+        let mut memo = matcher::Memo::new(&paper, nslots);
         let t0 = Instant::now();
         let mut matched = 0;
-        for q in &queries {
-            for b in &q.blocks {
-                if matcher::scan_with_fields(b, &paper, &table, &mut memo).3 {
+        for q in &flats {
+            for b in q {
+                if matcher::scan_flat(b, &table, &mut memo).3 {
                     matched += 1;
                 }
             }

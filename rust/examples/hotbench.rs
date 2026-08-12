@@ -19,33 +19,45 @@ fn main() {
     let _ = sdg_tools::simd::dispatch_name();
 
     let mut queries =
-        load_queries(Path::new("/home/server/Downloads/sdg-paper-matcher/engine/data/queries")).unwrap();
+        load_queries(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../engine/data/queries")).unwrap();
     let table = matcher::compile_all(queries.iter().flat_map(|q| q.blocks.iter()));
     let mut nslots = 0u32;
     for q in &mut queries {
         matcher::resolve_blocks(&mut q.blocks, &table, &mut nslots);
     }
+    // Flatten every block once (the web server does this at boot).
+    let flats: Vec<Vec<matcher::FlatBlock>> = queries
+        .iter()
+        .map(|q| q.blocks.iter().map(|b| matcher::flatten_block(b, &table)).collect())
+        .collect();
 
     // warm the CPU + caches, verify correctness once
-    let mut warm = matcher::Memo::new();
+    let mut warm = matcher::Memo::new(&paper, nslots);
     let mut wmatched = 0;
-    for q in &queries {
-        for b in &q.blocks {
-            if matcher::scan_with_fields(b, &paper, &table, &mut warm).3 {
+    for q in &flats {
+        for f in q {
+            if matcher::scan_flat(f, &table, &mut warm).3 {
                 wmatched += 1;
             }
         }
     }
 
     // steady-state loop: fresh memo per request (server behavior), reusing
-    // the loaded+compiled queries and the already-parsed paper index.
+    // the loaded+compiled queries and the already-parsed paper index, with
+    // scratch output vectors reused across blocks (as web.rs does).
     let t0 = Instant::now();
     let mut matched = 0usize;
     for _ in 0..iters {
-        let mut memo = matcher::Memo::new();
-        for q in &queries {
-            for b in &q.blocks {
-                if matcher::scan_with_fields(b, &paper, &table, &mut memo).3 {
+        let mut memo = matcher::Memo::new(&paper, nslots);
+        let mut hits: Vec<(&str, u8)> = Vec::new();
+        let mut misses: Vec<(&str, u8)> = Vec::new();
+        let mut ex_hits: Vec<&str> = Vec::new();
+        for q in &flats {
+            for f in q {
+                hits.clear();
+                misses.clear();
+                ex_hits.clear();
+                if matcher::scan_flat_into(f, &table, &mut memo, &mut hits, &mut misses, &mut ex_hits) {
                     matched += 1;
                 }
             }

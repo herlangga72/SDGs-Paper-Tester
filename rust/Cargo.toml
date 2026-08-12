@@ -20,3 +20,8 @@ codegen-units = 1
 # Strip debug symbols: smaller image, faster cold start on Render. The
 # Docker build overrides these to thin LTO / 16 CGUs for faster builds.
 strip = "symbols"
+
+[features]
+# Dev-only: counting instrumentation + experiment toggles for latency tuning.
+# Run: cargo run --release --features prof --example prof -- <paper.md> [iters]
+prof = []
