@@ -868,20 +868,31 @@ pub fn scan_flat_into<'a, 'b>(
     // classifies it immediately - Push order is leaf order, so hits/misses/
     // excluded keep the AST traversal order. The stack evaluates the
     // boolean program; the verdict is the final stack value.
+    #[cfg(feature = "prof")]
+    let report = !prof::skip_report();
+    #[cfg(not(feature = "prof"))]
+    let report = true;
     let mut stack: Vec<bool> = Vec::with_capacity(8);
     for op in &flat.prog {
         match *op {
             Op::Push(i) => {
                 let l = &flat.leaves[i as usize];
                 let v = memo.term_hit(&table[l.pid as usize], l.mask, l.slot as usize);
-                if l.excluded {
-                    if v {
-                        ex_hits.push(&*l.raw);
+                if report {
+                    #[cfg(feature = "prof")]
+                    {
+                        use std::sync::atomic::Ordering;
+                        prof::REPORT_PUSHES.fetch_add(1, Ordering::Relaxed);
                     }
-                } else if v {
-                    hits.push((&*l.raw, l.mask));
-                } else {
-                    misses.push((&*l.raw, l.mask));
+                    if l.excluded {
+                        if v {
+                            ex_hits.push(&*l.raw);
+                        }
+                    } else if v {
+                        hits.push((&*l.raw, l.mask));
+                    } else {
+                        misses.push((&*l.raw, l.mask));
+                    }
                 }
                 stack.push(v);
             }
@@ -1323,6 +1334,174 @@ abstract: |
         assert!(glob_match(b"accoya? wood", b"accoyax wood remains a niche"));
         assert!(!glob_match(b"accoya? wood", b"accoya wood")); // needs a char before the space
         assert!(!glob_match(b"small?sc*", b"smallscale")); // needs small + X + sc
+    }
+
+    /// Seeded xorshift64 PRNG so randomized tests are reproducible.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n.max(1) as u64) as usize
+        }
+    }
+
+    /// Randomized papers (seeded) with random field combinations, joins and
+    /// pattern-interacting tokens: flat and AST scans must agree on every
+    /// block. Catches fold/segment/glob interactions the hand-crafted papers
+    /// miss.
+    #[test]
+    fn random_papers_flat_matches_ast() {
+        use crate::query::load_queries;
+        use std::path::Path;
+
+        let qdir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../engine/data/queries");
+        let mut queries = load_queries(&qdir).unwrap();
+        let table = compile_all(queries.iter().flat_map(|q| q.blocks.iter()));
+        let mut nslots = 0u32;
+        for q in &mut queries {
+            resolve_blocks(&mut q.blocks, &table, &mut nslots);
+        }
+        let flats: Vec<Vec<FlatBlock>> = queries
+            .iter()
+            .map(|q| q.blocks.iter().map(|b| flatten_block(b, &table)).collect())
+            .collect();
+
+        let toks = [
+            "small", "scale", "smallxscales", "smallscale", "accoya", "accoyax", "wood",
+            "conditional", "--convergence", "convergence", "herds", "herd", "sustain",
+            "sustainable", "developing", "countries", "tax", "evasion", "poverty", "poor",
+            "water", "cattle", "treatment", "climate", "change", "coral", "reef", "foreign",
+            "aid", "gender", "inequalit", "energy", "renewable", "ocean", "acidification",
+            "growth", "gdp", "income", "rights", "a", "b", "x", "ab", "São", "Tomé", "??",
+            "?", "*", "---", "a-b", "x y",
+        ];
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        let mut trials = 0usize;
+        let mut body_buf = String::new();
+        let mut abstract_buf = String::new();
+        let mut title_buf = String::new();
+        let mut kw_buf = String::new();
+        for _ in 0..30 {
+            let mut words = |n: usize, buf: &mut String, rng: &mut Rng| {
+                buf.clear();
+                for k in 0..n {
+                    if k > 0 && rng.below(5) == 0 {
+                        buf.push_str(if rng.below(2) == 0 { "\n" } else { "  " });
+                    } else if k > 0 {
+                        buf.push(' ');
+                    }
+                    buf.push_str(toks[rng.below(toks.len())]);
+                }
+            };
+            words(1 + rng.below(6), &mut title_buf, &mut rng);
+            let has_abs = rng.below(2) == 0;
+            let has_kw = rng.below(2) == 0;
+            let has_body = rng.below(3) == 0;
+            if has_abs {
+                words(2 + rng.below(20), &mut abstract_buf, &mut rng);
+            }
+            if has_kw {
+                words(1 + rng.below(4), &mut kw_buf, &mut rng);
+            }
+            if has_body {
+                body_buf.clear();
+                body_buf.push_str(&format!("---\n"));
+                words(5 + rng.below(60), &mut body_buf, &mut rng);
+            }
+            let mut paper = format!("---\ntitle: \"{}\"\n", title_buf);
+            if has_abs {
+                paper.push_str(&format!("abstract: |\n  {}\n", abstract_buf));
+            }
+            if has_kw {
+                paper.push_str(&format!("keywords: [{}]\n", kw_buf));
+            }
+            paper.push_str("---\n");
+            if has_body {
+                paper.push_str(&body_buf);
+            }
+
+            let p = Paper::from_text(&paper);
+            let mut memo = Memo::new(&p, nslots);
+            for (qi, q) in queries.iter().enumerate() {
+                for (bi, b) in q.blocks.iter().enumerate() {
+                    let ast = scan_with_fields(b, &p, &table, &mut memo);
+                    let flat = scan_flat(&flats[qi][bi], &table, &mut memo);
+                    assert_eq!(flat.3, ast.3, "trial {trials} q{qi} b{bi}: verdict");
+                    assert_eq!(
+                        flat.0.iter().map(|(s, m)| ((*s).to_owned(), *m)).collect::<Vec<_>>(),
+                        ast.0.iter().map(|(s, m)| (s.to_string(), *m)).collect::<Vec<_>>(),
+                        "trial {trials} q{qi} b{bi}: hits"
+                    );
+                    assert_eq!(
+                        flat.1.iter().map(|(s, m)| ((*s).to_owned(), *m)).collect::<Vec<_>>(),
+                        ast.1.iter().map(|(s, m)| (s.to_string(), *m)).collect::<Vec<_>>(),
+                        "trial {trials} q{qi} b{bi}: misses"
+                    );
+                }
+            }
+            trials += 1;
+        }
+    }
+
+    /// The TextIndex pre-filter must never reject a part that actually
+    /// occurs in the indexed text (no false negatives), across all part
+    /// lengths and random texts.
+    #[test]
+    fn could_contain_no_false_negatives() {
+        let mut rng = Rng(0xDEAD_BEEF_CAFE_F00D);
+        let alphabet: Vec<u8> = b"abcdefghijklmnopqrstuvwxyz 0123456789-_".to_vec();
+        for _ in 0..200 {
+            let n = rng.below(600);
+            let mut text = Vec::with_capacity(n);
+            for _ in 0..n {
+                text.push(alphabet[rng.below(alphabet.len())]);
+            }
+            let idx = TextIndex::build(&text);
+            // parts drawn from the text itself (guaranteed present)
+            for _ in 0..8 {
+                let len = 1 + rng.below(40);
+                if text.len() >= len {
+                    let start = rng.below(text.len() - len + 1);
+                    let part = &text[start..start + len];
+                    assert!(
+                        idx.could_contain(part),
+                        "false negative: {:?} in {:?}",
+                        String::from_utf8_lossy(part),
+                        String::from_utf8_lossy(&text)
+                    );
+                }
+            }
+        }
+    }
+
+    /// The public `eval` entry point (boolean verdict only) agrees with the
+    /// full scan on a small hand-built query.
+    #[test]
+    fn eval_public_api() {
+        use crate::parser::Parser;
+        use crate::tokenizer::tokenize;
+
+        let root = Parser::new(
+            tokenize("TITLE(tax evasion) AND (ABS(poverty) OR AUTHKEY(food*))").unwrap(),
+        )
+        .parse()
+        .unwrap();
+        let table = compile_all(std::iter::once(&root));
+        let mut root = root;
+        let mut nslots = 0u32;
+        resolve_blocks(std::slice::from_mut(&mut root), &table, &mut nslots);
+
+        let hit = Paper::from_text("---\ntitle: \"Tax evasion\"\nabstract: |\n  poverty is bad\n---");
+        assert!(eval(&root, None, &hit, &table), "expected match");
+        assert!(!eval(&root, None, &Paper::from_text("---\ntitle: \"tax evasion\"\n---"), &table), "abs part missing");
+        assert!(!eval(&root, None, &Paper::from_text("---\ntitle: \"Other\"\nabstract: |\n  food security\n---"), &table), "title part missing");
     }
 
     #[test]

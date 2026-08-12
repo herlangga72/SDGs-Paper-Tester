@@ -30,7 +30,7 @@ fn collect(n: &sdg_tools::ast::Node, pairs: &mut HashSet<(u32, u8)>, field: u8, 
 
 fn main() {
     let mut q =
-        load_queries(Path::new("/home/server/Downloads/sdg-paper-matcher/engine/data/queries")).unwrap();
+        load_queries(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../engine/data/queries")).unwrap();
     let t = matcher::compile_all(q.iter().flat_map(|x| x.blocks.iter()));
     let mut nslots = 0u32;
     for x in &mut q {
