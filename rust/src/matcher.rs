@@ -3,8 +3,9 @@
 use crate::ast::Node;
 use crate::paper::{Paper, ALL_FIELDS, F_ANY};
 use crate::simd::find;
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 
 /// Dev-only counting instrumentation and experiment toggles (feature `prof`).
 #[cfg(feature = "prof")]
@@ -88,6 +89,11 @@ pub struct TextIndex {
     bigrams: [u64; 1024],
     quads: Vec<u64>,
     quad_mask: u32, // power-of-two capacity minus one
+    /// quad -> byte positions, recorded only for pattern first-quads
+    /// (`FIRST_QUADS`). A missing entry means the quad is absent from the
+    /// text: an exact, false-negative-free gate that lets pattern search
+    /// verify candidate starts instead of scanning the whole buffer.
+    pos: FastMap<u32, Vec<u32>>,
 }
 
 /// Two independent multiplicative hashes into a `mask`-bounded bit array.
@@ -100,40 +106,235 @@ fn bloom_hashes(q: u32, mask: u32) -> (u32, u32) {
     (h1, h2)
 }
 
+/// Fast non-cryptographic hasher for the quad-position map and the
+/// pattern-first-quad set. Keys are compile-time/derived u32s, never
+/// adversarial input, so a multiplicative hash is safe (std's SipHash is
+/// ~10x slower on the per-window positions pass).
+#[derive(Clone, Copy)]
+pub struct FastHasher(u64);
+
+impl Default for FastHasher {
+    fn default() -> Self {
+        FastHasher(0xcbf2_9ce4_8422_2325)
+    }
+}
+
+impl std::hash::Hasher for FastHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0 ^ u64::from(b)).wrapping_mul(0x100_0000_01B3);
+        }
+    }
+    #[inline]
+    fn write_u64(&mut self, n: u64) {
+        self.0 = (self.0 ^ n).wrapping_mul(0x100_0000_01B3);
+    }
+    #[inline]
+    fn write_u8(&mut self, n: u8) {
+        self.write_u64(u64::from(n));
+    }
+    #[inline]
+    fn write_usize(&mut self, n: usize) {
+        self.write_u64(n as u64);
+    }
+}
+
+impl std::hash::BuildHasher for FastHasher {
+    type Hasher = FastHasher;
+    #[inline]
+    fn build_hasher(&self) -> FastHasher {
+        FastHasher(0xcbf2_9ce4_8422_2325)
+    }
+}
+
+pub type FastMap<K, V> = HashMap<K, V, FastHasher>;
+
+fn new_fast_map<K, V>() -> FastMap<K, V> {
+    HashMap::with_capacity_and_hasher(16, FastHasher::default())
+}
+
+/// First-4-bytes of every literal pattern part (len >= 4), unioned across
+/// every `compile_all` call. TextIndexes record byte positions only for
+/// these quads, so pattern search verifies a handful of candidate starts
+/// instead of scanning the whole buffer (the bloom-only prefilter used to
+/// fall through to a full SIMD scan per term, which on repetitive text
+/// where every quad is present made scan cost ~memory-bandwidth-bound:
+/// measured 570 ms on a 1.6 MB repeated paper vs ~10 ms with positions). A
+/// quad's absence from the recorded positions is a hard no-match, never a
+/// fallback to scan.
+static FIRST_QUADS: Mutex<Option<Arc<HashSet<u32, FastHasher>>>> = Mutex::new(None);
+
+/// Shared snapshot of the pattern first-quads for one index build (the
+/// positions pass does a contains per window; the Arc avoids holding the
+/// global lock and cloning ~25k entries per request).
+fn first_quads() -> Arc<HashSet<u32, FastHasher>> {
+    let mut g = FIRST_QUADS.lock().unwrap();
+    g.get_or_insert_with(|| Arc::new(HashSet::with_hasher(FastHasher::default()))).clone()
+}
+
+
+/// Parallel build threshold: below this, one sequential pass is cheaper
+/// than the thread split + merge (measured: 256 KiB slices, merge ~0.5 ms).
+const PAR_CHUNK: usize = 256 * 1024;
+
+/// Partial index of one text slice (dense arrays are OR-merged, position
+/// lists are concatenated in ascending slice order).
+struct BuildPart {
+    bytes: [bool; 256],
+    bigrams: [u64; 1024],
+    quads: Vec<u64>,
+    pos: FastMap<u32, Vec<u32>>,
+}
+
+fn build_serial(text: &[u8], needed: &HashSet<u32, FastHasher>) -> TextIndex {
+    merge_parts(vec![build_chunk(text, needed, 0)], text.len())
+}
+
+/// Index the slice `text[base..]` (at most `PAR_CHUNK` + 3 bytes, so the
+/// 2- and 4-byte windows straddling a chunk boundary are still seen; the
+/// boundary quads are duplicated by the next slice, harmless for the bit
+/// arrays, and positions are capped so each window is recorded exactly
+/// once, by the slice that contains it).
+fn build_chunk(text: &[u8], needed: &HashSet<u32, FastHasher>, base: usize) -> BuildPart {
+    let n = text.len();
+    let end = (base + PAR_CHUNK).min(n);
+    let chunk_len = end - base;
+    let slice = &text[base..(end + 3).min(n)];
+
+    let mut bytes = [false; 256];
+    let mut bigrams = [0u64; 1024];
+    let qbits = (n.saturating_sub(3).saturating_mul(8)).next_power_of_two().max(1 << 16);
+    let quad_mask = (qbits as u32) - 1;
+    let mut quads = vec![0u64; (qbits >> 6) as usize];
+    let mut pos: FastMap<u32, Vec<u32>> = new_fast_map();
+
+    for w in slice.windows(2) {
+        let a = w[0] as usize;
+        let b = w[1] as usize;
+        bigrams[(a << 2) | (b >> 6)] |= 1u64 << (b & 63);
+    }
+    for w in slice.windows(4) {
+        let q = u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
+        let (h1, h2) = bloom_hashes(q, quad_mask);
+        quads[(h1 >> 6) as usize] |= 1u64 << (h1 & 63);
+        quads[(h2 >> 6) as usize] |= 1u64 << (h2 & 63);
+    }
+    for &b in slice[..chunk_len].iter() {
+        bytes[b as usize] = true;
+    }
+    if !needed.is_empty() {
+        // 64K-bit direct-mapped filter over the needed quads: one load +
+        // shift per window; the exact HashSet probe runs only on hits (a
+        // few per thousand windows). No false negatives.
+        let mut nf = [0u64; 1024];
+        for &q in needed {
+            let h = ((u64::from(q).wrapping_mul(0x9E37_79B1)) >> 16) & 0xFFFF;
+            nf[(h >> 6) as usize] |= 1u64 << (h & 63);
+        }
+        for (i, w) in slice.windows(4).enumerate() {
+            if i + 4 > chunk_len {
+                break; // boundary-spanning window: recorded by the next slice
+            }
+            let q = u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
+            let h = ((u64::from(q).wrapping_mul(0x9E37_79B1)) >> 16) & 0xFFFF;
+            if (nf[(h >> 6) as usize] >> (h & 63)) & 1 == 0 {
+                continue;
+            }
+            if needed.contains(&q) {
+                let v = pos.entry(q).or_default();
+                // Bounded per chunk: verification reads at most 1024
+                // candidates; the merge keeps the first 1024 overall.
+                if v.len() < 1024 {
+                    v.push((base + i) as u32);
+                }
+            }
+        }
+    }
+    BuildPart { bytes, bigrams, quads, pos }
+}
+
+fn merge_parts(parts: Vec<BuildPart>, n: usize) -> TextIndex {
+    let qbits = (n.saturating_sub(3).saturating_mul(8)).next_power_of_two().max(1 << 16);
+    let quad_mask = (qbits as u32) - 1;
+    let mut out = BuildPart {
+        bytes: [false; 256],
+        bigrams: [0u64; 1024],
+        quads: vec![0u64; (qbits >> 6) as usize],
+        pos: new_fast_map(),
+    };
+    for p in parts {
+        for i in 0..256 {
+            out.bytes[i] |= p.bytes[i];
+        }
+        for i in 0..1024 {
+            out.bigrams[i] |= p.bigrams[i];
+        }
+        for (i, &v) in p.quads.iter().enumerate() {
+            out.quads[i] |= v;
+        }
+        for (q, v) in p.pos {
+            let dst = out.pos.entry(q).or_default();
+            // Keep the first 1024 candidates overall (ascending order).
+            let room = 1024usize.saturating_sub(dst.len());
+            dst.extend(v.into_iter().take(room));
+        }
+    }
+    TextIndex { bytes: out.bytes, bigrams: out.bigrams, quads: out.quads, quad_mask, pos: out.pos }
+}
+
 impl TextIndex {
     pub fn build(text: &[u8]) -> TextIndex {
+        TextIndex::build_with(text, &first_quads())
+    }
+
+    /// `build`, but records quad positions only for the quads in `needed`
+    /// (the pattern first-quads). Pass an empty set when only the presence
+    /// filters are wanted (benchmarks, tests).
+    ///
+    /// Texts above `PAR_CHUNK` are built as independent 256 KiB slices on
+    /// scoped threads (no rayon dependency) and merged: the positions pass
+    /// (one filter probe per 4-byte window, plus a push per recorded
+    /// occurrence) dominates the build at MB scale, and it parallelizes
+    /// cleanly.
+    pub fn build_with(text: &[u8], needed: &HashSet<u32, FastHasher>) -> TextIndex {
         #[cfg(feature = "prof")]
         {
             use std::sync::atomic::Ordering;
             prof::INDEX_BUILDS.fetch_add(1, Ordering::Relaxed);
             prof::INDEX_BYTES.fetch_add(text.len() as u64, Ordering::Relaxed);
         }
-        let n = text.len();
-        let mut bytes = [false; 256];
-        let mut bigrams = [0u64; 1024];
-        // ~16 bits of Bloom per window bounds the combined false-positive
-        // rate to ~(1/16)^2 even when every window is distinct. Minimum 64K
-        // bits (8 KiB) keeps tiny inputs cheap.
-        let qbits = (n.saturating_sub(3).saturating_mul(16)).next_power_of_two().max(1 << 16);
-        let mut quads = vec![0u64; (qbits >> 6) as usize];
-        let quad_mask = (qbits as u32) - 1;
+        if text.len() < PAR_CHUNK {
+            return build_serial(text, needed);
+        }
+        let chunks = text.len().div_ceil(PAR_CHUNK);
+        let mut parts: Vec<Option<BuildPart>> = (0..chunks).map(|_| None).collect();
+        std::thread::scope(|s| {
+            let mut handles = Vec::with_capacity(chunks);
+            for (ci, slot) in parts.iter_mut().enumerate() {
+                let base = ci * PAR_CHUNK;
+                handles.push(s.spawn(move || {
+                    *slot = Some(build_chunk(text, needed, base));
+                }));
+            }
+            for h in handles {
+                h.join().unwrap();
+            }
+        });
+        merge_parts(parts.into_iter().map(|p| p.unwrap()).collect(), text.len())
+    }
 
-        for w in text.windows(2) {
-            let a = w[0] as usize;
-            let b = w[1] as usize;
-            // bit index = a*256 + b
-            bigrams[(a << 2) | (b >> 6)] |= 1u64 << (b & 63);
-        }
-        for w in text.windows(4) {
-            let q = u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
-            let (h1, h2) = bloom_hashes(q, quad_mask);
-            quads[(h1 >> 6) as usize] |= 1u64 << (h1 & 63);
-            quads[(h2 >> 6) as usize] |= 1u64 << (h2 & 63);
-        }
-        for &b in text {
-            bytes[b as usize] = true;
-        }
-        TextIndex { bytes, bigrams, quads, quad_mask }
+    /// Byte positions of `q` (first-4-bytes of a pattern part), if the index
+    /// was built with `q` in its `needed` set. Every occurrence of `q` is
+    /// present (windows enumerated step 1), so a missing entry is a hard
+    /// "quad absent from this text".
+    #[inline]
+    pub fn positions(&self, q: u32) -> Option<&Vec<u32>> {
+        self.pos.get(&q)
     }
 
     /// True if the literal part *could* appear in the indexed text. Any
@@ -181,6 +382,26 @@ impl TextIndex {
             }
         }
     }
+
+    /// All-quads variant: every internal 4-byte window must hit the bloom.
+    /// Stronger than `could_contain` (first+last only); used as a pre-gate
+    /// before candidate verification so parts whose full word never occurs
+    /// are rejected without walking their first quad's positions (repetitive
+    /// text can hold hundreds of candidates per quad).
+    pub fn could_contain_all(&self, part: &[u8]) -> bool {
+        let mut w = 0;
+        while w + 4 <= part.len() {
+            let q = u32::from_le_bytes([part[w], part[w + 1], part[w + 2], part[w + 3]]);
+            let (h1, h2) = bloom_hashes(q, self.quad_mask);
+            if ((self.quads[(h1 >> 6) as usize] >> (h1 & 63)) & 1) == 0
+                || ((self.quads[(h2 >> 6) as usize] >> (h2 & 63)) & 1) == 0
+            {
+                return false;
+            }
+            w += 1;
+        }
+        true
+    }
 }
 
 fn compile_pattern(kw: &str) -> Pattern {
@@ -194,14 +415,14 @@ fn compile_pattern(kw: &str) -> Pattern {
     if !has_star && !has_q {
         Pattern {
             raw: Arc::from(kw),
-            lower_raw: lower.clone().into_bytes(),
+            lower_raw: Vec::new(), // only '?' globs need the full lowered text
             parts: vec![lower.into_bytes()],
             no_wildcard: true,
         }
     } else if !has_q {
         Pattern {
             raw: Arc::from(kw),
-            lower_raw: lower.clone().into_bytes(),
+            lower_raw: Vec::new(),
             parts: lower.split('*').filter(|p| !p.is_empty()).map(|p| p.as_bytes().to_vec()).collect(),
             no_wildcard: false,
         }
@@ -240,6 +461,18 @@ pub fn compile_all<'a>(blocks: impl Iterator<Item = &'a Node>) -> Vec<Pattern> {
                 let idx = table.len();
                 table.push(compile_pattern(kw));
                 seen.insert(kw.to_string(), idx);
+            }
+        }
+    }
+    // Union every literal part's first-4-bytes so TextIndex builds record
+    // positions for all of them (multiple compile_all calls stay sound).
+    let mut g = FIRST_QUADS.lock().unwrap();
+    let s = g.get_or_insert_with(|| Arc::new(HashSet::with_hasher(FastHasher::default())));
+    let s = Arc::make_mut(s); // deep-clones only if a request took a snapshot (boot-time only)
+    for p in &table {
+        for part in &p.parts {
+            if part.len() >= 4 {
+                s.insert(u32::from_le_bytes([part[0], part[1], part[2], part[3]]));
             }
         }
     }
@@ -390,6 +623,31 @@ fn glob_match_at(pat: &[u8], text: &[u8]) -> bool {
     true
 }
 
+/// `text[p..]` starts with `part` (per-candidate check in the quad-position
+/// index). A single unaligned u64 load+compare on both sides covers the
+/// first 8 bytes: the first 4 are already known equal (they ARE the quad the
+/// position was recorded for), and most candidates diverge from the pattern
+/// within bytes 4-7, so this avoids a libc memcmp call per candidate. Falls
+/// back to slice equality for the tail of longer parts (rare path).
+#[inline]
+fn starts_at(text: &[u8], p: usize, part: &[u8]) -> bool {
+    let n = part.len();
+    if text.len() - p < n {
+        return false;
+    }
+    let t = &text[p..];
+    if n >= 8 {
+        let pm = u64::from_le_bytes(part[..8].try_into().unwrap());
+        let tm = u64::from_le_bytes(t[..8].try_into().unwrap());
+        if tm != pm {
+            return false;
+        }
+        n == 8 || &t[8..n] == &part[8..]
+    } else {
+        &t[..n] == part
+    }
+}
+
 impl Pattern {
     /// Cheap pre-filter: every literal part of the pattern must be present
     /// in the indexed text, otherwise `matches` cannot succeed. Glob ('?')
@@ -440,6 +698,94 @@ impl Pattern {
             }
             true
         }
+    }
+
+    /// Like `matches`, but uses the index's quad positions to verify a
+    /// handful of candidate starts instead of scanning the whole buffer.
+    /// Semantics are identical (same word-boundary rule for plain terms,
+    /// same no-space wildcard gap rule); `positions` has no false negatives,
+    /// so a missing entry for the part's first quad means the quad is absent
+    /// and `false` is authoritative. Falls back to `matches` when the first
+    /// quad is common (more than 1024 occurrences: scattered verification
+    /// costs more than one streaming SIMD pass).
+    pub fn matches_indexed(&self, text: &[u8], idx: &TextIndex) -> bool {
+        #[cfg(feature = "prof")]
+        {
+            use std::sync::atomic::Ordering;
+            prof::MATCHES_CALLS.fetch_add(1, Ordering::Relaxed);
+        }
+        let part0 = if self.parts.is_empty() {
+            return self.matches(text); // '?' glob: no literal parts to index
+        } else {
+            &self.parts[0]
+        };
+        if part0.len() >= 4 {
+            // Reject parts whose full word never occurs before walking
+            // candidate positions (first+last-quad filter is not enough on
+            // repetitive text where both quads occur independently).
+            if !idx.could_contain_all(part0) {
+                return false;
+            }
+            let q = u32::from_le_bytes([part0[0], part0[1], part0[2], part0[3]]);
+            match idx.positions(q) {
+                Some(ps) if ps.len() <= 1024 => {
+                    // Exhaustive: verify every candidate (1024 unaligned
+                    // loads is ~20-40 us, still cheaper than one streaming
+                    // SIMD pass, and a miss is a hard false).
+                    for &p in ps {
+                        let p = p as usize;
+                        if !starts_at(text, p, part0) {
+                            continue;
+                        }
+                        if self.no_wildcard {
+                            let before = p == 0 || !is_word(text[p - 1]);
+                            let after_p = p + part0.len();
+                            let after = after_p >= text.len() || !is_word(text[after_p]);
+                            if before && after {
+                                return true;
+                            }
+                        } else {
+                            // rest_matches scans forward and misses only after
+                            // reaching the end of the buffer; every later
+                            // candidate starts even further forward, so it
+                            // would miss too (same first-occurrence semantics
+                            // as `matches`).
+                            if self.rest_matches_at(text, p + part0.len()) {
+                                return true;
+                            }
+                            return false;
+                        }
+                    }
+                    return false;
+                }
+                // No positions recorded: every literal part's first four
+                // bytes are in FIRST_QUADS (compile_all unions them), so the
+                // quad is absent from this text: hard no-match, no scan.
+                None => return false,
+                // Common quad: one streaming SIMD pass is cheaper.
+                Some(_) => {}
+            }
+        }
+        self.matches(text)
+    }
+
+    /// Subsequent literal parts must follow with only non-space characters
+    /// in between (Scopus `*` matches within a word only).
+    fn rest_matches_at(&self, text: &[u8], mut from: usize) -> bool {
+        for part in &self.parts[1..] {
+            let mut p = from;
+            loop {
+                match find(text, part, p) {
+                    Some(x) if !crate::simd::any_ws(&text[from..x]) => {
+                        from = x + part.len();
+                        break;
+                    }
+                    Some(x) => p = x + 1,
+                    None => return false,
+                }
+            }
+        }
+        true
     }
 }
 
@@ -496,15 +842,22 @@ pub struct Memo<'a> {
     full_id: u8,
     full_covers_sections: bool,
     full_segs: [(usize, usize); 4],
-    joined: Vec<JoinedEntry>,
+    joined: Vec<JoinedEntry<'a>>,
     /// O(1) mask -> joined-buffer index (i32 for a -1 "unset" sentinel).
     mask_cache: [i32; 256],
+    /// Buffer-id-list signature -> joined entry, so every mask that selects
+    /// the same buffers shares ONE buffer and ONE TextIndex build (masks
+    /// that all fall back to the full text used to rebuild the full text
+    /// copy + index per mask: measured 2.3x slower on a 1.8 MB paper).
+    join_cache: FastMap<u64, usize>,
 }
 
 /// A mask's folded buffer plus its per-field segments (for `?` globs) and a
 /// lazily built `TextIndex` pre-filter.
-struct JoinedEntry {
-    buf: Vec<u8>,
+struct JoinedEntry<'a> {
+    /// Borrowed when the entry is exactly the full text (no copy); owned
+    /// when it is a real multi-buffer fold.
+    buf: Cow<'a, [u8]>,
     idx: Option<TextIndex>,
     nsegs: u8,
     segs: [(usize, usize); 5],
@@ -543,6 +896,7 @@ impl<'a> Memo<'a> {
             full_segs: paper.full_section_ranges(),
             joined: Vec::new(),
             mask_cache: [-1; 256],
+            join_cache: new_fast_map(),
         }
     }
 
@@ -553,7 +907,7 @@ impl<'a> Memo<'a> {
         if cached >= 0 {
             return cached as usize;
         }
-        // Decode the mask into deduplicated buffer ids, then concatenate.
+        // Decode the mask into deduplicated buffer ids.
         let mut ids = [0u8; 5];
         let mut n = 0usize;
         for f in 0..4u8 {
@@ -572,49 +926,66 @@ impl<'a> Memo<'a> {
                 n += 1;
             }
         }
-        if self.full_covers_sections && (mask & 0x0F) == 0x0F {
-            // Default TITLE-ABS-KEY: the full text IS the sections' join, so
-            // use it directly (one buffer instead of four, ~2x fewer bytes).
-            // Its per-section ranges make '?'-globs keep per-field semantics.
-            let full = self.bufs[self.full_id as usize];
-            let mut segs = [(0usize, 0usize); 5];
-            let mut nsegs = 0usize;
-            for (s, e) in self.full_segs.iter() {
-                if s != e {
-                    segs[nsegs] = (*s, *e);
-                    nsegs += 1;
-                }
-            }
-            self.joined.push(JoinedEntry {
-                buf: full.to_vec(),
-                idx: None,
-                nsegs: nsegs as u8,
-                segs,
-            });
-            let idx = self.joined.len() - 1;
-            self.mask_cache[mask as usize] = idx as i32;
-            return idx;
+        // Share one joined buffer across every mask selecting the same ids
+        // (e.g. all masks falling back to the full text): one copy + one
+        // TextIndex build per distinct selection instead of per mask.
+        let mut key = n as u64;
+        for &id in &ids[..n] {
+            key = (key << 8) | u64::from(id);
+        }
+        if let Some(&j) = self.join_cache.get(&key) {
+            self.mask_cache[mask as usize] = j as i32;
+            return j;
         }
         let mut cap = 0usize;
         for &id in &ids[..n] {
             cap += self.bufs[id as usize].len();
         }
-        let mut buf = Vec::with_capacity(cap + n);
-        let mut segs = [(0usize, 0usize); 5];
-        let mut nsegs = 0usize;
-        for &id in &ids[..n] {
-            let b = self.bufs[id as usize];
-            if nsegs > 0 {
-                buf.push(b'\n');
+        let (buf, segs, nsegs);
+        if n == 1 && ids[0] == self.full_id {
+            // Exactly the full text: borrow it, zero copy. Its per-section
+            // ranges (when full covers the sections) keep '?'-glob
+            // semantics; otherwise it is one segment.
+            let full = self.bufs[self.full_id as usize];
+            if self.full_covers_sections {
+                let mut sg = [(0usize, 0usize); 5];
+                let mut ns = 0usize;
+                for (s, e) in self.full_segs.iter() {
+                    if s != e {
+                        sg[ns] = (*s, *e);
+                        ns += 1;
+                    }
+                }
+                buf = Cow::Borrowed(full);
+                segs = sg;
+                nsegs = ns;
+            } else {
+                buf = Cow::Borrowed(full);
+                segs = [(0, full.len()), (0, 0), (0, 0), (0, 0), (0, 0)];
+                nsegs = 1;
             }
-            let start = buf.len();
-            buf.extend_from_slice(b);
-            segs[nsegs] = (start, buf.len());
-            nsegs += 1;
+        } else {
+            let mut v = Vec::with_capacity(cap + n);
+            let mut sg = [(0usize, 0usize); 5];
+            let mut ns = 0usize;
+            for &id in &ids[..n] {
+                let b = self.bufs[id as usize];
+                if ns > 0 {
+                    v.push(b'\n');
+                }
+                let start = v.len();
+                v.extend_from_slice(b);
+                sg[ns] = (start, v.len());
+                ns += 1;
+            }
+            buf = Cow::Owned(v);
+            segs = sg;
+            nsegs = ns;
         }
         self.joined.push(JoinedEntry { buf, idx: None, nsegs: nsegs as u8, segs });
         let idx = self.joined.len() - 1;
         self.mask_cache[mask as usize] = idx as i32;
+        self.join_cache.insert(key, idx);
         idx
     }
 
@@ -698,11 +1069,11 @@ impl<'a> Memo<'a> {
         let filter = pat.could_match(idx);
         // SIMD search runs only when the pre-filter passes (short-circuit).
         #[cfg(feature = "prof")]
-        if filter && (prof::skip_find() || pat.matches(&entry.buf)) {
+        if filter && (prof::skip_find() || pat.matches_indexed(&entry.buf, idx)) {
             return true;
         }
         #[cfg(not(feature = "prof"))]
-        if filter && pat.matches(&entry.buf) {
+        if filter && pat.matches_indexed(&entry.buf, idx) {
             return true;
         }
         false
@@ -1257,6 +1628,77 @@ This is the body. It discusses carbon markets and debt relief at length.";
         let f = flatten_block(&q.blocks[0], &table2);
         let mut memo2 = Memo::new(&paper, nslots2);
         assert!(!scan_flat(&f, &table2, &mut memo2).3, "body text leaked into TITLE scope");
+    }
+
+    /// `matches_indexed` (quad positions) must agree with `matches` (full
+    /// scan) across boundary and wildcard edge cases.
+    #[test]
+    fn matches_indexed_equiv_matches() {
+        let cases = [
+            ("foreign aid", "foreign aid in developing countries", true),
+            ("foreign aid", "xforeign aid", false),
+            ("foreign aid", "foreign aidy", false),
+            ("foreign aid", "foreign-aid policies", false),
+            ("foreign aid", "  foreign aid.", true),
+            ("foreign aid", "foreign  aid", false),
+            ("aa", "xaa aa", true),
+            ("aa", "aaa", false),
+            ("aa", "aa_", false),
+            ("aa", "aa x", true),
+            ("developing* countr*", "studies in developing countries", true),
+            ("developing* countr*", "developing countries", true),
+            ("developing* countr*", "developing and countries", false),
+            ("developing*countr*", "developing_countries", true),
+            ("developing*countr*", "developing countries", false),
+            ("poverty*-reducing*", "poverty-reducing policies", true),
+            ("poverty*-reducing*", "povertyreducing policies", false),
+            ("a* b", "a b", true),
+            ("a* b", "a b c b", true),
+            ("a* b* c", "a b c", true),
+        ];
+        for (pat, text, want) in cases {
+            let p = compile_pattern(pat);
+            let needed: HashSet<u32, FastHasher> = p
+                .parts
+                .iter()
+                .filter(|x| x.len() >= 4)
+                .map(|x| u32::from_le_bytes([x[0], x[1], x[2], x[3]]))
+                .collect();
+            let idx = TextIndex::build_with(text.as_bytes(), &needed);
+            assert_eq!(p.matches(text.as_bytes()), want, "scan {pat:?} vs {text:?}");
+            assert_eq!(p.matches_indexed(text.as_bytes(), &idx), want, "indexed {pat:?} vs {text:?}");
+        }
+    }
+
+    /// First quad occurs 500+ times before the real match: candidate
+    /// verification must stay exhaustive (no cap that drops the match).
+    #[test]
+    fn matches_indexed_common_quad_verifies_all() {
+        let mut txt = String::new();
+        for _ in 0..600 {
+            txt.push_str("forest ");
+        }
+        txt.push_str("foreign aid matters");
+        let p = compile_pattern("foreign aid");
+        let needed: HashSet<u32, FastHasher> = [u32::from_le_bytes(*b"fore")].into_iter().collect();
+        let idx = TextIndex::build_with(txt.as_bytes(), &needed);
+        assert!(idx.positions(u32::from_le_bytes(*b"fore")).unwrap().len() > 512);
+        assert!(p.matches_indexed(txt.as_bytes(), &idx));
+        // Absent quad: hard false without a scan.
+        let idx = TextIndex::build_with(b"zzz zzz".as_slice(), &first_quads());
+        assert!(!p.matches_indexed(b"zzz zzz", &idx));
+    }
+
+    /// Repeated text (every quad present) must not degenerate into a scan
+    /// per term: the positions gate answers from the index.
+    #[test]
+    fn matches_indexed_repetitive_text() {
+        let txt = "tax evasion in developing countries. ".repeat(4000);
+        let p = compile_pattern("quantum computing");
+        let needed: HashSet<u32, FastHasher> = [u32::from_le_bytes(*b"quan")].into_iter().collect();
+        let idx = TextIndex::build_with(txt.as_bytes(), &needed);
+        assert!(idx.positions(u32::from_le_bytes(*b"quan")).is_none());
+        assert!(!p.matches_indexed(txt.as_bytes(), &idx));
     }
 
     /// Edge papers that stress the folded-buffer logic the repo papers do
