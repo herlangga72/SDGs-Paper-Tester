@@ -204,7 +204,7 @@ fn cmd_match(args: &[String]) -> Result<(), String> {
         fs::read_to_string(&path).map_err(|e| format!("cannot read {path}: {e}"))?
     };
 
-    let paper = Paper::from_text(&text);
+    let paper = Paper::from_owned(text);
     let title = paper
         .title
         .clone()

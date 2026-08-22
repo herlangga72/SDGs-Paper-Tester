@@ -1420,7 +1420,7 @@ fn run_match(headers: &[(String, String)], body: &[u8]) -> Result<MatchOutcome, 
                     .to_string(),
             );
         }
-        Paper::from_text_with_meta(&text)
+        Paper::from_owned_with_meta(text)
     };
 
     let top = clamp_int(fields.get("top").map(String::as_str), 3, 1, 20);

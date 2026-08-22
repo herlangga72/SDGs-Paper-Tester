@@ -95,22 +95,28 @@ fn parse_simple_yaml(lines: &[&str]) -> Vec<(String, YVal)> {
 }
 
 /// (meta, body) — YAML frontmatter between `---` lines, if present.
-pub fn parse_frontmatter(text: &str) -> (Vec<(String, YVal)>, String) {
+/// The body is a slice of `text` (no join/copy), so an owned input string
+/// can be kept whole by the Paper and the searchable body sliced out of it.
+pub fn parse_frontmatter(text: &str) -> (Vec<(String, YVal)>, &str) {
     if !text.trim_start().starts_with("---") {
-        return (Vec::new(), text.to_string());
+        return (Vec::new(), text);
     }
     let lines: Vec<&str> = text.split('\n').collect();
     let mut end = None;
+    let mut end_byte = text.len();
     for (idx, l) in lines.iter().enumerate().skip(1) {
         if l.trim() == "---" {
             end = Some(idx);
+            // byte offset just past the closing `---` line: sum of the line
+            // lengths plus one '\n' per line (clamped; a trailing `---`
+            // without '\n' overshoots by one).
+            end_byte = lines[..=idx].iter().map(|s| s.len() + 1).sum::<usize>().min(text.len());
             break;
         }
     }
-    let Some(end) = end else { return (Vec::new(), text.to_string()) };
+    let Some(end) = end else { return (Vec::new(), text) };
     let meta = parse_simple_yaml(&lines[1..end]);
-    let body = lines[end + 1..].join("\n");
-    (meta, body)
+    (meta, &text[end_byte..])
 }
 
 /// Paper metadata (YAML frontmatter or the web form). Used by the web UI
@@ -165,7 +171,13 @@ impl Meta {
 
 pub struct Paper {
     pub title: Option<String>,
-    full_text: String,
+    /// Owned input text. `full_text()` slices `[body_start..]`, so the
+    /// searchable body is never copied out of the caller's string.
+    input: String,
+    /// Byte offset of the searchable body within `input` (frontmatter is
+    /// dropped by slicing, not copying). 0 when the full text is the
+    /// sections join or the whole input.
+    body_start: usize,
     lower_sections: [Option<Vec<u8>>; 4],
     lower_full: Vec<u8>,
     /// True when `lower_full` is the join of the section buffers (no body
@@ -173,99 +185,128 @@ pub struct Paper {
     pub(crate) full_covers_sections: bool,
 }
 
-impl Paper {
-    pub fn from_text(text: &str) -> Paper {
-        let (meta, body) = parse_frontmatter(text);
-        let mut sections: [Option<String>; 4] = [None, None, None, None];
 
-        // body marker lines (legacy TITLE:/ABSTRACT:/KEYWORDS: format)
-        let mut cur: Option<usize> = None;
-        for ln in body.lines() {
-            let t = ln.trim_start();
-            let mut marker: Option<usize> = None;
-            if let Some(rest) = t.strip_prefix("TITLE:") {
-                marker = Some(F_TITLE as usize);
-                sections[F_TITLE as usize] = Some(rest.trim().to_string());
-            } else if let Some(rest) = t.strip_prefix("ABSTRACT:") {
-                marker = Some(F_ABS as usize);
-                sections[F_ABS as usize] = Some(rest.trim().to_string());
-            } else if let Some(rest) = t.strip_prefix("KEYWORDS:") {
-                sections[F_KEY as usize] = Some(rest.trim().to_string());
-                sections[F_AUTHKEY as usize] = Some(rest.trim().to_string());
-                marker = Some(F_KEY as usize);
-            } else if let Some(rest) = t.strip_prefix("AUTHKEY:") {
-                sections[F_AUTHKEY as usize] = Some(rest.trim().to_string());
-                marker = Some(F_AUTHKEY as usize);
-            }
-            if marker.is_some() {
-                cur = marker;
-            } else if let Some(c) = cur {
-                if !ln.trim().is_empty() {
-                    if let Some(s) = sections[c].as_mut() {
-                        s.push(' ');
-                        s.push_str(ln.trim());
-                    }
+/// Shared construction from an owned input, parsed frontmatter pairs and
+/// the body's byte offset within it. Zero-copy: the body is sliced out of
+/// `text`; only the frontmatter/section strings (small) are copied.
+fn build_paper(text: String, meta: Vec<(String, YVal)>, body_start: usize) -> Paper {
+    let body_is_ws = text[body_start..].trim().is_empty();
+    let mut sections: [Option<String>; 4] = [None, None, None, None];
+
+    // body marker lines (legacy TITLE:/ABSTRACT:/KEYWORDS: format)
+    let mut cur: Option<usize> = None;
+    for ln in text[body_start..].lines() {
+        let t = ln.trim_start();
+        let mut marker: Option<usize> = None;
+        if let Some(rest) = t.strip_prefix("TITLE:") {
+            marker = Some(F_TITLE as usize);
+            sections[F_TITLE as usize] = Some(rest.trim().to_string());
+        } else if let Some(rest) = t.strip_prefix("ABSTRACT:") {
+            marker = Some(F_ABS as usize);
+            sections[F_ABS as usize] = Some(rest.trim().to_string());
+        } else if let Some(rest) = t.strip_prefix("KEYWORDS:") {
+            sections[F_KEY as usize] = Some(rest.trim().to_string());
+            sections[F_AUTHKEY as usize] = Some(rest.trim().to_string());
+            marker = Some(F_KEY as usize);
+        } else if let Some(rest) = t.strip_prefix("AUTHKEY:") {
+            sections[F_AUTHKEY as usize] = Some(rest.trim().to_string());
+            marker = Some(F_AUTHKEY as usize);
+        }
+        if marker.is_some() {
+            cur = marker;
+        } else if let Some(c) = cur {
+            if !ln.trim().is_empty() {
+                if let Some(s) = sections[c].as_mut() {
+                    s.push(' ');
+                    s.push_str(ln.trim());
                 }
             }
         }
+    }
 
-        // frontmatter wins over body markers
-        let mut title = None;
-        for (k, v) in meta {
-            match (k.as_str(), v) {
-                ("title", YVal::S(s)) => {
-                    title = Some(s.clone());
-                    sections[F_TITLE as usize] = Some(s);
-                }
-                ("abstract" | "summary", YVal::S(s)) => sections[F_ABS as usize] = Some(s),
-                ("keywords" | "keyword" | "author_keywords", YVal::L(l)) => {
-                    let j = l.join(", ");
-                    sections[F_KEY as usize] = Some(j.clone());
-                    sections[F_AUTHKEY as usize] = Some(j);
-                }
-                ("keywords" | "keyword" | "author_keywords", YVal::S(s)) => {
-                    sections[F_KEY as usize] = Some(s.clone());
-                    sections[F_AUTHKEY as usize] = Some(s);
-                }
-                _ => {}
+    // frontmatter wins over body markers
+    let mut title = None;
+    for (k, v) in meta {
+        match (k.as_str(), v) {
+            ("title", YVal::S(s)) => {
+                title = Some(s.clone());
+                sections[F_TITLE as usize] = Some(s);
             }
+            ("abstract" | "summary", YVal::S(s)) => sections[F_ABS as usize] = Some(s),
+            ("keywords" | "keyword" | "author_keywords", YVal::L(l)) => {
+                let j = l.join(", ");
+                sections[F_KEY as usize] = Some(j.clone());
+                sections[F_AUTHKEY as usize] = Some(j);
+            }
+            ("keywords" | "keyword" | "author_keywords", YVal::S(s)) => {
+                sections[F_KEY as usize] = Some(s.clone());
+                sections[F_AUTHKEY as usize] = Some(s);
+            }
+            _ => {}
         }
+    }
 
-        let has_sections = sections.iter().any(|s| s.as_ref().map_or(false, |x| !x.trim().is_empty()));
-        let full = if !body.trim().is_empty() {
-            body.to_string()
-        } else if has_sections {
+    let has_sections = sections.iter().any(|s| s.as_ref().map_or(false, |x| !x.trim().is_empty()));
+    let (input, body_start) = if !body_is_ws {
+        (text, body_start)
+    } else if has_sections {
+        (
             sections
                 .iter()
                 .flatten()
                 .cloned()
                 .collect::<Vec<_>>()
-                .join("\n")
-        } else {
-            text.to_string()
-        };
+                .join("\n"),
+            0,
+        )
+    } else {
+        (text, 0)
+    };
 
-        let lower_full = lower_ascii(full.as_bytes());
-        let lower_sections = [
-            sections[0].as_ref().map(|s| lower_ascii(s.as_bytes())),
-            sections[1].as_ref().map(|s| lower_ascii(s.as_bytes())),
-            sections[2].as_ref().map(|s| lower_ascii(s.as_bytes())),
-            sections[3].as_ref().map(|s| lower_ascii(s.as_bytes())),
-        ];
-        Paper {
-            title,
-            lower_full,
-            lower_sections,
-            full_text: full,
-            full_covers_sections: body.trim().is_empty(),
-        }
+    let lower_full = lower_ascii(&input.as_bytes()[body_start..]);
+    let lower_sections = [
+        sections[0].as_ref().map(|s| lower_ascii(s.as_bytes())),
+        sections[1].as_ref().map(|s| lower_ascii(s.as_bytes())),
+        sections[2].as_ref().map(|s| lower_ascii(s.as_bytes())),
+        sections[3].as_ref().map(|s| lower_ascii(s.as_bytes())),
+    ];
+    Paper {
+        title,
+        input,
+        body_start,
+        lower_full,
+        lower_sections,
+        full_covers_sections: body_is_ws,
+    }
+}
+
+impl Paper {
+    /// Parse an owned text string. The string is kept as-is (body is a
+    /// slice), so no full-text copy happens on the hot path. Callers that
+    /// already own a `String` should use this; `from_text` (borrowed) is
+    /// for literals and tests.
+    pub fn from_owned(text: String) -> Paper {
+        let (meta, body) = parse_frontmatter(&text);
+        let body_start = text.len() - body.len();
+        build_paper(text, meta, body_start)
     }
 
+    pub fn from_text(text: &str) -> Paper {
+        Paper::from_owned(text.to_string())
+    }
+
+
     /// Parse text and also return the frontmatter metadata (web server).
-    pub fn from_text_with_meta(text: &str) -> (Paper, Meta) {
-        let (pairs, _) = parse_frontmatter(text);
+    /// The frontmatter is parsed once for both the `Meta` and the sections.
+    pub fn from_owned_with_meta(text: String) -> (Paper, Meta) {
+        let (pairs, body) = parse_frontmatter(&text);
         let meta = Meta::from_pairs(&pairs);
-        (Paper::from_text(text), meta)
+        let body_start = text.len() - body.len();
+        (build_paper(text, pairs, body_start), meta)
+    }
+
+    pub fn from_text_with_meta(text: &str) -> (Paper, Meta) {
+        Paper::from_owned_with_meta(text.to_string())
     }
 
     /// Build a Paper straight from field sections (web form input, no YAML
@@ -281,7 +322,7 @@ impl Paper {
             sections[3].as_ref().map(|s| lower_ascii(s.as_bytes())),
         ];
         let title = sections[F_TITLE as usize].clone();
-        Paper { title, lower_full, lower_sections, full_text: full, full_covers_sections: true }
+        Paper { title, input: full, body_start: 0, lower_full, lower_sections, full_covers_sections: true }
     }
 
     /// Byte ranges of each present section within `text_lower(F_ANY)`.
@@ -308,7 +349,7 @@ impl Paper {
     /// Original (un-lowercased) full text; byte offsets in it are 1:1 with
     /// `text_lower(F_ANY)` because ASCII lowercasing preserves length.
     pub fn full_text(&self) -> &str {
-        &self.full_text
+        &self.input[self.body_start..]
     }
 
     /// Lowercased text for a field id (falls back to full text).
@@ -321,5 +362,33 @@ impl Paper {
             }
         }
         &self.lower_full
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn owned_paper_keeps_title_and_sections() {
+        let p = Paper::from_owned(
+            "---\ntitle: \"T\"\nabstract: |\n  A b.\nkeywords: [x, y]\n---\nBody text here.".to_string(),
+        );
+        assert_eq!(p.title.as_deref(), Some("T"));
+        assert_eq!(p.full_text(), "Body text here.");
+        assert_eq!(p.text_lower(F_TITLE), b"t");
+        assert_eq!(p.text_lower(F_ABS), b"a b.");
+        assert_eq!(p.text_lower(F_KEY), b"x, y");
+        assert_eq!(p.text_lower(F_AUTHKEY), b"x, y"); // keywords feed both
+    }
+
+    #[test]
+    fn owned_paper_no_frontmatter() {
+        let p = Paper::from_owned("just a plain paper body".to_string());
+        assert_eq!(p.title, None);
+        assert_eq!(p.full_text(), "just a plain paper body");
+        assert_eq!(p.text_lower(F_ANY), b"just a plain paper body");
+        // body text present -> full text is the body, not the sections join
+        assert!(!p.full_covers_sections);
     }
 }

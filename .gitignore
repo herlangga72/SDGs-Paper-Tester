@@ -13,3 +13,5 @@ rust/target/
 # OS junk
 .DS_Store
 Thumbs.db
+
+rust/web-server.log
