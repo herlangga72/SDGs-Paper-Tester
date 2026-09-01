@@ -18,6 +18,7 @@
 //! Usage:
 //!     cargo run --bin web --release [--host 127.0.0.1] [--port 8000] [--no-browser]
 
+use sdg_tools::cache;
 use sdg_tools::matcher::{self, Pattern};
 use sdg_tools::paper::{self, Meta, Paper, F_ANY};
 use sdg_tools::query::{self, Query};
@@ -99,40 +100,84 @@ fn queries_dir() -> PathBuf {
 // a few ms here thanks to the SIMD matcher)
 // ---------------------------------------------------------------------------
 
-static APP: OnceLock<(Vec<Query>, Vec<Pattern>, Vec<Vec<matcher::FlatBlock>>)> = OnceLock::new();
+static APP: OnceLock<(
+    Vec<Query>,
+    &'static [Pattern],
+    Vec<Vec<matcher::FlatBlock>>,
+    Vec<matcher::SdgDict>,
+)> = OnceLock::new();
 
-fn app() -> &'static (Vec<Query>, Vec<Pattern>, Vec<Vec<matcher::FlatBlock>>) {
+fn app() -> &'static (
+    Vec<Query>,
+    &'static [Pattern],
+    Vec<Vec<matcher::FlatBlock>>,
+    Vec<matcher::SdgDict>,
+) {
     APP.get_or_init(|| {
-        let mut queries = match query::load_queries(&queries_dir()) {
-            Ok(q) => q,
-            Err(e) => {
-                eprintln!("[web] warning: could not load queries: {e}");
-                Vec::new()
+        let qdir = queries_dir();
+        let t = Instant::now();
+        // Boot cache: the parsed+resolved query ASTs, pattern table,
+        // flattened blocks and pretokenized SDG dictionaries are persisted
+        // to sdg_cache.bin (validated by query mtimes), so a restart skips
+        // the Scopus-file parse AND the ~21k-keyword recompile.
+        let cached = cache::read_cached(&qdir);
+        let (queries, table, flats, dicts) = match cached {
+            Some(data) => {
+                matcher::rebuild_first_quads(data.patterns);
+                eprintln!(
+                    "[web] mmap'd boot cache ({} queries, {} patterns)",
+                    data.queries.len(),
+                    data.patterns.len()
+                );
+                (data.queries, data.patterns, data.flats, data.dicts)
+            }
+            None => {
+                let mut queries = match query::load_queries(&qdir) {
+                    Ok(q) => q,
+                    Err(e) => {
+                        eprintln!("[web] warning: could not load queries: {e}");
+                        Vec::new()
+                    }
+                };
+                // Precompile every keyword once into a dense table and stamp
+                // each AST leaf with its pattern index; matching then never
+                // hashes keyword strings.
+                let table = matcher::compile_all(queries.iter().flat_map(|q| q.blocks.iter()));
+                let mut nslots = 0u32;
+                for q in &mut queries {
+                    matcher::resolve_blocks(&mut q.blocks, &table, &mut nslots);
+                }
+                // Flatten every block to a postfix program once, so a request
+                // never re-walks the AST (tree dispatch was ~40% of the
+                // per-request time).
+                let flats: Vec<Vec<matcher::FlatBlock>> = queries
+                    .iter()
+                    .map(|q| q.blocks.iter().map(|b| matcher::flatten_block(b, &table)).collect())
+                    .collect();
+                // Keyword dictionaries (unique include keywords + excluded
+                // set) for suggestions and the Advanced tab.
+                let dicts: Vec<matcher::SdgDict> =
+                    queries.iter().map(|q| matcher::collect_sdg_dict(&q.blocks)).collect();
+                if let Err(e) = cache::write_cache(
+                    &qdir,
+                    matcher::blob_slice(),
+                    &queries,
+                    &table,
+                    &flats,
+                    &dicts,
+                ) {
+                    eprintln!("[web] warning: could not write boot cache: {e}");
+                }
+                let table: &'static [Pattern] = Box::leak(table.into_boxed_slice());
+                (queries, table, flats, dicts)
             }
         };
-        let t = Instant::now();
-        // Precompile every keyword once into a dense table and stamp each
-        // AST leaf with its pattern index; matching then never hashes
-        // keyword strings. (Previously ~21k patterns were recompiled per
-        // request, which dominated the per-request cost.)
-        let table = matcher::compile_all(queries.iter().flat_map(|q| q.blocks.iter()));
-        let mut nslots = 0u32;
-        for q in &mut queries {
-            matcher::resolve_blocks(&mut q.blocks, &table, &mut nslots);
-        }
-        // Flatten every block to a postfix program once, so a request never
-        // re-walks the AST (measured: ~40% of per-request time was tree
-        // dispatch + per-node calls).
-        let flats = queries
-            .iter()
-            .map(|q| q.blocks.iter().map(|b| matcher::flatten_block(b, &table)).collect())
-            .collect();
         eprintln!(
-            "[web] precompiled {} patterns in {:.1} ms",
-            table.len(),
-            t.elapsed().as_secs_f64() * 1000.0
+            "[web] ready in {:.1} ms ({} patterns)",
+            t.elapsed().as_secs_f64() * 1000.0,
+            table.len()
         );
-        (queries, table, flats)
+        (queries, table, flats, dicts)
     })
 }
 
@@ -140,26 +185,55 @@ fn get_queries() -> &'static Vec<Query> {
     &app().0
 }
 
-fn get_patterns() -> &'static Vec<Pattern> {
-    &app().1
+fn get_patterns() -> &'static [Pattern] {
+    app().1
 }
 
 fn get_flats() -> &'static Vec<Vec<matcher::FlatBlock>> {
     &app().2
 }
 
+fn get_dicts() -> &'static Vec<matcher::SdgDict> {
+    &app().3
+}
+
 // ---------------------------------------------------------------------------
 // Matching (identical semantics to engine/match_paper.py)
 // ---------------------------------------------------------------------------
+
+/// One non-matching block that can still qualify, ranked by `cost`
+/// (minimum keywords to add). `need` holds the missing-tag groups: any ONE
+/// keyword from each group qualifies the block.
+struct NearBlock {
+    bno: usize,
+    /// Include keywords already hit (deduped).
+    n_hit: usize,
+    /// Minimum keywords to add to qualify (never INF_COST here).
+    cost: usize,
+    /// Candidate keywords per group (any one per group).
+    need: Vec<Vec<&'static str>>,
+    /// The include keywords of this block already present in the paper
+    /// (rendered as green "already in your text" chips).
+    hits: Vec<(&'static str, u8)>,
+}
 
 struct SdgReport {
     sdg: String,
     // Keywords are borrowed from the global FlatBlocks ('static).
     matched: Vec<(usize, Vec<(&'static str, u8)>)>,
-    near: Vec<(usize, Vec<(&'static str, u8)>, usize)>,
+    near: Vec<NearBlock>,
     near_total: usize,
     excluded: Vec<&'static str>,
     max_kw: usize,
+    /// Deterministic best-fit keyword suggestions (no LLM).
+    suggestions: Vec<matcher::Suggestion>,
+    /// Keywords that alone qualify the SDG: they appear in the single missing
+    /// group (need.len()==1, cost==1) of some near-miss block.
+    solo: HashSet<&'static str>,
+    /// Per keyword that appears in a near-miss block but does NOT qualify
+    /// alone: the minimum number of additional keywords still needed
+    /// (cost of the cheapest block containing it, minus one).
+    extra: HashMap<&'static str, usize>,
 }
 
 /// Full report: one entry per SDG. The pattern cache is global (precompiled
@@ -171,41 +245,103 @@ fn match_report(paper: &Paper, top: usize, max_kw: usize) -> Vec<SdgReport> {
     // the corpus) are evaluated once instead of once per occurrence.
     let mut memo = matcher::Memo::new(paper, 0);
     let mut out = Vec::new();
+    // Paper word set, built once and reused for every SDG's suggestion
+    // scoring (allocation-free after this point).
+    let paper_text = String::from_utf8_lossy(paper.text_lower(paper::F_ANY));
+    let words = matcher::text_words(&paper_text);
     // Scratch vectors reused across blocks (clear keeps their capacity).
     let mut hits: Vec<(&'static str, u8)> = Vec::new();
     let mut misses: Vec<(&'static str, u8)> = Vec::new();
     let mut ex_hits: Vec<&'static str> = Vec::new();
+    let mut mscr = matcher::MinAddScratch::default();
     for (qi, q) in get_queries().iter().enumerate() {
         let mut matched = Vec::new();
-        let mut near = Vec::new();
+        // (block_no, keywords already hit, min keywords to add, need groups,
+        //  already-hit keyword entries)
+        let mut near: Vec<(usize, usize, usize, Vec<Vec<&'static str>>, Vec<(&'static str, u8)>)> = Vec::new();
         let mut ex: Vec<&'static str> = Vec::new();
+        let mut present: HashSet<&'static str> = HashSet::new();
+        // Keywords that qualify the SDG on their own / still need N more.
+        let mut solo: HashSet<&'static str> = HashSet::new();
+        let mut extra: HashMap<&'static str, usize> = HashMap::new();
         for (bno, flat) in get_flats()[qi].iter().enumerate() {
             hits.clear();
             misses.clear();
             ex_hits.clear();
             let is_match = matcher::scan_flat_into(flat, table, &mut memo, &mut hits, &mut misses, &mut ex_hits);
-            ex.extend(ex_hits.iter().cloned());
+            // Every include-leaf hit counts as "present" for the keyword
+            // suggestions (even when its block did not match overall).
+            for (kw, _) in hits.iter() {
+                present.insert(*kw);
+            }
             // The Scopus query files repeat terms across AND sub-groups, so
             // dedupe by (keyword identity, field mask) before rendering.
             let hits = dedupe_kw(std::mem::take(&mut hits));
             if is_match {
                 matched.push((bno, hits));
             } else {
-                near.push((bno, dedupe_kw(std::mem::take(&mut misses)), hits.len()));
+                // Cost-only near-miss analysis (zero allocation): exact
+                // minimum keywords to add. INF_COST means a required-path
+                // NOT is already true - the block is disqualified by an
+                // excluded term, so it is NOT a near miss. The candidate
+                // keyword groups are materialized below only for the blocks
+                // that make the displayed list.
+                let (_, cost) = matcher::min_add_flat_cost(flat, table, &mut memo, &mut mscr);
+                if cost == matcher::INF_COST as u32 {
+                    // Only report excluded terms when the positive side alone
+                    // would have matched - i.e. the NOT genuinely blocked a
+                    // near-qualifying block (off-topic blocks are dropped).
+                    if matcher::eval_ignore_not_block(&get_queries()[qi].blocks[bno], table, &mut memo) {
+                        ex.extend(ex_hits.iter().cloned());
+                    }
+                } else {
+                    // Materialize the missing-tag groups for every finite-cost
+                    // block: they feed both the AND-clause visualization and
+                    // the per-chip "qualifies alone / needs N more" badges.
+                    let ma = matcher::min_add_flat(flat, table, &mut memo, &mut mscr);
+                    let cost_us = cost as usize;
+                    if cost_us == 1 && ma.need.len() == 1 {
+                        solo.extend(ma.need[0].iter().copied());
+                    } else {
+                        let need_more = cost_us.saturating_sub(1);
+                        for g in &ma.need {
+                            for k in g {
+                                let cur = extra.get(k).copied();
+                                if cur.is_none() || need_more < cur.unwrap() {
+                                    extra.insert(*k, need_more);
+                                }
+                            }
+                        }
+                    }
+                    near.push((bno, hits.len(), cost_us, ma.need, hits));
+                }
             }
         }
-        near.sort_by_key(|t| t.1.len()); // fewest missing keywords first
+        // Rerank: fewest keywords to add first; ties go to the block that
+        // already hit more keywords.
+        near.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| b.1.cmp(&a.1)));
         let near_total = near.len();
+        let near_blocks: Vec<NearBlock> = near
+            .into_iter()
+            .take(top)
+            .map(|(bno, n_hit, cost, need, hits)| NearBlock { bno, n_hit, cost, need, hits })
+            .collect();
         let mut exu = ex.clone();
         exu.sort_unstable();
         exu.dedup();
+        // Best-fit keywords to add: rank the SDG's include keywords by
+        // word-token overlap with the paper text (pure math, no LLM).
+        let suggestions = matcher::suggest_keywords(&words, &get_dicts()[qi], &present, 10);
         out.push(SdgReport {
             sdg: q.sdg.clone(),
             matched,
-            near: near.into_iter().take(top).collect(),
+            near: near_blocks,
             near_total,
             excluded: exu,
             max_kw,
+            suggestions,
+            solo,
+            extra,
         });
     }
     out
@@ -832,26 +968,77 @@ fn fetch_doi(doi: &str) -> Result<String, (u16, String)> {
 // HTML rendering of the match report
 // ---------------------------------------------------------------------------
 
+fn chip(kw: &str, mask: u8, cls: &str) -> String {
+    let field = if mask == 0 || mask == field_mask_all() {
+        String::new()
+    } else {
+        format!("<span class=\"field\">[{}]</span>", matcher::field_names(mask))
+    };
+    format!("<span class=\"kw {cls}\">{}{field}</span>", esc(kw))
+}
+
+/// One keyword chip list: the first `max_kw` chips plus a "Show all N"
+/// toggle button revealing the full list (see app.js `.kw-toggle` handler).
 fn kw_tags<K: AsRef<str>>(entries: &[(K, u8)], cls: &str, max_kw: usize) -> String {
     if entries.is_empty() {
         return "<span class=\"none\">none</span>".to_string();
     }
+    let n = entries.len();
+    let take = max_kw.min(n);
     let mut out = String::new();
-    for (kw, mask) in entries.iter().take(max_kw) {
-        let field = if *mask == 0 || *mask == field_mask_all() {
-            String::new()
-        } else {
-            format!("<span class=\"field\">[{}]</span>", matcher::field_names(*mask))
-        };
-        out.push_str(&format!("<span class=\"kw {cls}\">{}{field}</span>", esc(kw.as_ref())));
+    for (kw, mask) in entries.iter().take(take) {
+        out.push_str(&chip(kw.as_ref(), *mask, cls));
     }
-    if entries.len() > max_kw {
+    if n > take {
+        let rest: String = entries
+            .iter()
+            .skip(take)
+            .map(|(kw, mask)| chip(kw.as_ref(), *mask, cls))
+            .collect();
         out.push_str(&format!(
-            "<span class=\"muted-text\">… +{} more</span>",
-            entries.len() - max_kw
+            "<span class=\"kw-more\" hidden>{rest}</span>\
+             <button type=\"button\" class=\"kw-toggle\" data-all=\"Show all {n}\" \
+             data-few=\"Show fewer\">Show all {n}</button>"
         ));
     }
     out
+}
+
+/// Render one near-miss path as AND-joined "pick any one" boxes.
+fn render_need_chain(need: &[Vec<&'static str>], max_kw: usize, body: &mut String) {
+    body.push_str("<div class=\"and-chain\">");
+    let n_groups = need.len();
+    for (gi, g) in need.iter().take(3).enumerate() {
+        if gi > 0 {
+            body.push_str("<div class=\"and-op\">AND</div>");
+        }
+        body.push_str(&format!(
+            "<div class=\"and-group\"><div class=\"and-group-label\">Box {} — pick any ONE:</div>",
+            gi + 1
+        ));
+        let entries: Vec<(&'static str, u8)> = g.iter().map(|k| (*k, 0)).collect();
+        body.push_str(&kw_tags(&entries, "missing", max_kw));
+        body.push_str("</div>");
+    }
+    if n_groups > 3 {
+        let mut rest = String::new();
+        for (gi, g) in need.iter().enumerate().skip(3) {
+            rest.push_str("<div class=\"and-op\">AND</div>");
+            rest.push_str(&format!(
+                "<div class=\"and-group\"><div class=\"and-group-label\">Box {} — pick any ONE:</div>",
+                gi + 1
+            ));
+            let entries: Vec<(&'static str, u8)> = g.iter().map(|k| (*k, 0)).collect();
+            rest.push_str(&kw_tags(&entries, "missing", max_kw));
+            rest.push_str("</div>");
+        }
+        body.push_str(&format!(
+            "<div class=\"kw-more kw-more-block\" hidden>{rest}</div>\
+             <button type=\"button\" class=\"kw-toggle\" data-all=\"Show all {n_groups} boxes\" \
+             data-few=\"Show fewer boxes\">Show all {n_groups} boxes</button>"
+        ));
+    }
+    body.push_str("</div>");
 }
 
 /// Mask of the default TITLE-ABS-KEY search (all four section fields).
@@ -962,26 +1149,109 @@ fn render_results(report: &[SdgReport], paper: &Paper, meta: &Meta, ms: f64) -> 
             body.push_str("</div>");
         }
         if !r.near.is_empty() {
-            body.push_str("<div class=\"block\"><h4>Near misses — add any of these keywords to qualify</h4>");
-            for (bno, misses, n_hit) in &r.near {
+            body.push_str("<div class=\"block\"><h4>How to qualify this SDG</h4>");
+            let (first, rest) = r.near.split_first().unwrap();
+            let word = if first.cost == 1 { "keyword" } else { "keywords" };
+            body.push_str(&format!(
+                "<div class=\"status-line\">Your text is <b>{} {}</b> short of qualifying for <b>SDG {} — {}</b>.</div>",
+                first.cost,
+                word,
+                r.sdg,
+                esc(sdg_name(&r.sdg))
+            ));
+            // Fastest (cheapest) path, green callout.
+            body.push_str("<div class=\"fastest\">");
+            body.push_str(&format!(
+                "<div class=\"fastest-head\">⚡ Fastest — add {} {} (pick any one from each box):</div>",
+                first.cost, word
+            ));
+            render_need_chain(&first.need, r.max_kw, &mut body);
+            body.push_str(
+                "<div class=\"min-hint\">1 keyword from each box = the SDG qualifies. Click a chip to add it to your Keywords field.</div>",
+            );
+            body.push_str("<div class=\"have-line\"><b>Already in your text:</b> ");
+            if first.hits.is_empty() {
+                body.push_str("<span class=\"none\">none yet</span>");
+            } else {
+                body.push_str(&kw_tags(&first.hits, "hit", r.max_kw));
+            }
+            body.push_str("</div>");
+            body.push_str("</div>");
+            // Other paths, collapsed.
+            if !rest.is_empty() {
+                let mut alts = String::new();
+                for (ai, nb) in rest.iter().enumerate() {
+                    let w = if nb.cost == 1 { "keyword" } else { "keywords" };
+                    alts.push_str(&format!(
+                        "<div class=\"way-head\">Way {} — add {} {}:</div>",
+                        ai + 2,
+                        nb.cost,
+                        w
+                    ));
+                    render_need_chain(&nb.need, r.max_kw, &mut alts);
+                }
                 body.push_str(&format!(
-                    "<div class=\"muted-text\" style=\"margin:4px 0 2px\">block {bno}: \
-                     {n_hit} keyword(s) already hit</div>"
+                    "<div class=\"kw-more kw-more-block\" hidden>{alts}</div>\
+                     <button type=\"button\" class=\"kw-toggle\" data-all=\"Show {} other ways to qualify\" \
+                     data-few=\"Hide other ways\">Show {} other ways to qualify</button>",
+                    rest.len(),
+                    rest.len()
                 ));
-                body.push_str(&kw_tags(misses, "missing", r.max_kw));
             }
             if r.near_total > r.near.len() {
                 body.push_str(&format!(
-                    "<div class=\"muted-text\">… {} more near-miss blocks not shown</div>",
+                    "<div class=\"muted-text\">… {} more ways not shown</div>",
                     r.near_total - r.near.len()
                 ));
             }
             body.push_str("</div>");
         }
         if !r.excluded.is_empty() {
-            body.push_str("<div class=\"block\"><h4>Excluded terms found in the text (can disqualify a match)</h4>");
+            body.push_str("<div class=\"block\"><h4>Excluded terms that blocked a near match — remove them from the text to qualify</h4>");
             let entries: Vec<(&'static str, u8)> = r.excluded.iter().map(|k| (*k, 0)).collect();
             body.push_str(&kw_tags(&entries, "ex", r.max_kw));
+            body.push_str("</div>");
+        }
+        if !r.suggestions.is_empty() {
+            let heading = if r.matched.is_empty() {
+                "Best-fit keywords to add (click to copy)"
+            } else {
+                "Related keywords from this SDG — best fit to your text (click to copy)"
+            };
+            body.push_str(&format!("<div class=\"block\"><h4>{heading}</h4>"));
+            if r.matched.is_empty() {
+                body.push_str(
+                    "<div class=\"sug-legend\"><span class=\"sug-badge solo\">✓ alone</span> qualifies by itself · \
+                     <span class=\"sug-badge more\">+N</span> still needs N more keyword(s) · \
+                     <span class=\"sug-badge block\">⚠ blocked</span> excluded term — adding it blocks a match</div>",
+                );
+            }
+            body.push_str("<div class=\"sug-row\">");
+            for s in r.suggestions.iter().take(r.max_kw.min(10)) {
+                let pct = (s.score * 100.0).round() as u32;
+                let badge = if s.excluded_in_sdg {
+                    "<span class=\"sug-badge block\" title=\"also an excluded (NOT) term in this SDG — adding it can block a match\">⚠ blocked</span>".to_string()
+                } else if r.matched.is_empty() && r.solo.contains(s.keyword.as_ref()) {
+                    "<span class=\"sug-badge solo\" title=\"this keyword alone qualifies the SDG\">✓ alone</span>".to_string()
+                } else if r.matched.is_empty() {
+                    match r.extra.get(s.keyword.as_ref()) {
+                        Some(n) => format!("<span class=\"sug-badge more\" title=\"still needs {n} more keyword(s) — see the near-miss boxes above\">+{n} more</span>"),
+                        None => "<span class=\"sug-badge more\" title=\"does not qualify by itself — see the near-miss boxes above\">+ more</span>".to_string(),
+                    }
+                } else {
+                    String::new()
+                };
+                body.push_str(&format!(
+                    "<button type=\"button\" class=\"kw sug\" data-kw=\"{}\">{}<span class=\"score\">{pct}%</span>{badge}</button>",
+                    esc(&s.keyword),
+                    esc(&s.keyword)
+                ));
+            }
+            body.push_str("</div>");
+            body.push_str(&format!(
+                "<div class=\"muted-text\">Auto-ranked by word overlap with your text — no AI. Open the <b>Advanced</b> tab for the full SDG {} keyword list.</div>",
+                r.sdg
+            ));
             body.push_str("</div>");
         }
 
@@ -1022,8 +1292,14 @@ fn render_results(report: &[SdgReport], paper: &Paper, meta: &Meta, ms: f64) -> 
         }
     }
 
+    let explainer = "<details class=\"card explainer\"><summary>How SDG matching works (30 seconds)</summary>\
+        <p>Each SDG is made of several <b>keyword paths</b>. A paper qualifies for an SDG as soon as <b>one full path</b> \
+        is present in its text. For every SDG you are close to, we show the <b>shortest missing path</b> first: \
+        pick <b>one keyword from each box</b> and the SDG qualifies. Click any suggested keyword to add it to your \
+        Keywords field (it is copied to the clipboard too).</p></details>";
+
     format!(
-        "<div id=\"results-inner\"><h2 class=\"section\">Results</h2>{info_html}{stat}{chips_html}\
+        "<div id=\"results-inner\"><h2 class=\"section\">Results</h2>{info_html}{stat}{chips_html}{explainer}\
          <div id=\"cards\">{cards}</div>{hl}</div>"
     )
 }
@@ -1379,29 +1655,18 @@ struct MatchOutcome {
 
 /// Parse the /match form (urlencoded or multipart), build the paper, and run
 /// the report. Shared by the HTML endpoint and the JSON API.
-fn run_match(headers: &[(String, String)], body: &[u8]) -> Result<MatchOutcome, String> {
-    let t0 = Instant::now();
-    let ctype = headers
-        .iter()
-        .find(|(k, _)| k == "content-type")
-        .map(|(_, v)| v.clone())
-        .unwrap_or_default();
-    let (mut fields, files) = if ctype.contains("multipart/form-data") {
-        match boundary_of(&ctype) {
-            Some(b) => parse_multipart(body, &b),
-            None => (HashMap::new(), HashMap::new()),
-        }
-    } else {
-        (parse_urlencoded(body), HashMap::new())
-    };
-
+/// Build a Paper from the request fields (form fields when present, else
+/// raw pasted text / uploaded file). Shared by /match and /api/keywords.
+fn paper_from_request(
+    fields: &mut HashMap<String, String>,
+    files: &HashMap<String, Vec<u8>>,
+) -> Result<(Paper, Meta), String> {
     let form_keys = ["title", "abstract", "keywords", "authors", "year", "journal", "doi"];
     let any = form_keys
         .iter()
         .any(|k| fields.get(*k).map_or(false, |v| !v.trim().is_empty()));
-
-    let (paper, meta) = if any {
-        paper_from_fields(&fields)
+    if any {
+        Ok(paper_from_fields(fields))
     } else {
         // raw pasted text, or uploaded file
         let mut text = fields.remove("paper").unwrap_or_default();
@@ -1420,10 +1685,29 @@ fn run_match(headers: &[(String, String)], body: &[u8]) -> Result<MatchOutcome, 
                     .to_string(),
             );
         }
-        Paper::from_owned_with_meta(text)
+        Ok(Paper::from_owned_with_meta(text))
+    }
+}
+
+fn run_match(headers: &[(String, String)], body: &[u8]) -> Result<MatchOutcome, String> {
+    let t0 = Instant::now();
+    let ctype = headers
+        .iter()
+        .find(|(k, _)| k == "content-type")
+        .map(|(_, v)| v.clone())
+        .unwrap_or_default();
+    let (mut fields, files) = if ctype.contains("multipart/form-data") {
+        match boundary_of(&ctype) {
+            Some(b) => parse_multipart(body, &b),
+            None => (HashMap::new(), HashMap::new()),
+        }
+    } else {
+        (parse_urlencoded(body), HashMap::new())
     };
 
-    let top = clamp_int(fields.get("top").map(String::as_str), 3, 1, 20);
+    let (paper, meta) = paper_from_request(&mut fields, &files)?;
+
+    let top = clamp_int(fields.get("top").map(String::as_str), 30, 1, 30);
     let max_kw = clamp_int(fields.get("maxkw").map(String::as_str), 10, 1, 50);
     let report = match_report(&paper, top, max_kw);
     let ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -1452,11 +1736,30 @@ fn api_match(headers: &[(String, String)], body: &[u8]) -> Resp {
                             "keywords": hits.iter().map(|(kw, f)| serde_json::json!({"keyword": kw, "fields": matcher::field_names(*f)})).collect::<Vec<_>>(),
                         })
                     }).collect();
-                    let near: Vec<serde_json::Value> = r.near.iter().map(|(bno, misses, nh)| {
+                    let near: Vec<serde_json::Value> = r.near.iter().map(|nb| {
+                        let need: Vec<serde_json::Value> = nb.need.iter().map(|g| {
+                            serde_json::json!({
+                                "group": g.iter().map(|k| *k).collect::<Vec<&str>>(),
+                            })
+                        }).collect();
+                        let missing: Vec<serde_json::Value> = nb.need.iter().flatten()
+                            .map(|k| serde_json::json!({"keyword": *k, "fields": ""}))
+                            .collect();
                         serde_json::json!({
-                            "block": bno,
-                            "missing": misses.iter().map(|(kw, f)| serde_json::json!({"keyword": kw, "fields": matcher::field_names(*f)})).collect::<Vec<_>>(),
-                            "hits": nh,
+                            "block": nb.bno,
+                            "hits": nb.n_hit,
+                            "cost": nb.cost,
+                            "need": need,
+                            "missing": missing,
+                        })
+                    }).collect();
+                    let suggestions: Vec<serde_json::Value> = r.suggestions.iter().map(|s| {
+                        serde_json::json!({
+                            "keyword": s.keyword.as_ref(),
+                            "score": (s.score * 100.0).round() as u32,
+                            "excluded": s.excluded_in_sdg,
+                            "qualifies_alone": r.solo.contains(s.keyword.as_ref()),
+                            "extra_needed": r.extra.get(s.keyword.as_ref()).copied(),
                         })
                     }).collect();
                     serde_json::json!({
@@ -1465,6 +1768,7 @@ fn api_match(headers: &[(String, String)], body: &[u8]) -> Resp {
                         "near": near,
                         "near_total": r.near_total,
                         "excluded": r.excluded.iter().map(|e| e).collect::<Vec<_>>(),
+                        "suggestions": suggestions,
                     })
                 }).collect::<Vec<_>>(),
             });
@@ -1472,6 +1776,67 @@ fn api_match(headers: &[(String, String)], body: &[u8]) -> Resp {
                 .with_header("X-Processing-Time", &format!("{:.1} ms", m.ms))
         }
     }
+}
+
+/// POST /api/keywords — full keyword list of one SDG, scored against the
+/// paper's text (Advanced tab). Same form fields as /api/match plus `sdg`
+/// and optional `limit`. Deterministic token-overlap ranking, no LLM.
+fn api_keywords(headers: &[(String, String)], body: &[u8]) -> Resp {
+    let ctype = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("content-type"));
+    let (fields, files) = match ctype.and_then(|(_, v)| boundary_of(v)) {
+        Some(b) => parse_multipart(body, &b),
+        None => (parse_urlencoded(body), HashMap::new()),
+    };
+    let sdg = fields.get("sdg").map(String::as_str).unwrap_or("10").trim().to_string();
+    let qi = match get_queries().iter().position(|q| q.sdg == sdg) {
+        Some(i) => i,
+        None => {
+            return Resp::json(400, format!("{{\"error\":{}}}", jstr(&format!("unknown sdg {sdg}"))));
+        }
+    };
+    let limit = clamp_int(fields.get("limit").map(String::as_str), 300, 1, 2000);
+    let mut fields = fields;
+    let (paper, _meta) = match paper_from_request(&mut fields, &files) {
+        Ok(p) => p,
+        Err(msg) => return Resp::json(400, format!("{{\"error\":{}}}", jstr(&msg))),
+    };
+    let table = get_patterns();
+    let mut memo = matcher::Memo::new(&paper, 0);
+    let mut present: HashSet<&'static str> = HashSet::new();
+    for flat in &get_flats()[qi] {
+        let mut hits: Vec<(&'static str, u8)> = Vec::new();
+        let mut misses: Vec<(&'static str, u8)> = Vec::new();
+        let mut ex: Vec<&'static str> = Vec::new();
+        matcher::scan_flat_into(flat, table, &mut memo, &mut hits, &mut misses, &mut ex);
+        for (kw, _) in hits {
+            present.insert(kw);
+        }
+    }
+    let paper_text = String::from_utf8_lossy(paper.text_lower(paper::F_ANY));
+    let words = matcher::text_words(&paper_text);
+    let scored = matcher::score_keywords(&words, &get_dicts()[qi], &present, limit);
+    let n_present = present.len();
+    let total = get_dicts()[qi].len();
+    let kws: Vec<serde_json::Value> = scored
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "keyword": s.keyword.as_ref(),
+                "score": (s.score * 100.0).round() as u32,
+                "present": s.present,
+                "excluded": s.excluded_in_sdg,
+            })
+        })
+        .collect();
+    let out = serde_json::json!({
+        "sdg": sdg,
+        "sdg_name": sdg_name(&sdg),
+        "total": total,
+        "present": n_present,
+        "keywords": kws,
+        "limit": limit,
+    });
+    Resp::json(200, out.to_string())
 }
 
 fn route(method: &str, target: &str, headers: &[(String, String)], body: &[u8]) -> Resp {
@@ -1483,6 +1848,7 @@ fn route(method: &str, target: &str, headers: &[(String, String)], body: &[u8]) 
         "GET" => route_get(path, qs),
         "POST" if path == "/match" => route_match(headers, body),
         "POST" if path == "/api/match" => api_match(headers, body),
+        "POST" if path == "/api/keywords" => api_keywords(headers, body),
         _ => Resp::not_found(),
     }
 }

@@ -56,11 +56,95 @@ pub mod prof {
     }
 }
 
+/// The process-wide string blob. Every `Pattern`/`LeafDesc`/`SdgDict`
+/// record stores (offset, len) pairs into this blob. At boot the blob is
+/// either the compiled+leaked keyword data or the mmap'd cache region, so
+/// the hot path reads strings straight out of mapped memory (zero copy).
+/// Stored as atomics so tests can replace it and the hot path reads it
+/// without locking.
+static BLOB_PTR: std::sync::atomic::AtomicPtr<u8> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+static BLOB_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Current blob (for the boot-cache writer to persist it).
+pub fn blob_slice() -> &'static [u8] {
+    blob()
+}
+
+/// Install the string blob (boot: compiled data or the mmap'd cache).
+pub fn set_blob(b: &'static [u8]) {
+    use std::sync::atomic::Ordering;
+    BLOB_PTR.store(b.as_ptr() as *mut u8, Ordering::Relaxed);
+    BLOB_LEN.store(b.len(), Ordering::Relaxed);
+}
+
+#[inline]
+fn blob() -> &'static [u8] {
+    use std::sync::atomic::Ordering;
+    let p = BLOB_PTR.load(Ordering::Relaxed);
+    if p.is_null() {
+        return &[];
+    }
+    let len = BLOB_LEN.load(Ordering::Relaxed);
+    unsafe { std::slice::from_raw_parts(p, len) }
+}
+
+/// A keyword pattern compiled to blob-offset records. `parts` is a table of
+/// (offset, len) u32 pairs inside the blob (empty for '?'-glob terms).
+/// `#[repr(C)]` + fixed size: the boot cache stores the raw records and the
+/// runtime can view the mmap'd region as `&[Pattern]` directly.
+#[repr(C)]
 pub struct Pattern {
-    pub raw: Arc<str>,
-    lower_raw: Vec<u8>,
-    parts: Vec<Vec<u8>>, // literal parts split on '*' (empty if the term has '?')
+    raw_off: u32,
+    raw_len: u32,
+    lower_off: u32,
+    lower_len: u32,
+    parts_off: u32,
+    parts_len: u32, // number of parts (u32 pairs at parts_off)
     no_wildcard: bool,
+}
+
+impl Pattern {
+    /// The keyword as written in the query file.
+    #[inline]
+    pub fn raw(&self) -> &'static str {
+        let b = blob();
+        unsafe { std::str::from_utf8_unchecked(&b[self.raw_off as usize..(self.raw_off + self.raw_len) as usize]) }
+    }
+
+    /// Full lowercased text (only '?'-glob patterns keep it).
+    #[inline]
+    fn lower_raw(&self) -> &'static [u8] {
+        let b = blob();
+        &b[self.lower_off as usize..(self.lower_off + self.lower_len) as usize]
+    }
+
+    #[inline]
+    fn n_parts(&self) -> usize {
+        self.parts_len as usize
+    }
+
+    #[inline]
+    fn part(&self, i: usize) -> &'static [u8] {
+        let b = blob();
+        let t = self.parts_off as usize + i * 8;
+        let off = u32::from_ne_bytes([b[t], b[t + 1], b[t + 2], b[t + 3]]) as usize;
+        let len = u32::from_ne_bytes([b[t + 4], b[t + 5], b[t + 6], b[t + 7]]) as usize;
+        &b[off..off + len]
+    }
+
+    fn parts(&self) -> impl Iterator<Item = &'static [u8]> + '_ {
+        (0..self.n_parts()).map(move |i| self.part(i))
+    }
+
+    pub fn no_wildcard(&self) -> bool {
+        self.no_wildcard
+    }
+
+    /// Blob offsets of the keyword text (for LeafDesc records).
+    #[inline]
+    pub fn raw_off_len(&self) -> (u32, u32) {
+        (self.raw_off, self.raw_len)
+    }
 }
 
 /// Per-text presence index: every 4-byte window (quad), every 2-byte window
@@ -404,33 +488,24 @@ impl TextIndex {
     }
 }
 
-fn compile_pattern(kw: &str) -> Pattern {
-    // Leading/trailing whitespace in a keyword is a data artifact
-    // (SDG07 contains `TITLE-ABS(" international") AND TITLE-ABS(" cooperation")`
-    // for "international cooperation"); Scopus ignores it in phrases too.
-    let kw = kw.trim();
-    let lower = kw.to_ascii_lowercase();
-    let has_star = lower.contains('*');
-    let has_q = lower.contains('?');
-    if !has_star && !has_q {
-        Pattern {
-            raw: Arc::from(kw),
-            lower_raw: Vec::new(), // only '?' globs need the full lowered text
-            parts: vec![lower.into_bytes()],
-            no_wildcard: true,
-        }
-    } else if !has_q {
-        Pattern {
-            raw: Arc::from(kw),
-            lower_raw: Vec::new(),
-            parts: lower.split('*').filter(|p| !p.is_empty()).map(|p| p.as_bytes().to_vec()).collect(),
-            no_wildcard: false,
-        }
-    } else {
-        Pattern { raw: Arc::from(kw), lower_raw: lower.into_bytes(), parts: Vec::new(), no_wildcard: false }
-    }
+/// Per-keyword info collected while building the string blob.
+struct KwInfo {
+    raw_off: u32,
+    raw_len: u32,
+    lower_off: u32,
+    lower_len: u32,
+    no_wildcard: bool,
+    parts_off: u32,
+    parts_len: u32,
+    parts: Vec<(u32, u32)>, // (offset, len) into the blob for each literal part
 }
 
+/// Precompile every keyword in a set of AST blocks into a dense table.
+/// All keyword strings (raw, lowered, literal parts) are concatenated into
+/// ONE process-lifetime blob; every `Pattern` is then a small record of
+/// (offset, len) pairs into that blob. The blob is also what the boot cache
+/// mmaps, so a cache hit needs zero keyword copying. Matching never hashes
+/// keyword strings (leaves resolve to table indices at boot).
 fn collect_leaves<'a>(node: &'a Node, out: &mut Vec<&'a str>) {
     match node {
         Node::Leaf { keyword, .. } => out.push(keyword),
@@ -444,33 +519,87 @@ fn collect_leaves<'a>(node: &'a Node, out: &mut Vec<&'a str>) {
     }
 }
 
-/// Precompile every keyword in a set of AST blocks into a dense table.
-/// The table is immutable after construction and shared across requests;
-/// leaves are then resolved to table indices (`resolve_blocks`) so matching
-/// never hashes keyword strings. Matching a paper used to recompile ~21k
-/// patterns per request, which dominated the per-request cost.
 pub fn compile_all<'a>(blocks: impl Iterator<Item = &'a Node>) -> Vec<Pattern> {
-    let mut table: Vec<Pattern> = Vec::new();
-    let mut seen: HashMap<String, usize> = HashMap::new();
+    // 1) unique keywords in first-seen order
+    let mut kws: Vec<&str> = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
     let mut leaves = Vec::new();
     for b in blocks {
         leaves.clear();
         collect_leaves(b, &mut leaves);
         for kw in leaves.drain(..) {
-            if !seen.contains_key(kw) {
-                let idx = table.len();
-                table.push(compile_pattern(kw));
-                seen.insert(kw.to_string(), idx);
+            if seen.insert(kw) {
+                kws.push(kw);
             }
         }
     }
+    // 2) build the blob: raw bytes, lowered bytes ('?'-globs), part bytes,
+    //    then the parts table (u32 (off,len) pairs).
+    let mut blob: Vec<u8> = Vec::new();
+    let mut infos: Vec<KwInfo> = Vec::with_capacity(kws.len());
+    for kw in &kws {
+        // Leading/trailing whitespace in a keyword is a data artifact
+        // (SDG07 contains `TITLE-ABS(" international") ...`); Scopus ignores
+        // it in phrases too.
+        let kw = kw.trim();
+        let raw_off = blob.len() as u32;
+        blob.extend_from_slice(kw.as_bytes());
+        let raw_len = kw.len() as u32;
+        let lower = kw.to_ascii_lowercase();
+        let has_star = lower.contains('*');
+        let has_q = lower.contains('?');
+        let (no_wildcard, parts_bytes): (bool, Vec<Vec<u8>>) = if !has_star && !has_q {
+            (true, vec![lower.as_bytes().to_vec()])
+        } else if !has_q {
+            (false, lower.split('*').filter(|p| !p.is_empty()).map(|p| p.as_bytes().to_vec()).collect())
+        } else {
+            (false, Vec::new())
+        };
+        let mut parts = Vec::with_capacity(parts_bytes.len());
+        for pb in parts_bytes {
+            let off = blob.len() as u32;
+            blob.extend_from_slice(&pb);
+            parts.push((off, pb.len() as u32));
+        }
+        let (lower_off, lower_len) = if has_q {
+            let off = blob.len() as u32;
+            blob.extend_from_slice(lower.as_bytes());
+            (off, lower.len() as u32)
+        } else {
+            (0, 0)
+        };
+        infos.push(KwInfo { raw_off, raw_len, lower_off, lower_len, no_wildcard, parts_off: 0, parts_len: 0, parts });
+    }
+    // parts table (pairs are read via `Pattern::part`)
+    for info in &mut infos {
+        info.parts_off = blob.len() as u32;
+        for &(off, len) in &info.parts {
+            blob.extend_from_slice(&off.to_le_bytes());
+            blob.extend_from_slice(&len.to_le_bytes());
+        }
+        info.parts_len = info.parts.len() as u32;
+    }
+    let blob_static: &'static [u8] = Box::leak(blob.into_boxed_slice());
+    set_blob(blob_static);
+    let table: Vec<Pattern> = infos
+        .into_iter()
+        .map(|i| Pattern {
+            raw_off: i.raw_off,
+            raw_len: i.raw_len,
+            lower_off: i.lower_off,
+            lower_len: i.lower_len,
+            parts_off: i.parts_off,
+            parts_len: i.parts_len,
+            no_wildcard: i.no_wildcard,
+        })
+        .collect();
     // Union every literal part's first-4-bytes so TextIndex builds record
     // positions for all of them (multiple compile_all calls stay sound).
     let mut g = FIRST_QUADS.lock().unwrap();
     let s = g.get_or_insert_with(|| Arc::new(HashSet::with_hasher(FastHasher::default())));
-    let s = Arc::make_mut(s); // deep-clones only if a request took a snapshot (boot-time only)
+    let s = Arc::make_mut(s);
     for p in &table {
-        for part in &p.parts {
+        for part in p.parts() {
             if part.len() >= 4 {
                 s.insert(u32::from_le_bytes([part[0], part[1], part[2], part[3]]));
             }
@@ -478,7 +607,6 @@ pub fn compile_all<'a>(blocks: impl Iterator<Item = &'a Node>) -> Vec<Pattern> {
     }
     table
 }
-
 /// Stamp every leaf with its pattern index, effective field mask, and dense
 /// memo slot. Call once at boot after `compile_all`; matching then resolves
 /// leaves by array indexing and never hashes keyword strings or
@@ -500,12 +628,9 @@ pub fn compile_all<'a>(blocks: impl Iterator<Item = &'a Node>) -> Vec<Pattern> {
 pub fn resolve_blocks(blocks: &mut [Node], table: &[Pattern], nslots: &mut u32) -> usize {
     let mut map: HashMap<&str, usize> = HashMap::with_capacity(table.len());
     for (i, p) in table.iter().enumerate() {
-        map.insert(p.raw.as_ref(), i);
+        map.insert(p.raw(), i);
     }
-    // Slot ids: dense over the seen (pid, mask) pairs, assigned in first-seen
-    // order. `pid` is already dense over the table, so keying the memo array
-    // on `pid` alone would be too coarse (the same pattern under different
-    // field masks can give different results) — hence a (pid, mask) slot.
+    // Slot ids: dense over the seen (pid, mask) pairs, assigned in firsteat 
     // `slot_of` is local per call, but `nslots` is the GLOBAL running counter
     // so slots never collide across queries that share one Memo.
     let mut slot_of: HashMap<(u32, u8), u32> = HashMap::new();
@@ -653,10 +778,10 @@ impl Pattern {
     /// in the indexed text, otherwise `matches` cannot succeed. Glob ('?')
     /// patterns have no literal parts and always pass.
     pub fn could_match(&self, idx: &TextIndex) -> bool {
-        if self.parts.is_empty() {
+        if self.n_parts() == 0 {
             return true;
         }
-        self.parts.iter().all(|p| idx.could_contain(p))
+        self.parts().all(|p| idx.could_contain(p))
     }
 
     pub fn matches(&self, text: &[u8]) -> bool {
@@ -666,12 +791,13 @@ impl Pattern {
             prof::MATCHES_CALLS.fetch_add(1, Ordering::Relaxed);
         }
         if self.no_wildcard {
-            find_boundary(text, &self.parts[0])
-        } else if self.parts.is_empty() {
-            glob_match(&self.lower_raw, text)
+            find_boundary(text, self.part(0))
+        } else if self.n_parts() == 0 {
+            glob_match(self.lower_raw(), text)
         } else {
             let mut from = 0usize;
-            for (k, part) in self.parts.iter().enumerate() {
+            for k in 0..self.n_parts() {
+                let part = self.part(k);
                 if k == 0 {
                     // the first literal may start anywhere
                     match find(text, part, 0) {
@@ -714,10 +840,10 @@ impl Pattern {
             use std::sync::atomic::Ordering;
             prof::MATCHES_CALLS.fetch_add(1, Ordering::Relaxed);
         }
-        let part0 = if self.parts.is_empty() {
+        let part0 = if self.n_parts() == 0 {
             return self.matches(text); // '?' glob: no literal parts to index
         } else {
-            &self.parts[0]
+            self.part(0)
         };
         if part0.len() >= 4 {
             // Reject parts whose full word never occurs before walking
@@ -772,7 +898,8 @@ impl Pattern {
     /// Subsequent literal parts must follow with only non-space characters
     /// in between (Scopus `*` matches within a word only).
     fn rest_matches_at(&self, text: &[u8], mut from: usize) -> bool {
-        for part in &self.parts[1..] {
+        for k in 1..self.n_parts() {
+            let part = self.part(k);
             let mut p = from;
             loop {
                 match find(text, part, p) {
@@ -1043,18 +1170,18 @@ impl<'a> Memo<'a> {
         // A zero mask means "no field scoping" -> the default TITLE-ABS-KEY.
         let mask = if mask == 0 { field_mask(&ALL_FIELDS) } else { mask };
         let jidx = self.joined_for(mask);
-        if pat.parts.is_empty() {
+        if pat.n_parts() == 0 {
             // '?' glob: run per segment so patterns cannot span fields.
             let j = &self.joined[jidx];
             if j.nsegs > 1 {
                 for s in &j.segs[..j.nsegs as usize] {
-                    if glob_match(&pat.lower_raw, &j.buf[s.0..s.1]) {
+                    if glob_match(pat.lower_raw(), &j.buf[s.0..s.1]) {
                         return true;
                     }
                 }
                 return false;
             }
-            return glob_match(&pat.lower_raw, &j.buf);
+            return glob_match(pat.lower_raw(), &j.buf);
         }
         let entry = &mut self.joined[jidx];
         if entry.idx.is_none() {
@@ -1113,9 +1240,9 @@ fn eval_memo(node: &Node, mask: u8, table: &[Pattern], memo: &mut Memo) -> bool 
 }
 
 pub struct BlockScan {
-    pub hits: Vec<Arc<str>>,
-    pub misses: Vec<Arc<str>>,
-    pub excluded_hits: Vec<Arc<str>>,
+    pub hits: Vec<&'static str>,
+    pub misses: Vec<&'static str>,
+    pub excluded_hits: Vec<&'static str>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1129,83 +1256,128 @@ pub struct BlockScan {
 // ---------------------------------------------------------------------------
 
 /// Postfix operator over leaf indices (`Push(i)` evaluates `leaves[i]`).
-#[derive(Clone, Copy, Debug)]
-pub enum Op {
-    Push(u32),
-    /// Push a constant (identity of an empty group: AND -> true, OR -> false).
-    True,
-    False,
-    Not,
-    And,
-    Or,
+/// Groups are emitted as a single n-ary op (`OrN(k)` / `AndN(k)` pops the
+/// top k stack entries and folds them at once) instead of k-1 binary folds:
+/// the min-add union/concat is then O(total keywords) per group instead of
+/// O(n^2) re-unioning the accumulated result at every fold.
+///
+/// Fixed 8-byte record (`tag` + `payload`) so the program is a dense, aligned
+/// array that the hot loop walks sequentially and the boot cache can mmap
+/// zero-copy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C)]
+pub struct Op {
+    pub tag: u32,
+    pub payload: u32,
+}
+
+pub const OP_PUSH: u32 = 0;
+pub const OP_TRUE: u32 = 1;
+pub const OP_FALSE: u32 = 2;
+pub const OP_NOT: u32 = 3;
+pub const OP_AND: u32 = 4;
+pub const OP_OR: u32 = 5;
+pub const OP_ANDN: u32 = 6;
+pub const OP_ORN: u32 = 7;
+
+impl Op {
+    #[inline]
+    pub fn push(i: u32) -> Op {
+        Op { tag: OP_PUSH, payload: i }
+    }
+    #[inline]
+    pub fn and_n(n: u32) -> Op {
+        Op { tag: OP_ANDN, payload: n }
+    }
+    #[inline]
+    pub fn or_n(n: u32) -> Op {
+        Op { tag: OP_ORN, payload: n }
+    }
 }
 
 /// One keyword occurrence inside a flattened block.
 #[derive(Clone, Debug)]
+/// One keyword occurrence inside a flattened block. `raw_off`/`raw_len`
+/// index the process string blob, so a cached (mmap'd) block needs no
+/// keyword copies. Fixed-size for direct mmap viewing.
+#[repr(C)]
 pub struct LeafDesc {
     pub pid: u32,
     pub slot: u32,
     pub mask: u8,
     pub excluded: bool,
-    pub raw: Arc<str>,
+    pub raw_off: u32,
+    pub raw_len: u32,
+}
+
+impl LeafDesc {
+    #[inline]
+    pub fn raw(&self) -> &'static str {
+        let b = blob();
+        unsafe { std::str::from_utf8_unchecked(&b[self.raw_off as usize..(self.raw_off + self.raw_len) as usize]) }
+    }
 }
 
 /// A block compiled to a postfix program + flat leaf list. Built once at
 /// boot, AFTER `resolve_blocks` has stamped slots onto the AST.
+/// A block compiled to a postfix program + flat leaf list. Both are
+/// fixed-size records; the slices are `'static` (leaked at compile time or
+/// zero-copy views of the mmap'd boot cache).
 pub struct FlatBlock {
-    pub prog: Vec<Op>,
-    pub leaves: Vec<LeafDesc>,
+    pub prog: &'static [Op],
+    pub leaves: &'static [LeafDesc],
 }
 
 /// Flatten one block (call AFTER `resolve_blocks`). Leaf order and exclusion
 /// parity match the AST traversal exactly, so `scan_flat` produces the same
 /// hits/misses/excluded lists (including duplicates) as the tree walk.
 pub fn flatten_block(block: &Node, table: &[Pattern]) -> FlatBlock {
-    fn emit(node: &Node, excluded: bool, table: &[Pattern], fb: &mut FlatBlock) {
+    fn emit(node: &Node, excluded: bool, table: &[Pattern], prog: &mut Vec<Op>, leaves: &mut Vec<LeafDesc>) {
         match node {
             Node::Leaf { pid, mask, slot, .. } => {
-                let i = fb.leaves.len() as u32;
-                fb.leaves.push(LeafDesc {
+                let i = leaves.len() as u32;
+                leaves.push(LeafDesc {
                     pid: *pid,
                     slot: *slot,
                     mask: *mask,
                     excluded,
-                    raw: table[*pid as usize].raw.clone(),
+                    raw_off: table[*pid as usize].raw_off_len().0,
+                    raw_len: table[*pid as usize].raw_off_len().1,
                 });
-                fb.prog.push(Op::Push(i));
+                prog.push(Op::push(i));
             }
-            Node::Field { child, .. } => emit(child, excluded, table, fb),
+            Node::Field { child, .. } => emit(child, excluded, table, prog, leaves),
             Node::Not { child } => {
-                emit(child, !excluded, table, fb);
-                fb.prog.push(Op::Not);
+                emit(child, !excluded, table, prog, leaves);
+                prog.push(Op { tag: OP_NOT, payload: 0 });
             }
             Node::Group { op, children } => {
-                // A group with k children needs k-1 binary ops; fold eagerly
-                // (op after every child past the first) so the eval stack
-                // stays ~2 deep instead of k deep. AND/OR are associative,
-                // so the fold order does not matter. A 1-child group
-                // evaluates to the child itself (no extra op, since `And`
-                // would pop an empty stack -> false), and an empty group
-                // pushes its identity (AND -> true, OR -> false).
+                // A group with k children folds as a single n-ary op
+                // (Op::AndN/OrN): one pass, no intermediate binary folds, so
+                // the min-add union/concat is O(total keywords) per group.
                 match children.len() {
-                    0 => fb.prog.push(if op == "OR" { Op::False } else { Op::True }),
-                    1 => emit(&children[0], excluded, table, fb),
+                    0 => prog.push(if op == "OR" { Op { tag: OP_FALSE, payload: 0 } } else { Op { tag: OP_TRUE, payload: 0 } }),
+                    1 => emit(&children[0], excluded, table, prog, leaves),
                     _ => {
-                        let opcode = if op == "OR" { Op::Or } else { Op::And };
-                        let mut it = children.iter();
-                        emit(it.next().unwrap(), excluded, table, fb);
-                        for c in it {
-                            emit(c, excluded, table, fb);
-                            fb.prog.push(opcode);
+                        let n = children.len() as u32;
+                        for c in children {
+                            emit(c, excluded, table, prog, leaves);
                         }
+                        prog.push(if op == "OR" { Op::or_n(n) } else { Op::and_n(n) });
                     }
                 }
             }
         }
     }
-    let mut fb = FlatBlock { prog: Vec::new(), leaves: Vec::new() };
-    emit(block, false, table, &mut fb);
-    fb
+    let mut prog: Vec<Op> = Vec::new();
+    let mut leaves: Vec<LeafDesc> = Vec::new();
+    emit(block, false, table, &mut prog, &mut leaves);
+    // 'static slices: leaked once at boot (or zero-copy views of the mmap'd
+    // boot cache) - the user-facing trade is RAM for startup speed.
+    FlatBlock {
+        prog: Box::leak(prog.into_boxed_slice()),
+        leaves: Box::leak(leaves.into_boxed_slice()),
+    }
 }
 
 /// Tiny boolean stack: 32 inline slots plus a heap fallback. 2974 of the
@@ -1242,6 +1414,39 @@ impl BoolStack {
         }
         self.sp -= 1;
         self.buf[self.sp]
+    }
+    /// Fold the top `k` values with `f` (left-associative), then replace
+    /// them with the result. No allocation: values are read inline from the
+    /// inline buffer or the heap spill.
+    #[inline]
+    fn fold_top<F: Fn(bool, bool) -> bool>(&mut self, k: u32, f: F) -> bool {
+        let k = k as usize;
+        let total = self.sp + self.extra.len();
+        debug_assert!(k <= total);
+        // All values that matter live in `buf[0..sp]` plus `extra`; the
+        // top k values span the tail of `extra` and/or the tail of `buf`.
+        // Iterate from the bottom of the top-k window upward.
+        let mut acc = false;
+        let mut first = true;
+        let take_from_extra = self.extra.len().min(k);
+        let need_from_buf = k - take_from_extra;
+        for i in (self.extra.len() - take_from_extra)..self.extra.len() {
+            let v = self.extra[i];
+            acc = if first { v } else { f(acc, v) };
+            first = false;
+        }
+        for i in (self.sp - need_from_buf)..self.sp {
+            let v = self.buf[i];
+            acc = if first { v } else { f(acc, v) };
+            first = false;
+        }
+        // Truncate k entries.
+        let drop_from_extra = self.extra.len().min(k);
+        self.extra.truncate(self.extra.len() - drop_from_extra);
+        self.sp -= k - drop_from_extra;
+        // Push the folded result.
+        self.push(acc);
+        acc
     }
 }
 
@@ -1281,10 +1486,10 @@ pub fn scan_flat_into<'a, 'b>(
     #[cfg(not(feature = "prof"))]
     let report = true;
     let mut stack = BoolStack::new();
-    for op in &flat.prog {
-        match *op {
-            Op::Push(i) => {
-                let l = &flat.leaves[i as usize];
+    for op in flat.prog {
+        match op.tag {
+            OP_PUSH => {
+                let l = &flat.leaves[op.payload as usize];
                 let v = memo.term_hit(&table[l.pid as usize], l.mask, l.slot as usize);
                 if report {
                     #[cfg(feature = "prof")]
@@ -1294,32 +1499,39 @@ pub fn scan_flat_into<'a, 'b>(
                     }
                     if l.excluded {
                         if v {
-                            ex_hits.push(&*l.raw);
+                            ex_hits.push(l.raw());
                         }
                     } else if v {
-                        hits.push((&*l.raw, l.mask));
+                        hits.push((l.raw(), l.mask));
                     } else {
-                        misses.push((&*l.raw, l.mask));
+                        misses.push((l.raw(), l.mask));
                     }
                 }
                 stack.push(v);
             }
-            Op::True => stack.push(true),
-            Op::False => stack.push(false),
-            Op::Not => {
+            OP_TRUE => stack.push(true),
+            OP_FALSE => stack.push(false),
+            OP_NOT => {
                 let t = stack.pop();
                 stack.push(!t);
             }
-            Op::And => {
+            OP_AND => {
                 let b = stack.pop();
                 let a = stack.pop();
                 stack.push(a && b);
             }
-            Op::Or => {
+            OP_OR => {
                 let b = stack.pop();
                 let a = stack.pop();
                 stack.push(a || b);
             }
+            OP_ANDN => {
+                stack.fold_top(op.payload, |a, b| a && b);
+            }
+            OP_ORN => {
+                stack.fold_top(op.payload, |a, b| a || b);
+            }
+            _ => unreachable!("unknown op tag"),
         }
     }
     stack.pop()
@@ -1350,10 +1562,1055 @@ pub fn scan_block_shared<'a>(
     memo: &mut Memo<'a>,
 ) -> (BlockScan, bool) {
     let mut out = BlockScan { hits: Vec::new(), misses: Vec::new(), excluded_hits: Vec::new() };
+
     let matched = rec(block, field_mask(&ALL_FIELDS), false, table, memo, &mut out);
     (out, matched)
 }
 
+// ---------------------------------------------------------------------------
+// Near-miss analysis: minimum keywords to add ("missing tags") + reranking
+//
+// For every block that did not match we compute, with no LLM and no heuristic
+// scoring, the *exact* minimum number of keywords that must be added to the
+// paper text for the block to become true, plus the candidate keyword groups
+// to choose from (any ONE keyword from each group qualifies). Blocks are then
+// reranked by that cost (cheapest first), which surfaces e.g. an AND block
+// that is a single country name away from SDG 3 instead of a huge OR block
+// with fewer total keywords but no topical overlap.
+//
+// cost == INF_COST means the block is false and CANNOT be fixed by adding
+// keywords: a NOT branch on a required path is already true (the paper
+// contains an excluded term). Such blocks are reported as "disqualified" and
+// are never suggested as near misses.
+// ---------------------------------------------------------------------------
+
+pub const INF_COST: usize = usize::MAX;
+
+/// Result of the minimum-addition analysis for one (sub)tree.
+#[derive(Debug, Clone)]
+pub struct MinAdd {
+    /// Current boolean value of the subtree against the paper.
+    pub value: bool,
+    /// Minimum keywords to add to make the subtree true (INF_COST if impossible).
+    pub cost: usize,
+    /// Candidate keywords to add: pick any ONE keyword from each group. Only
+    /// meaningful when `value == false && cost < INF_COST`. Keywords borrow
+    /// the process string blob ('static - zero-copy from the mmap'd cache).
+    pub need: Vec<Vec<&'static str>>,
+}
+
+/// Fast path: for a plain keyword child (`Leaf` or `Field(Leaf)` - the
+/// overwhelming majority of OR/AND children) return `(keyword, hit)` without
+/// allocating a `MinAdd`. This avoids the per-leaf vector allocations that
+/// dominated large blocks (e.g. SDG07's giant lists).
+fn leaf_kw_hit(node: &Node, _mask: u8, table: &[Pattern], memo: &mut Memo) -> Option<(&'static str, bool)> {
+    let (leaf, lm): (&Node, u8) = match node {
+        Node::Leaf { mask: m, .. } => (node, *m),
+        Node::Field { fields, child } => match child.as_ref() {
+            Node::Leaf { .. } => (child, field_mask_from_strings(fields)),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    match leaf {
+        Node::Leaf { slot, .. } => {
+            let p = pat(table, leaf);
+            let v = memo.term_hit(p, lm, *slot as usize);
+            Some((p.raw(), v))
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// Group fingerprint: FNV-1a over (pointer, len) of each keyword. Duplicate
+/// groups across TITLE-ABS / AUTHKEY / TITLE variants share the same blob
+/// strings, hence the same addresses, so pointer-based dedup is exact and
+/// costs O(1) per keyword.
+fn group_fp(g: &[&'static str]) -> u64 {
+    let mut h = 0xcbf29ce484222325u64;
+    for kw in g {
+        h ^= kw.as_ptr() as usize as u64;
+        h = h.wrapping_mul(0x100000001b3);
+        h ^= kw.len() as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+fn min_add(node: &Node, mask: u8, table: &[Pattern], memo: &mut Memo) -> MinAdd {
+    match node {
+        Node::Leaf { mask: lm, slot, .. } => {
+            let p = pat(table, node);
+            if memo.term_hit(p, *lm, *slot as usize) {
+                MinAdd { value: true, cost: 0, need: Vec::new() }
+            } else {
+                MinAdd { value: false, cost: 1, need: vec![vec![p.raw()]] }
+            }
+        }
+        Node::Field { fields, child } => {
+            min_add(child, field_mask_from_strings(fields), table, memo)
+        }
+        Node::Not { child } => {
+            let c = min_add(child, mask, table, memo);
+            if c.value {
+                // Child is already true; adding keywords can only make it
+                // "more true", so NOT(child) can never become true.
+                MinAdd { value: false, cost: INF_COST, need: Vec::new() }
+            } else {
+                MinAdd { value: true, cost: 0, need: Vec::new() }
+            }
+        }
+        Node::Group { op, children } => {
+            if op == "OR" {
+                // Streaming pass: no intermediate Vec<MinAdd> per node. Track
+                // the cheapest satisfiable branch plus the union of the
+                // single-keyword groups of every equally-cheap branch.
+                let mut any_true = false;
+                let mut min_cost = INF_COST;
+                let mut best: Option<MinAdd> = None;
+                let mut all_single = true;
+                let mut seen: HashSet<&'static str> = HashSet::new();
+                let mut union: Vec<&'static str> = Vec::new();
+                for c in children {
+                    // Plain keywords (the overwhelming majority of children)
+                    // are handled inline so a leaf never allocates a MinAdd;
+                    // only the final union and the single `best` candidate do.
+                    match leaf_kw_hit(c, mask, table, memo) {
+                        Some((kw, hit)) => {
+                            if hit {
+                                any_true = true;
+                                break;
+                            }
+                            // cost-1, single-keyword candidate, no allocation
+                            if 1 < min_cost {
+                                min_cost = 1;
+                                all_single = true;
+                                seen.clear();
+                                union.clear();
+                                seen.insert(kw);
+                                union.push(kw);
+                                best = Some(MinAdd { value: false, cost: 1, need: vec![vec![kw]] });
+                            } else if 1 == min_cost && all_single {
+                                if seen.insert(kw) {
+                                    union.push(kw);
+                                }
+                            }
+                        }
+                        None => {
+                            let r = min_add(c, mask, table, memo);
+                            if r.value {
+                                any_true = true;
+                                break;
+                            }
+                            if r.cost == INF_COST {
+                                continue;
+                            }
+                            if r.cost < min_cost {
+                                // New cheapest branch: reset the union.
+                                min_cost = r.cost;
+                                let single = r.need.len() == 1;
+                                seen.clear();
+                                union.clear();
+                                if single {
+                                    for kw in &r.need[0] {
+                                        seen.insert(kw);
+                                        union.push(kw);
+                                    }
+                                }
+                                all_single = single;
+                                best = Some(r);
+                            } else if r.cost == min_cost {
+                                // Tie with the cheapest: union only counts
+                                // when every cheapest branch is single-keyword.
+                                if all_single {
+                                    if r.need.len() != 1 {
+                                        all_single = false;
+                                        union.clear();
+                                        seen.clear();
+                                    } else {
+                                        for kw in &r.need[0] {
+                                            if seen.insert(kw) {
+                                                union.push(kw);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if any_true {
+                    return MinAdd { value: true, cost: 0, need: Vec::new() };
+                }
+                let b = match best {
+                    None => return MinAdd { value: false, cost: INF_COST, need: Vec::new() },
+                    Some(b) => b,
+                };
+                let need = if all_single && !union.is_empty() { vec![union] } else { b.need };
+                MinAdd { value: false, cost: min_cost, need }
+            } else {
+                // AND, W/n, PRE/n, ... : every child must hit. Costs add up
+                // across groups; any impossible child makes the block
+                // impossible. Groups are deduped by a pointer fingerprint
+                // (linear deep `contains` was O(checks x group chars) and
+                // dominated large AND chains like SDG07's).
+                let mut cost = 0usize;
+                let mut need: Vec<Vec<&'static str>> = Vec::new();
+                let mut seen_fp: HashMap<u64, Vec<&'static str>> = HashMap::new();
+                for c in children {
+                    let r = min_add(c, mask, table, memo);
+                    if r.cost == INF_COST {
+                        return MinAdd { value: false, cost: INF_COST, need: Vec::new() };
+                    }
+                    cost = cost.saturating_add(r.cost);
+                    for g in r.need {
+                        let fp = group_fp(&g);
+                        match seen_fp.get(&fp) {
+                            // Same pointer sequence => identical group: skip.
+                            Some(first) if *first == g => {}
+                            // New group, or a rare fp collision with different
+                            // content: keep it (collision is verified).
+                            _ => {
+                                seen_fp.insert(fp, g.clone());
+                                need.push(g);
+                            }
+                        }
+                    }
+                }
+                MinAdd { value: cost == 0, cost, need }
+            }
+        }
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// Flat-program min-add (mechanically sympathetic)
+//
+// The AST walk above is correct but allocates a MinAdd (two nested Vecs) at
+// every node, which dominates large blocks (SDG07 b1: 18 ms). This variant
+// evaluates the SAME semantics on the block's postfix program (`FlatBlock`):
+// one sequential pass over `prog` with SoA stacks (bool+u32 pairs), and the
+// need groups live in a per-block arena of plain integers + Arc clones.
+// Memory layout follows the access pattern (dense vectors, no per-node heap
+// churn, index-based references) and we gladly trade a little RAM for the
+// ~50x speedup on pathological blocks.
+// ---------------------------------------------------------------------------
+
+/// u32 sentinel for INF_COST inside the flat evaluator.
+const INF_U32: u32 = u32::MAX;
+
+// TEMP probe counters
+pub static DBG_OPS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub static DBG_UNION_KW: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub static DBG_UNIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub static DBG_AND_GROUPS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub static DBG_FP_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[derive(Clone, Copy, Default)]
+struct EvalEntry {
+    value: bool,
+    cost: u32,
+    /// Need groups slice into the groups arena: [g_start, g_start + g_len).
+    g_start: u32,
+    g_len: u32,
+    /// Single-union keyword slice into the kw arena (only when g_len == 1).
+    k_start: u32,
+    k_len: u32,
+}
+
+#[derive(Clone, Copy)]
+struct GroupSlice {
+    start: u32,
+    len: u32,
+}
+
+/// Per-block scratch arenas, reused across blocks/requests.
+pub struct MinAddScratch {
+    /// (value, cost) pairs for the cost-only pass.
+    pairs: Vec<(bool, u32)>,
+    /// Full entries for the need pass.
+    eval: Vec<EvalEntry>,
+    /// Keyword arena: every keyword that ended up in a need group.
+    kw: Vec<&'static str>,
+    /// Group arena: slices into `kw`.
+    groups: Vec<GroupSlice>,
+    /// Pointer fingerprints of keywords in the current union.
+    kw_seen: HashSet<u64>,
+    /// Pointer fingerprints of groups already in the current AND need.
+    group_seen: HashMap<u64, u32>,
+    /// Reusable operand buffer for n-ary group ops (avoids per-op allocs).
+    kids: Vec<EvalEntry>,
+}
+
+impl Default for MinAddScratch {
+    fn default() -> Self {
+        MinAddScratch {
+            pairs: Vec::with_capacity(64),
+            eval: Vec::with_capacity(64),
+            kw: Vec::new(),
+            groups: Vec::new(),
+            kw_seen: HashSet::new(),
+            group_seen: HashMap::new(),
+            kids: Vec::with_capacity(16),
+        }
+    }
+}
+
+#[inline]
+fn str_fp(a: &str) -> u64 {
+    (a.as_ptr() as usize) as u64 ^ ((a.len() as u64) << 32)
+}
+
+#[inline]
+fn group_fp_slice(kw: &[&'static str], start: u32, len: u32) -> u64 {
+    let mut h = 0xcbf29ce484222325u64;
+    for kw in &kw[start as usize..(start + len) as usize] {
+        h ^= str_fp(kw);
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+/// Cost-only pass on the flat program: (value, cost) with a dense pair
+/// stack. No recursion, no allocation (stacks live in the scratch).
+pub fn min_add_flat_cost(
+    flat: &FlatBlock,
+    table: &[Pattern],
+    memo: &mut Memo,
+    scr: &mut MinAddScratch,
+) -> (bool, u32) {
+    scr.pairs.clear();
+    for op in flat.prog {
+        match op.tag {
+            OP_PUSH => {
+                let l = &flat.leaves[op.payload as usize];
+                let v = memo.term_hit(&table[l.pid as usize], l.mask, l.slot as usize);
+                scr.pairs.push((v, if v { 0 } else { 1 }));
+            }
+            OP_TRUE => scr.pairs.push((true, 0)),
+            OP_FALSE => scr.pairs.push((false, INF_U32)),
+            OP_NOT => {
+                let (v, _) = scr.pairs.pop().unwrap();
+                scr.pairs.push((!v, if v { INF_U32 } else { 0 }));
+            }
+            OP_AND => {
+                let (bv, bc) = scr.pairs.pop().unwrap();
+                let (av, ac) = scr.pairs.pop().unwrap();
+                let inf = (!av && ac == INF_U32) || (!bv && bc == INF_U32);
+                let cost = if inf {
+                    INF_U32
+                } else {
+                    (if av { 0 } else { ac }).saturating_add(if bv { 0 } else { bc })
+                };
+                scr.pairs.push((cost == 0, cost));
+            }
+            OP_OR => {
+                let (bv, bc) = scr.pairs.pop().unwrap();
+                let (av, ac) = scr.pairs.pop().unwrap();
+                if av || bv {
+                    scr.pairs.push((true, 0));
+                } else {
+                    scr.pairs.push((false, ac.min(bc)));
+                }
+            }
+            OP_ANDN => {
+                let k = op.payload as usize;
+                let n = scr.pairs.len();
+                let mut inf = false;
+                let mut any_false = false;
+                let mut cost = 0u32;
+                for &(v, c) in &scr.pairs[n - k..] {
+                    if !v {
+                        any_false = true;
+                        if c == INF_U32 {
+                            inf = true;
+                            break;
+                        }
+                        cost = cost.saturating_add(c);
+                    }
+                }
+                scr.pairs.truncate(n - k);
+                scr.pairs.push(if inf {
+                    (false, INF_U32)
+                } else if any_false {
+                    (false, cost)
+                } else {
+                    (true, 0)
+                });
+            }
+            OP_ORN => {
+                let k = op.payload as usize;
+                let n = scr.pairs.len();
+                let mut any_true = false;
+                let mut min = INF_U32;
+                for &(v, c) in &scr.pairs[n - k..] {
+                    if v {
+                        any_true = true;
+                        break;
+                    }
+                    if c < min {
+                        min = c;
+                    }
+                }
+                scr.pairs.truncate(n - k);
+                scr.pairs.push(if any_true { (true, 0) } else { (false, min) });
+            }
+            _ => unreachable!("unknown op tag"),
+        }
+    }
+    scr.pairs.pop().unwrap_or((false, INF_U32))
+}
+
+/// Full pass: value + cost + need groups, arena-backed.
+pub fn min_add_flat(
+    flat: &FlatBlock,
+    table: &[Pattern],
+    memo: &mut Memo,
+    scr: &mut MinAddScratch,
+) -> MinAdd {
+    scr.eval.clear();
+    scr.kw.clear();
+    scr.groups.clear();
+    scr.group_seen.clear();
+    for op in flat.prog {
+        DBG_OPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        match op.tag {
+            OP_PUSH => {
+                let l = &flat.leaves[op.payload as usize];
+                let v = memo.term_hit(&table[l.pid as usize], l.mask, l.slot as usize);
+                if v {
+                    scr.eval.push(EvalEntry { value: true, cost: 0, ..Default::default() });
+                } else {
+                    let k = scr.kw.len() as u32;
+                    scr.kw.push(l.raw());
+                    let g = scr.groups.len() as u32;
+                    scr.groups.push(GroupSlice { start: k, len: 1 });
+                    scr.eval.push(EvalEntry { value: false, cost: 1, g_start: g, g_len: 1, k_start: k, k_len: 1 });
+                }
+            }
+            OP_TRUE => scr.eval.push(EvalEntry { value: true, cost: 0, ..Default::default() }),
+            OP_FALSE => scr.eval.push(EvalEntry { value: false, cost: INF_U32, ..Default::default() }),
+            OP_NOT => {
+                let e = scr.eval.pop().unwrap();
+                scr.eval.push(if e.value {
+                    EvalEntry { value: false, cost: INF_U32, ..Default::default() }
+                } else {
+                    EvalEntry { value: true, cost: 0, ..Default::default() }
+                });
+            }
+            OP_AND => {
+                let b = scr.eval.pop().unwrap();
+                let a = scr.eval.pop().unwrap();
+                let inf = (!a.value && a.cost == INF_U32) || (!b.value && b.cost == INF_U32);
+                if inf {
+                    scr.eval.push(EvalEntry { value: false, cost: INF_U32, ..Default::default() });
+                    continue;
+                }
+                let cost = (if a.value { 0 } else { a.cost })
+                    .saturating_add(if b.value { 0 } else { b.cost });
+                if a.value && b.value {
+                    scr.eval.push(EvalEntry { value: true, cost: 0, ..Default::default() });
+                    continue;
+                }
+                // concat need groups with fp dedup
+                let g0 = scr.groups.len() as u32;
+                let mut ng = 0u32;
+                DBG_AND_GROUPS.fetch_add((a.g_len + b.g_len) as usize, std::sync::atomic::Ordering::Relaxed);
+                for e in [&a, &b] {
+                    for gi in e.g_start..e.g_start + e.g_len {
+                        let gs = scr.groups[gi as usize];
+                        let fp = group_fp_slice(&scr.kw, gs.start, gs.len);
+                        match scr.group_seen.get(&fp) {
+                            Some(&first) if scr.group_slice_eq(first, gs) => { DBG_FP_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+                            _ => {
+                                scr.group_seen.insert(fp, g0 + ng);
+                                scr.groups.push(gs);
+                                ng += 1;
+                            }
+                        }
+                    }
+                }
+                scr.eval.push(EvalEntry {
+                    value: false,
+                    cost,
+                    g_start: g0,
+                    g_len: ng,
+                    ..Default::default()
+                });
+            }
+            OP_OR => {
+                let b = scr.eval.pop().unwrap();
+                let a = scr.eval.pop().unwrap();
+                if a.value || b.value {
+                    scr.eval.push(EvalEntry { value: true, cost: 0, ..Default::default() });
+                    continue;
+                }
+                if a.cost < b.cost {
+                    scr.eval.push(a);
+                    continue;
+                }
+                if b.cost < a.cost {
+                    scr.eval.push(b);
+                    continue;
+                }
+                // tie at min cost: union when both single, else first
+                if a.g_len == 1 && b.g_len == 1 {
+                    DBG_UNIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    DBG_UNION_KW.fetch_add((a.k_len + b.k_len) as usize, std::sync::atomic::Ordering::Relaxed);
+                    let k0 = scr.kw.len() as u32;
+                    scr.kw_seen.clear();
+                    let mut fresh: Vec<&'static str> = Vec::new();
+                    for e in [&a, &b] {
+                        for kw in &scr.kw[e.k_start as usize..(e.k_start + e.k_len) as usize] {
+                            if scr.kw_seen.insert(str_fp(kw)) {
+                                fresh.push(*kw);
+                            }
+                        }
+                    }
+                    let nk = fresh.len() as u32;
+                    scr.kw.extend(fresh);
+                    let g = scr.groups.len() as u32;
+                    scr.groups.push(GroupSlice { start: k0, len: nk });
+                    scr.eval.push(EvalEntry {
+                        value: false,
+                        cost: a.cost,
+                        g_start: g,
+                        g_len: 1,
+                        k_start: k0,
+                        k_len: nk,
+                    });
+                } else {
+                    scr.eval.push(a);
+                }
+            }
+            OP_ANDN => {
+                let k = op.payload as usize;
+                let n = scr.eval.len();
+                let mut kids = std::mem::take(&mut scr.kids);
+                kids.clear();
+                kids.extend(scr.eval.drain(n - k..));
+                let mut inf = false;
+                let mut cost = 0u32;
+                for e in &kids {
+                    if !e.value {
+                        if e.cost == INF_U32 {
+                            inf = true;
+                            break;
+                        }
+                        cost = cost.saturating_add(e.cost);
+                    }
+                }
+                if inf {
+                    scr.eval.push(EvalEntry { value: false, cost: INF_U32, ..Default::default() });
+                } else if cost == 0 {
+                    scr.eval.push(EvalEntry { value: true, cost: 0, ..Default::default() });
+                } else {
+                    // concat all children's groups, one dedup pass. The fp
+                    // dedup is scoped to THIS AndN op (duplicates across
+                    // siblings), not across the block: a persistent set would
+                    // empty later ANDs whose groups were seen earlier.
+                    scr.group_seen.clear();
+                    let g0 = scr.groups.len() as u32;
+                    let mut ng = 0u32;
+                    for e in &kids {
+                        for gi in e.g_start..e.g_start + e.g_len {
+                            let gs = scr.groups[gi as usize];
+                            let fp = group_fp_slice(&scr.kw, gs.start, gs.len);
+                            if let Some(&first) = scr.group_seen.get(&fp) {
+                                if scr.group_slice_eq(first, gs) {
+                                    continue;
+                                }
+                            }
+                            scr.group_seen.insert(fp, g0 + ng);
+                            scr.groups.push(gs);
+                            ng += 1;
+                        }
+                    }
+                    let (k_start, k_len) = if ng == 1 {
+                        let gs = scr.groups[g0 as usize];
+                        (gs.start, gs.len)
+                    } else {
+                        (0, 0)
+                    };
+                    scr.eval.push(EvalEntry {
+                        value: false,
+                        cost,
+                        g_start: g0,
+                        g_len: ng,
+                        k_start,
+                        k_len,
+                    });
+                }
+                scr.kids = kids;
+            }
+            OP_ORN => {
+                let k = op.payload as usize;
+                let n = scr.eval.len();
+                let mut kids = std::mem::take(&mut scr.kids);
+                kids.clear();
+                kids.extend(scr.eval.drain(n - k..));
+                let mut any_true = false;
+                let mut min_cost = INF_U32;
+                let mut best = 0usize;
+                for (i, e) in kids.iter().enumerate() {
+                    if e.value {
+                        any_true = true;
+                        break;
+                    }
+                    if e.cost < min_cost {
+                        min_cost = e.cost;
+                        best = i;
+                    }
+                }
+                // `best` must be a MIN-COST kid before the tie-break pass:
+                // kids[0] may not be min-cost, and comparing group counts
+                // against a non-min-cost baseline would never move `best`.
+                let mut first_min = 0usize;
+                for (i, e) in kids.iter().enumerate() {
+                    if e.cost == min_cost {
+                        first_min = i;
+                        break;
+                    }
+                }
+                best = first_min;
+                if any_true {
+                    scr.eval.push(EvalEntry { value: true, cost: 0, ..Default::default() });
+                    scr.kids = kids;
+                    continue;
+                }
+                if min_cost == INF_U32 {
+                    scr.eval.push(EvalEntry { value: false, cost: INF_U32, ..Default::default() });
+                    scr.kids = kids;
+                    continue;
+                }
+                // Best min-cost child: fewest groups, then fewest keywords.
+                for (i, e) in kids.iter().enumerate() {
+                    if e.cost == min_cost && e.g_len < kids[best].g_len {
+                        best = i;
+                    }
+                }
+                let all_single = kids
+                    .iter()
+                    .all(|e| e.cost != min_cost || e.g_len == 1);
+                if !all_single {
+                    scr.eval.push(kids[best]);
+                    scr.kids = kids;
+                    continue;
+                }
+                // ONE union pass over every min-cost single group.
+                let k0 = scr.kw.len() as u32;
+                scr.kw_seen.clear();
+                let mut fresh: Vec<&'static str> = Vec::new();
+                for e in kids.iter().filter(|e| e.cost == min_cost) {
+                    for kw in &scr.kw[e.k_start as usize..(e.k_start + e.k_len) as usize] {
+                        if scr.kw_seen.insert(str_fp(kw)) {
+                            fresh.push(*kw);
+                        }
+                    }
+                }
+                let nk = fresh.len() as u32;
+                scr.kw.extend(fresh);
+                let g = scr.groups.len() as u32;
+                scr.groups.push(GroupSlice { start: k0, len: nk });
+                scr.eval.push(EvalEntry {
+                    value: false,
+                    cost: min_cost,
+                    g_start: g,
+                    g_len: 1,
+                    k_start: k0,
+                    k_len: nk,
+                });
+                scr.kids = kids;
+            }
+            _ => unreachable!("unknown op tag"),
+        }
+    }
+    let top = scr.eval.pop().unwrap_or(EvalEntry { value: false, cost: INF_U32, ..Default::default() });
+    // Materialize the final need from the arena (keywords are 'static
+    // blob refs - zero-copy).
+    let mut need: Vec<Vec<&'static str>> = Vec::new();
+    for gi in top.g_start..top.g_start + top.g_len {
+        let gs = scr.groups[gi as usize];
+        need.push(scr.kw[gs.start as usize..(gs.start + gs.len) as usize].to_vec());
+    }
+    MinAdd { value: top.value, cost: top.cost as usize, need }
+}
+
+impl MinAddScratch {
+    fn group_slice_eq(&self, gi: u32, gs: GroupSlice) -> bool {
+        let first = self.groups[gi as usize];
+        if first.len != gs.len {
+            return false;
+        }
+        for k in 0..first.len {
+            let a = &self.kw[(first.start + k) as usize];
+            let b = &self.kw[(gs.start + k) as usize];
+            if !std::ptr::eq(&**a, &**b) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// Near-miss analysis for a whole block (default TITLE-ABS-KEY scope),
+/// reusing the caller's per-request `Memo` so leaf verdicts are cached.
+pub fn min_add_block<'a>(
+    block: &Node,
+    table: &[Pattern],
+    memo: &mut Memo<'a>,
+) -> MinAdd {
+    min_add(block, field_mask(&ALL_FIELDS), table, memo)
+}
+
+/// (value, cost) twin with NO allocations: the fast path used to rerank all
+/// non-matching blocks. The `need` groups are only materialized afterwards
+/// for the blocks that make the displayed list (see `min_add_block`).
+fn min_add_vc(node: &Node, mask: u8, table: &[Pattern], memo: &mut Memo) -> (bool, usize) {
+    match node {
+        Node::Leaf { mask: lm, slot, .. } => {
+            let v = memo.term_hit(pat(table, node), *lm, *slot as usize);
+            (v, if v { 0 } else { 1 })
+        }
+        Node::Field { fields, child } => {
+            min_add_vc(child, field_mask_from_strings(fields), table, memo)
+        }
+        Node::Not { child } => {
+            let (v, _) = min_add_vc(child, mask, table, memo);
+            if v {
+                (false, INF_COST)
+            } else {
+                (true, 0)
+            }
+        }
+        Node::Group { op, children } => {
+            if op == "OR" {
+                let mut min = INF_COST;
+                for c in children {
+                    let (v, cost) = min_add_vc(c, mask, table, memo);
+                    if v {
+                        return (true, 0);
+                    }
+                    if cost < min {
+                        min = cost;
+                    }
+                }
+                (false, min)
+            } else {
+                let mut cost = 0usize;
+                for c in children {
+                    let (v, cst) = min_add_vc(c, mask, table, memo);
+                    if !v && cst == INF_COST {
+                        return (false, INF_COST);
+                    }
+                    if !v {
+                        cost = cost.saturating_add(cst);
+                    }
+                }
+                (cost == 0, cost)
+            }
+        }
+    }
+}
+
+/// Minimum keywords to add for a whole block - cost only, no allocation.
+pub fn min_add_block_cost<'a>(
+    block: &Node,
+    table: &[Pattern],
+    memo: &mut Memo<'a>,
+) -> usize {
+    min_add_vc(block, field_mask(&ALL_FIELDS), table, memo).1
+}
+
+/// Evaluate a block with every `NOT` clause REMOVED: true iff the block's
+/// positive (include) side alone would match. Used to decide whether excluded
+/// terms genuinely *disqualify* a block - i.e. the paper already satisfies
+/// everything else and only a NOT clause stands in the way. When this is
+/// false the block is simply off-topic, so its NOT-leaf hits are noise and
+/// must not be reported as "can disqualify". Semantics: a removed NOT child
+/// is the identity element of its group (true under AND, absent under OR).
+pub fn eval_ignore_not_block<'a>(
+    block: &Node,
+    table: &[Pattern],
+    memo: &mut Memo<'a>,
+) -> bool {
+    fn go(node: &Node, mask: u8, table: &[Pattern], memo: &mut Memo) -> bool {
+        match node {
+            Node::Leaf { mask: lm, slot, .. } => {
+                memo.term_hit(pat(table, node), *lm, *slot as usize)
+            }
+            Node::Field { fields, child } => go(child, field_mask_from_strings(fields), table, memo),
+            Node::Not { .. } => true, // clause removed: identity
+            Node::Group { op, children } => {
+                let kids: Vec<&Node> =
+                    children.iter().filter(|c| !matches!(c, Node::Not { .. })).collect();
+                if op == "OR" {
+                    kids.iter().any(|c| go(c, mask, table, memo))
+                } else {
+                    kids.iter().all(|c| go(c, mask, table, memo))
+                }
+            }
+        }
+    }
+    go(block, field_mask(&ALL_FIELDS), table, memo)
+}
+
+// ---------------------------------------------------------------------------
+// Keyword suggestions ("best-fit keywords to add") - deterministic, no LLM
+//
+// Every SDG is an OR of keyword blocks; a paper qualifies as soon as ONE
+// include keyword is present. To help pick the right keyword we rank an
+// SDG's unique include keywords by word-token overlap with the paper text:
+// score = (keyword tokens found in the text) / (keyword tokens). Tokens are
+// lowercased and pre-tokenized ONCE at boot ("pretokenize"): requests only
+// do set lookups, never re-derive tokens. `*`/`?` wildcards match text words
+// by prefix / literal-substring. Keywords the paper already contains are
+// flagged (advanced tab) or skipped (report suggestions), and keywords that
+// are also excluded (NOT) leaves somewhere in the same SDG are flagged.
+// ---------------------------------------------------------------------------
+
+/// Keyword dictionary of one SDG (leaf level), pre-tokenized at boot so the
+/// per-request suggestion scoring is allocation-free.
+pub struct SdgDict {
+    /// (keyword, lowercased overlap tokens) for every unique include
+    /// keyword. Keywords are `Arc<str>` so scoring clones a cheap refcount
+    /// instead of a String; tokens are lowercased once at boot ("pretokenize")
+    /// so requests only do set lookups over them.
+    pub keywords: Vec<(Arc<str>, Vec<String>)>,
+    pub excluded: HashSet<String>,
+}
+
+impl SdgDict {
+    /// Number of unique include keywords.
+    pub fn len(&self) -> usize {
+        self.keywords.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.keywords.is_empty()
+    }
+}
+
+/// One suggested keyword for a paper.
+#[derive(Debug, Clone)]
+pub struct Suggestion {
+    pub keyword: Arc<str>,
+    /// Fraction of the keyword's word tokens found in the paper text (0..=1).
+    pub score: f32,
+    /// The keyword also appears under a NOT clause somewhere in this SDG.
+    pub excluded_in_sdg: bool,
+}
+
+/// One scored keyword of an SDG against a paper (advanced browser view).
+#[derive(Debug, Clone)]
+pub struct ScoredKw {
+    pub keyword: Arc<str>,
+    /// Fraction of the keyword's word tokens found in the paper text (0..=1).
+    pub score: f32,
+    /// The keyword is already present in the paper (it is a hit right now).
+    pub present: bool,
+    /// The keyword also appears under a NOT clause somewhere in this SDG.
+    pub excluded_in_sdg: bool,
+}
+
+fn collect_leafs(node: &Node, excluded: bool, inc: &mut HashSet<String>, exc: &mut HashSet<String>) {
+    match node {
+        Node::Leaf { keyword, .. } => {
+            if excluded {
+                exc.insert(keyword.clone());
+            } else {
+                inc.insert(keyword.clone());
+            }
+        }
+        Node::Field { child, .. } => collect_leafs(child, excluded, inc, exc),
+        Node::Not { child } => collect_leafs(child, !excluded, inc, exc),
+        Node::Group { children, .. } => {
+            for c in children {
+                collect_leafs(c, excluded, inc, exc);
+            }
+        }
+    }
+}
+
+/// Build the keyword dictionary of an SDG from its query blocks.
+pub fn collect_sdg_dict(blocks: &[Node]) -> SdgDict {
+    let mut inc: HashSet<String> = HashSet::new();
+    let mut exc: HashSet<String> = HashSet::new();
+    for b in blocks {
+        collect_leafs(b, false, &mut inc, &mut exc);
+    }
+    let mut include: Vec<String> = inc.into_iter().collect();
+    include.sort_unstable();
+    let keywords = include
+        .into_iter()
+        .map(|kw| {
+            let all: Vec<String> = kw
+                .split(' ')
+                .filter(|t| !t.is_empty())
+                .map(|t| t.to_lowercase())
+                .collect();
+            let meaningful: Vec<String> = all.iter().filter(|t| t.len() > 2).cloned().collect();
+            // Overlap tokens: ignore stopword-ish tokens unless the phrase is
+            // all stopwords (short phrases still score).
+            let tokens = if meaningful.is_empty() { all } else { meaningful };
+            (Arc::from(kw), tokens)
+        })
+        .collect();
+    SdgDict { keywords, excluded: exc }
+}
+
+/// Paper word index: a set for exact lookups plus a sorted slice for
+/// prefix (wildcard) lookups via binary search. Built ONCE per request and
+/// shared by every SDG's scoring; memory layout matches the access pattern
+/// (dense, sorted, cache-friendly) at the cost of a little extra RAM.
+pub struct PaperWords<'a> {
+    set: HashSet<&'a str>,
+    sorted: Vec<&'a str>,
+}
+
+pub fn text_words(text: &str) -> PaperWords<'_> {
+    let mut set: HashSet<&str> = text
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    let mut sorted: Vec<&str> = set.iter().copied().collect();
+    sorted.sort_unstable();
+    let mut set2 = HashSet::with_capacity(set.len());
+    for w in sorted.iter().copied() {
+        set2.insert(w);
+    }
+    std::mem::swap(&mut set, &mut set2);
+    PaperWords { set, sorted }
+}
+
+fn token_matches(tok: &str, words: &PaperWords) -> bool {
+    // `tok` is already lowercased (pre-tokenized at boot).
+    if tok.ends_with('*') {
+        let p = tok.trim_end_matches('*').trim_end_matches(|c: char| !c.is_alphanumeric());
+        if p.is_empty() {
+            return false;
+        }
+        // Prefix range [p, p+) via binary search over the sorted words.
+        let lo = words.sorted.partition_point(|w| w.as_bytes() < p.as_bytes());
+        return words.sorted.get(lo).is_some_and(|w| w.starts_with(p));
+    }
+    if tok.contains('*') || tok.contains('?') {
+        let literal: String = tok.chars().filter(|c| c.is_alphanumeric()).collect();
+        if literal.is_empty() {
+            return false;
+        }
+        return words.sorted.iter().any(|w| w.contains(literal.as_str()));
+    }
+    let stripped = tok.trim_matches(|c: char| !c.is_alphanumeric());
+    !stripped.is_empty() && words.set.contains(stripped)
+}
+
+/// Score every unique include keyword of an SDG against the paper's word
+/// index, best score first, at most `limit` entries. `present` = keywords
+/// already hit by the paper (kept in the list, flagged). Tokens were
+/// lowercased when the dict was built, so scoring is pure set lookups; the
+/// keyword clone is a cheap `Arc` refcount bump (RAM for speed).
+pub fn score_keywords(
+    words: &PaperWords,
+    dict: &SdgDict,
+    present: &HashSet<&str>,
+    limit: usize,
+) -> Vec<ScoredKw> {
+    let mut out: Vec<ScoredKw> = Vec::with_capacity(dict.keywords.len().min(limit + 64));
+    for (kw, tokens) in &dict.keywords {
+        let hit = tokens.iter().filter(|t| token_matches(t, words)).count();
+        out.push(ScoredKw {
+            keyword: kw.clone(),
+            score: if tokens.is_empty() { 0.0 } else { hit as f32 / tokens.len() as f32 },
+            present: present.contains(kw.as_ref()),
+            excluded_in_sdg: dict.excluded.contains(kw.as_ref()),
+        });
+    }
+    out.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.keyword.cmp(&b.keyword))
+    });
+    out.truncate(limit);
+    out
+}
+
+/// Ordering for the bounded top-N heap: lower score, then higher keyword
+/// (so the heap keeps the `limit` BEST suggestions and drains them best-first).
+struct Cand {
+    score: u32,
+    keyword: Arc<str>,
+    excluded: bool,
+}
+
+impl Ord for Cand {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other
+            .score
+            .cmp(&self.score)
+            .then_with(|| other.keyword.cmp(&self.keyword))
+    }
+}
+impl PartialOrd for Cand {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl PartialEq for Cand {
+    fn eq(&self, other: &Self) -> bool {
+        self.score == other.score && self.keyword == other.keyword
+    }
+}
+impl Eq for Cand {}
+
+/// Best-fit keywords to add: streams every include keyword through a bounded
+/// min-heap (limit entries, no full-list allocation/sort), skipping keywords
+/// the paper already contains and keywords with zero token overlap. Score is
+/// percent (0..=100) for integer-only heap comparisons.
+pub fn suggest_keywords(
+    words: &PaperWords,
+    dict: &SdgDict,
+    present: &HashSet<&str>,
+    limit: usize,
+) -> Vec<Suggestion> {
+    use std::collections::BinaryHeap;
+    let mut heap: BinaryHeap<Cand> = BinaryHeap::with_capacity(limit + 1);
+    for (kw, tokens) in &dict.keywords {
+        if present.contains(kw.as_ref()) {
+            continue;
+        }
+        let hit = tokens.iter().filter(|t| token_matches(t, words)).count();
+        if hit == 0 || tokens.is_empty() {
+            continue;
+        }
+        let pct = ((hit as f32 / tokens.len() as f32) * 100.0).round() as u32;
+        if pct == 0 {
+            continue;
+        }
+        let cand = Cand {
+            score: pct,
+            keyword: kw.clone(),
+            excluded: dict.excluded.contains(kw.as_ref()),
+        };
+        if heap.len() < limit {
+            heap.push(cand);
+        } else if cand < *heap.peek().unwrap() {
+            heap.pop();
+            heap.push(cand);
+        }
+    }
+    heap
+        .into_sorted_vec()
+        .into_iter()
+        .map(|c| Suggestion {
+            keyword: c.keyword,
+            score: c.score as f32 / 100.0,
+            excluded_in_sdg: c.excluded,
+        })
+        .collect()
+}
 /// Like `scan_block`, but each hit/miss also carries the field(s) the term is
 /// searched in ('' -> the default TITLE-ABS-KEY). Used by the web server,
 /// which renders `[TITLE,ABS]` chips next to every keyword.
@@ -1367,7 +2624,7 @@ pub fn scan_with_fields<'a>(
     _paper: &'a Paper,
     table: &[Pattern],
     memo: &mut Memo<'a>,
-) -> (Vec<(Arc<str>, u8)>, Vec<(Arc<str>, u8)>, Vec<Arc<str>>, bool) {
+) -> (Vec<(&'static str, u8)>, Vec<(&'static str, u8)>, Vec<&'static str>, bool) {
     let mut hits = Vec::new();
     let mut misses = Vec::new();
     let mut ex_hits = Vec::new();
@@ -1381,9 +2638,9 @@ fn rec_fields(
     excluded: bool,
     table: &[Pattern],
     memo: &mut Memo,
-    hits: &mut Vec<(Arc<str>, u8)>,
-    misses: &mut Vec<(Arc<str>, u8)>,
-    ex_hits: &mut Vec<Arc<str>>,
+    hits: &mut Vec<(&'static str, u8)>,
+    misses: &mut Vec<(&'static str, u8)>,
+    ex_hits: &mut Vec<&'static str>,
 ) -> bool {
     match node {
         Node::Leaf { mask, slot, .. } => {
@@ -1401,7 +2658,7 @@ fn rec_fields(
                         prof::REPORT_PUSHES.fetch_add(1, Ordering::Relaxed);
                     }
                     if report {
-                        ex_hits.push(p.raw.clone());
+                        ex_hits.push(p.raw());
                     }
                 }
             } else if found {
@@ -1411,7 +2668,7 @@ fn rec_fields(
                     prof::REPORT_PUSHES.fetch_add(1, Ordering::Relaxed);
                 }
                 if report {
-                    hits.push((p.raw.clone(), *mask));
+                    hits.push((p.raw(), *mask));
                 }
             } else {
                 #[cfg(feature = "prof")]
@@ -1420,7 +2677,7 @@ fn rec_fields(
                     prof::REPORT_PUSHES.fetch_add(1, Ordering::Relaxed);
                 }
                 if report {
-                    misses.push((p.raw.clone(), *mask));
+                    misses.push((p.raw(), *mask));
                 }
             }
             found
@@ -1486,12 +2743,12 @@ fn rec(
             let found = memo.term_hit(p, *mask, *slot as usize);
             if excluded {
                 if found {
-                    out.excluded_hits.push(p.raw.clone());
+                    out.excluded_hits.push(p.raw());
                 }
             } else if found {
-                out.hits.push(p.raw.clone());
+                out.hits.push(p.raw());
             } else {
-                out.misses.push(p.raw.clone());
+                out.misses.push(p.raw());
             }
             found
         }
@@ -1517,15 +2774,257 @@ fn rec(
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// Boot cache serialization
+//
+// Recompiling ~21k keyword patterns at every boot (web server start, each CLI
+// invocation) costs ~70-80 ms. We persist the precomputed patterns, flattened
+// blocks and pretokenized SDG dictionaries in a compact binary cache (see
+// cache.rs); boot then reads the file (a few ms) instead of re-deriving
+// everything. The cache is validated by the query files' mtimes, so it is
+// always consistent with the sources. Memory layout is length-prefixed and
+// sequential - written once, read as a linear scan.
+// ---------------------------------------------------------------------------
+
+fn write_u32<W: std::io::Write>(w: &mut W, v: u32) -> std::io::Result<()> {
+    w.write_all(&v.to_le_bytes())
+}
+
+fn read_u32<R: std::io::Read>(r: &mut R) -> std::io::Result<u32> {
+    let mut b = [0u8; 4];
+    r.read_exact(&mut b)?;
+    Ok(u32::from_le_bytes(b))
+}
+
+fn write_bytes<W: std::io::Write>(w: &mut W, b: &[u8]) -> std::io::Result<()> {
+    write_u32(w, b.len() as u32)?;
+    w.write_all(b)
+}
+
+fn read_bytes<R: std::io::Read>(r: &mut R) -> std::io::Result<Vec<u8>> {
+    let n = read_u32(r)? as usize;
+    if n > (1 << 28) {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "cache: oversized field"));
+    }
+    let mut v = vec![0u8; n];
+    r.read_exact(&mut v)?;
+    Ok(v)
+}
+
+impl Pattern {
+    /// Record layout: 6 x u32 offsets/lengths + 1 flag byte + 3 pad bytes
+    /// (28 bytes total - matches `size_of::<Pattern>()` so the boot cache
+    /// can be viewed as `&[Pattern]` directly from the mmap).
+    pub fn serialize<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
+        write_u32(w, self.raw_off)?;
+        write_u32(w, self.raw_len)?;
+        write_u32(w, self.lower_off)?;
+        write_u32(w, self.lower_len)?;
+        write_u32(w, self.parts_off)?;
+        write_u32(w, self.parts_len)?;
+        w.write_all(&[self.no_wildcard as u8, 0, 0, 0])?;
+        Ok(())
+    }
+
+    pub fn deserialize<R: std::io::Read>(r: &mut R) -> std::io::Result<Pattern> {
+        let raw_off = read_u32(r)?;
+        let raw_len = read_u32(r)?;
+        let lower_off = read_u32(r)?;
+        let lower_len = read_u32(r)?;
+        let parts_off = read_u32(r)?;
+        let parts_len = read_u32(r)?;
+        let mut flag = [0u8; 1];
+        r.read_exact(&mut flag)?;
+        Ok(Pattern { raw_off, raw_len, lower_off, lower_len, parts_off, parts_len, no_wildcard: flag[0] != 0 })
+    }
+}
+
+impl Op {
+    fn serialize<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
+        write_u32(w, self.tag)?;
+        write_u32(w, self.payload)
+    }
+
+    fn deserialize<R: std::io::Read>(r: &mut R) -> std::io::Result<Op> {
+        Ok(Op { tag: read_u32(r)?, payload: read_u32(r)? })
+    }
+}
+
+impl FlatBlock {
+    /// Fixed-record write: op records (8 bytes) + leaf records (20 bytes).
+    pub fn serialize<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
+        write_u32(w, self.prog.len() as u32)?;
+        for op in self.prog {
+            op.serialize(w)?;
+        }
+        write_u32(w, self.leaves.len() as u32)?;
+        for l in self.leaves {
+            write_u32(w, l.pid)?;
+            write_u32(w, l.slot)?;
+            w.write_all(&[l.mask, l.excluded as u8, 0, 0])?; // 20-byte records
+            write_u32(w, l.raw_off)?;
+            write_u32(w, l.raw_len)?;
+        }
+        Ok(())
+    }
+
+    pub fn deserialize<R: std::io::Read>(r: &mut R) -> std::io::Result<FlatBlock> {
+        let np = read_u32(r)? as usize;
+        let mut prog = Vec::with_capacity(np.min(1 << 20));
+        for _ in 0..np {
+            prog.push(Op::deserialize(r)?);
+        }
+        let nl = read_u32(r)? as usize;
+        let mut leaves = Vec::with_capacity(nl.min(1 << 20));
+        for _ in 0..nl {
+            let pid = read_u32(r)?;
+            let slot = read_u32(r)?;
+            let mut m = [0u8; 2];
+            r.read_exact(&mut m)?;
+            let raw_off = read_u32(r)?;
+            let raw_len = read_u32(r)?;
+            leaves.push(LeafDesc { pid, slot, mask: m[0], excluded: m[1] != 0, raw_off, raw_len });
+        }
+        Ok(FlatBlock {
+            prog: Box::leak(prog.into_boxed_slice()),
+            leaves: Box::leak(leaves.into_boxed_slice()),
+        })
+    }
+}
+
+impl SdgDict {
+    pub fn serialize<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
+        write_u32(w, self.keywords.len() as u32)?;
+        for (kw, toks) in &self.keywords {
+            write_bytes(w, kw.as_bytes())?;
+            write_u32(w, toks.len() as u32)?;
+            for t in toks {
+                write_bytes(w, t.as_bytes())?;
+            }
+        }
+        write_u32(w, self.excluded.len() as u32)?;
+        let mut exc: Vec<&str> = self.excluded.iter().map(String::as_str).collect();
+        exc.sort_unstable();
+        for e in exc {
+            write_bytes(w, e.as_bytes())?;
+        }
+        Ok(())
+    }
+
+    pub fn deserialize<R: std::io::Read>(r: &mut R) -> std::io::Result<SdgDict> {
+        let n = read_u32(r)? as usize;
+        let mut keywords = Vec::with_capacity(n.min(1 << 20));
+        for _ in 0..n {
+            let kw = String::from_utf8(read_bytes(r)?)
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "cache: bad keyword"))?;
+            let nt = read_u32(r)? as usize;
+            let mut toks = Vec::with_capacity(nt.min(64));
+            for _ in 0..nt {
+                let t = String::from_utf8(read_bytes(r)?)
+                    .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "cache: bad token"))?;
+                toks.push(t);
+            }
+            keywords.push((Arc::from(kw), toks));
+        }
+        let ne = read_u32(r)? as usize;
+        let mut excluded = HashSet::with_capacity(ne.min(1 << 20));
+        for _ in 0..ne {
+            let e = String::from_utf8(read_bytes(r)?)
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "cache: bad exclude"))?;
+            excluded.insert(e);
+        }
+        Ok(SdgDict { keywords, excluded })
+    }
+}
+
+/// Rebuild the global FIRST_QUADS set from loaded patterns (normally done
+/// inside `compile_all`; needed when patterns come from the boot cache).
+pub fn rebuild_first_quads(patterns: &[Pattern]) {
+    let mut g = FIRST_QUADS.lock().unwrap();
+    let s = g.get_or_insert_with(|| Arc::new(HashSet::with_hasher(FastHasher::default())));
+    let s = Arc::make_mut(s);
+    for p in patterns {
+        for part in p.parts() {
+            if part.len() >= 4 {
+                s.insert(u32::from_le_bytes([part[0], part[1], part[2], part[3]]));
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Shared test blob: patterns built by `compile_pattern` append their
+    /// strings here (pre-reserved, never reallocates); `set_blob` repoints
+    /// the global (ptr, len) at each call so all test patterns stay valid.
+    static TEST_BLOB: Mutex<Option<&'static mut Vec<u8>>> = Mutex::new(None);
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Serialize the blob-dependent tests (the global blob is process-wide)
+    /// and give each test a fresh blob so offsets never go stale.
+    fn reset_test_blob() -> std::sync::MutexGuard<'static, ()> {
+        let lock = TEST_LOCK.lock().unwrap();
+        let mut g = TEST_BLOB.lock().unwrap();
+        let mut v: Box<Vec<u8>> = Box::new(Vec::with_capacity(1 << 20));
+        *g = Some(Box::leak(v));
+        let b = g.as_ref().unwrap();
+        set_blob(unsafe { std::slice::from_raw_parts(b.as_ptr(), b.len()) });
+        lock
+    }
+
+    fn compile_pattern(kw: &str) -> Pattern {
+        let mut g = TEST_BLOB.lock().unwrap();
+        if g.is_none() {
+            let mut v: Box<Vec<u8>> = Box::new(Vec::with_capacity(1 << 20));
+            *g = Some(Box::leak(v));
+        }
+        let b = g.as_mut().unwrap();
+        let kw = kw.trim();
+        let raw_off = b.len() as u32;
+        b.extend_from_slice(kw.as_bytes());
+        let raw_len = kw.len() as u32;
+        let lower = kw.to_ascii_lowercase();
+        let has_star = lower.contains('*');
+        let has_q = lower.contains('?');
+        let (no_wildcard, parts_bytes): (bool, Vec<Vec<u8>>) = if !has_star && !has_q {
+            (true, vec![lower.as_bytes().to_vec()])
+        } else if !has_q {
+            (false, lower.split('*').filter(|p| !p.is_empty()).map(|p| p.as_bytes().to_vec()).collect())
+        } else {
+            (false, Vec::new())
+        };
+        let mut parts = Vec::with_capacity(parts_bytes.len());
+        for pb in parts_bytes {
+            let off = b.len() as u32;
+            b.extend_from_slice(&pb);
+            parts.push((off, pb.len() as u32));
+        }
+        let (lower_off, lower_len) = if has_q {
+            let off = b.len() as u32;
+            b.extend_from_slice(lower.as_bytes());
+            (off, lower.len() as u32)
+        } else {
+            (0, 0)
+        };
+        let parts_off = b.len() as u32;
+        for &(off, len) in &parts {
+            b.extend_from_slice(&off.to_le_bytes());
+            b.extend_from_slice(&len.to_le_bytes());
+        }
+        set_blob(unsafe { std::slice::from_raw_parts(b.as_ptr(), b.len()) });
+        Pattern { raw_off, raw_len, lower_off, lower_len, parts_off, parts_len: parts.len() as u32, no_wildcard }
+    }
 
     /// The flattened-block path must produce byte-identical reports (verdict,
     /// hits, misses, excluded) to the AST tree walk, for every block of every
     /// SDG query and every paper in the repo.
     #[test]
     fn flat_matches_ast_scan() {
+        let _lock = reset_test_blob();
         use crate::query::load_queries;
         use std::path::Path;
 
@@ -1549,11 +3048,10 @@ mod tests {
                 for (bi, b) in q.blocks.iter().enumerate() {
                     let ast = scan_with_fields(b, &paper, &table, &mut memo);
                     let flat = scan_flat(&flats[qi][bi], &table, &mut memo);
-                    let owned = |v: Vec<(&str, u8)>| v.into_iter().map(|(s, m)| (s.to_owned(), m)).collect::<Vec<_>>();
-                    let owned_ast = |v: Vec<(Arc<str>, u8)>| v.into_iter().map(|(s, m)| (s.to_string(), m)).collect::<Vec<_>>();
+
                     assert_eq!(flat.3, ast.3, "verdict mismatch {p} q{qi} b{bi}");
-                    assert_eq!(owned(flat.0), owned_ast(ast.0), "hits mismatch {p} q{qi} b{bi}");
-                    assert_eq!(owned(flat.1), owned_ast(ast.1), "misses mismatch {p} q{qi} b{bi}");
+                    assert_eq!(flat.0, ast.0, "hits mismatch {p} q{qi} b{bi}");
+                    assert_eq!(flat.1, ast.1, "misses mismatch {p} q{qi} b{bi}");
                     assert_eq!(
                         flat.2.into_iter().map(String::from).collect::<Vec<_>>(),
                         ast.2.into_iter().map(|s| s.to_string()).collect::<Vec<_>>(),
@@ -1570,6 +3068,7 @@ mod tests {
     /// TITLE-scoped search.
     #[test]
     fn flat_matches_ast_with_body_text() {
+        let _lock = reset_test_blob();
         use crate::query::{load_queries, Query};
         use std::path::Path;
 
@@ -1634,6 +3133,7 @@ This is the body. It discusses carbon markets and debt relief at length.";
     /// scan) across boundary and wildcard edge cases.
     #[test]
     fn matches_indexed_equiv_matches() {
+        let _lock = reset_test_blob();
         let cases = [
             ("foreign aid", "foreign aid in developing countries", true),
             ("foreign aid", "xforeign aid", false),
@@ -1659,8 +3159,7 @@ This is the body. It discusses carbon markets and debt relief at length.";
         for (pat, text, want) in cases {
             let p = compile_pattern(pat);
             let needed: HashSet<u32, FastHasher> = p
-                .parts
-                .iter()
+                .parts()
                 .filter(|x| x.len() >= 4)
                 .map(|x| u32::from_le_bytes([x[0], x[1], x[2], x[3]]))
                 .collect();
@@ -1674,6 +3173,7 @@ This is the body. It discusses carbon markets and debt relief at length.";
     /// verification must stay exhaustive (no cap that drops the match).
     #[test]
     fn matches_indexed_common_quad_verifies_all() {
+        let _lock = reset_test_blob();
         let mut txt = String::new();
         for _ in 0..600 {
             txt.push_str("forest ");
@@ -1693,6 +3193,7 @@ This is the body. It discusses carbon markets and debt relief at length.";
     /// per term: the positions gate answers from the index.
     #[test]
     fn matches_indexed_repetitive_text() {
+        let _lock = reset_test_blob();
         let txt = "tax evasion in developing countries. ".repeat(4000);
         let p = compile_pattern("quantum computing");
         let needed: HashSet<u32, FastHasher> = [u32::from_le_bytes(*b"quan")].into_iter().collect();
@@ -1708,6 +3209,7 @@ This is the body. It discusses carbon markets and debt relief at length.";
     /// cross-field matches must not happen.
     #[test]
     fn flat_matches_ast_edge_papers() {
+        let _lock = reset_test_blob();
         use crate::query::load_queries;
         use std::path::Path;
 
@@ -1837,6 +3339,7 @@ abstract: |
     /// miss.
     #[test]
     fn random_papers_flat_matches_ast() {
+        let _lock = reset_test_blob();
         use crate::query::load_queries;
         use std::path::Path;
 
@@ -1934,6 +3437,7 @@ abstract: |
     /// lengths and random texts.
     #[test]
     fn could_contain_no_false_negatives() {
+        let _lock = reset_test_blob();
         let mut rng = Rng(0xDEAD_BEEF_CAFE_F00D);
         let alphabet: Vec<u8> = b"abcdefghijklmnopqrstuvwxyz 0123456789-_".to_vec();
         for _ in 0..200 {
@@ -1964,6 +3468,7 @@ abstract: |
     /// full scan on a small hand-built query.
     #[test]
     fn eval_public_api() {
+        let _lock = reset_test_blob();
         use crate::parser::Parser;
         use crate::tokenizer::tokenize;
 
@@ -1985,6 +3490,7 @@ abstract: |
 
     #[test]
     fn pattern_matches_plain_term() {
+        let _lock = reset_test_blob();
         let p = compile_pattern("foreign aid");
         assert!(p.matches(b"tax evasion and foreign aid in developing countries"));
         assert!(!p.matches(b"foreign-aid policies"));
@@ -1992,6 +3498,7 @@ abstract: |
 
     #[test]
     fn pattern_matches_wildcards() {
+        let _lock = reset_test_blob();
         let p = compile_pattern("developing* countr*");
         assert!(p.matches(b"studies in developing countries"));
         let p = compile_pattern("poverty*-reducing*");
@@ -2016,5 +3523,58 @@ abstract: |
             assert_eq!(find(hay, needle, 0), Some(10), "m={m}");
         }
         assert_eq!(find(hay, b"foreign aid", 0), Some(48));
+    }
+
+    /// Keyword suggestions: token-overlap ranking, present-keyword skip, and
+    /// the real SDG10 dictionary against a health-systems abstract.
+    #[test]
+    fn suggest_ranks_by_token_overlap() {
+        let mk = |kws: &[&str]| {
+            SdgDict {
+                keywords: kws
+                    .iter()
+                    .map(|k| {
+                        (
+                            Arc::from(*k),
+                            k.split(' ').filter(|t| !t.is_empty()).map(|t| t.to_lowercase()).collect(),
+                        )
+                    })
+                    .collect(),
+                excluded: HashSet::new(),
+            }
+        };
+        let dict = mk(&["health care access", "educational inequality", "digital government", "zebra farming"]);
+        let words = text_words("the school health system improves access to care for students in indonesia");
+        let present: HashSet<&str> = HashSet::new();
+        let sug = suggest_keywords(&words, &dict, &present, 10);
+        assert_eq!(sug[0].keyword.as_ref(), "health care access", "best token overlap first");
+        assert!(sug[0].score > 0.5);
+        assert!(sug.iter().all(|s| s.keyword.as_ref() != "zebra farming"), "no overlap -> skipped");
+
+        // Keywords already present in the paper are never suggested.
+        let present2: HashSet<&str> = ["health care access"].into_iter().collect();
+        let sug2 = suggest_keywords(&words, &dict, &present2, 10);
+        assert!(sug2.iter().all(|s| s.keyword.as_ref() != "health care access"));
+
+        // Real SDG10 dictionary vs the SistaUKS abstract: health/access terms
+        // must rank high.
+        use crate::query::load_queries;
+        use std::path::Path;
+        let qdir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../engine/data/queries");
+        let queries = load_queries(&qdir).unwrap();
+        let q10 = queries.iter().find(|q| q.sdg == "10").expect("SDG 10");
+        let dict10 = collect_sdg_dict(&q10.blocks);
+        let abstract_text = "SistaUKS, a health information system comprising software and data, \
+            facilitates the automation of the UKS stratification assessment process because of \
+            lack of health-care professionals. This study analyzed teacher satisfaction regarding \
+            the utilization of the SistaUKS system by 33 junior high school teachers in Boyolali \
+            Regency using the System Usability Scale.";
+        let words = text_words(abstract_text);
+        let top = suggest_keywords(&words, &dict10, &HashSet::new(), 10);
+        let names: Vec<&str> = top.iter().map(|s| s.keyword.as_ref()).collect();
+        assert!(
+            names.contains(&"health care access") || names.contains(&"access to health care"),
+            "health-access term must surface for SDG10, got {names:?}"
+        );
     }
 }

@@ -134,6 +134,10 @@ def term_pattern(term: str):
     single character and, like the Rust glob fallback, `*` in such terms may
     span anything.
     """
+    # Scopus query files contain keywords with stray leading/trailing
+    # whitespace (e.g. `"access "`); the Rust engine trims at compile time,
+    # so mirror that here ("access " must behave as "access").
+    term = term.strip()
     pat = _PAT_CACHE.get(term)
     if pat is not None:
         return pat
@@ -148,7 +152,14 @@ def term_pattern(term: str):
                 out.append(".")
             else:
                 out.append(re.escape(piece))
-        rx = rf"\b{''.join(out)}\b" if "*" not in term and "?" not in term else "".join(out)
+        # Whole-word via alnum lookarounds, NOT `\b`: keywords ending in
+        # punctuation (e.g. "hygiene (wash)") have no word boundary before a
+        # space, and Rust/Scopus still match them (`\b` would not).
+        rx = (
+            rf"(?<![A-Za-z0-9_]){''.join(out)}(?![A-Za-z0-9_])"
+            if "*" not in term and "?" not in term
+            else "".join(out)
+        )
         # DOTALL: the paper fields join YAML block-scalar lines with '\n';
         # '?' globs (and '*' in terms that also contain '?') may span line
         # breaks, like the Rust glob fallback.
@@ -424,22 +435,173 @@ def load_queries_from_dir(dirpath: str) -> list[tuple[str, list]]:
 # Main
 # --------------------------------------------------------------------------
 
+# Near-miss analysis: minimum keywords to add ("missing tags") + reranking.
+# Mirrors rust/src/matcher.rs min_add_block / eval_ignore_not_block exactly
+# (pure AST logic, no LLM): for each non-matching block we compute the exact
+# minimum number of keywords that must be added for it to become true, plus
+# the candidate keyword groups (any ONE keyword from each group qualifies).
+# Blocks are reranked cheapest-first. A block whose required-path NOT is
+# already true cannot be fixed by adding keywords (INF_COST) and is reported
+# as "disqualified by excluded term(s)" only when its positive side alone
+# would have matched.
+INF_COST = 1 << 30
+
+
+def min_add(node, fields: tuple[str, ...], paper: Paper):
+    """-> (value, cost, need): current verdict; minimum keywords to add to
+    make the subtree true (INF_COST if impossible); candidate groups."""
+    if isinstance(node, Leaf):
+        if term_hit(node.keyword, fields, paper):
+            return (True, 0, [])
+        return (False, 1, [[node.keyword]])
+    if isinstance(node, FieldWrap):
+        return min_add(node.child, node.fields, paper)
+    if isinstance(node, Not):
+        val, _, _ = min_add(node.child, fields, paper)
+        if val:
+            return (False, INF_COST, [])
+        return (True, 0, [])
+    if isinstance(node, Group):
+        if node.op == "OR":
+            cs = [min_add(c, fields, paper) for c in node.children]
+            if any(v for v, _, _ in cs):
+                return (True, 0, [])
+            finite = [c for c in cs if c[1] != INF_COST]
+            if not finite:
+                return (False, INF_COST, [])
+            min_cost = min(c[1] for c in finite)
+            candidates = [c for c in cs if c[1] == min_cost]
+            if all(len(c[2]) == 1 for c in candidates):
+                # Every cheapest branch needs ONE keyword: show the union.
+                union: list[str] = []
+                for c in candidates:
+                    for kw in c[2][0]:
+                        if kw not in union:
+                            union.append(kw)
+                return (False, min_cost, [union])
+            chosen = min(candidates, key=lambda c: (len(c[2]), sum(len(g) for g in c[2])))
+            return (False, min_cost, chosen[2])
+        # AND, W/n, PRE/n, ...: every child must hit.
+        total = 0
+        need: list[list[str]] = []
+        for c in node.children:
+            _, cost, g = min_add(c, fields, paper)
+            if cost == INF_COST:
+                return (False, INF_COST, [])
+            total += cost
+            for grp in g:
+                if grp not in need:
+                    need.append(grp)
+        return (total == 0, total, need)
+    raise TypeError(f"unknown node {node!r}")
+
+
+def eval_ignore_not(node, fields: tuple[str, ...], paper: Paper) -> bool:
+    """Block verdict with every NOT clause removed (positive side only)."""
+    if isinstance(node, Leaf):
+        return term_hit(node.keyword, fields, paper)
+    if isinstance(node, FieldWrap):
+        return eval_ignore_not(node.child, node.fields, paper)
+    if isinstance(node, Not):
+        return True  # clause removed: identity element
+    if isinstance(node, Group):
+        kids = [c for c in node.children if not isinstance(c, Not)]
+        if node.op == "OR":
+            return any(eval_ignore_not(c, fields, paper) for c in kids)
+        return all(eval_ignore_not(c, fields, paper) for c in kids)
+    raise TypeError(f"unknown node {node!r}")
+
+
+# --------------------------------------------------------------------------
+# Keyword suggestions ("best-fit keywords to add") — mirror of the Rust
+# scorer (matcher::score_keywords / suggest_keywords): deterministic
+# word-token overlap, no LLM. A paper qualifies for an SDG as soon as ONE
+# include keyword is present, so suggestions rank which keyword to add.
+# --------------------------------------------------------------------------
+
+def collect_sdg_dict(blocks: list) -> tuple[set[str], set[str]]:
+    """(unique include keywords, excluded-term set) of one SDG."""
+    inc: set[str] = set()
+    exc: set[str] = set()
+
+    def go(node, excluded: bool):
+        if isinstance(node, Leaf):
+            (exc if excluded else inc).add(node.keyword)
+        elif isinstance(node, FieldWrap):
+            go(node.child, excluded)
+        elif isinstance(node, Not):
+            go(node.child, not excluded)
+        elif isinstance(node, Group):
+            for c in node.children:
+                go(c, excluded)
+
+    for b in blocks:
+        go(b, False)
+    return inc, exc
+
+
+def _tok_match(tok: str, words: set[str]) -> bool:
+    lt = tok.lower()
+    if lt.endswith("*"):
+        p = lt.rstrip("*").rstrip("-_ ")
+        return any(w.startswith(p) for w in words) if p else False
+    if "*" in lt or "?" in lt:
+        lit = "".join(c for c in lt if c.isalnum())
+        return any(lit in w for w in words) if lit else False
+    return lt.strip("-_ ") in words
+
+
+def score_keywords(text: str, include, excluded: set[str], present: set[str],
+                   limit: int) -> list[dict]:
+    """Every unique include keyword, scored 0..100 by token overlap with the
+    folded paper text; best score first."""
+    words = {w for w in re.split(r"[^A-Za-z0-9]+", text.lower()) if w}
+    out = []
+    for kw in include:
+        toks = [t for t in kw.split(" ") if t]
+        meaningful = [t for t in toks if len(t) > 2] or toks
+        hit = sum(1 for t in meaningful if _tok_match(t, words))
+        out.append({
+            "keyword": kw,
+            "score": round(hit * 100.0 / len(meaningful)),
+            "present": kw in present,
+            "excluded": kw in excluded,
+        })
+    out.sort(key=lambda k: (-k["score"], k["keyword"]))
+    return out[:limit]
+
+
+def suggest_keywords(text: str, include, excluded: set[str], present: set[str],
+                     limit: int) -> list[dict]:
+    """Like score_keywords but only keywords the paper does NOT already
+    contain and with positive overlap."""
+    return [s for s in score_keywords(text, include, excluded, present, 10**9)
+            if not s["present"] and s["score"] > 0][:limit]
+
+
 def report(queries: list[tuple[str, list]], paper: Paper, args) -> int:
     """Match a paper against query blocks and print the report."""
     any_sdg = False
     for sdg, blocks in queries:
         matched = []
         near = []
-        excluded_hits: list[str] = []
+        disqualified: list[str] = []
         for bno, block in enumerate(blocks):
-            hits, misses, ex_hits = scan_block(block, paper)
-            excluded_hits += ex_hits
+            hits, _misses, ex_hits = scan_block(block, paper)
             if eval_node(block, (), paper):
                 matched.append((bno, hits))
             else:
-                near.append((bno, misses, len(hits), len(misses)))
+                _val, cost, need = min_add(block, (), paper)
+                if cost == INF_COST:
+                    # Only report excluded terms when the positive side alone
+                    # would have matched (off-topic blocks are dropped).
+                    if eval_ignore_not(block, (), paper):
+                        disqualified.extend(ex_hits)
+                else:
+                    near.append((bno, len(hits), cost, need))
 
-        near.sort(key=lambda t: len(t[1]))  # fewest missing keywords first
+        # Rerank: fewest keywords to add first, then most keywords hit.
+        near.sort(key=lambda t: (t[2], -t[1], sum(len(g) for g in t[3])))
         any_sdg = True
         print(f"=== SDG {sdg} ===")
         if matched:
@@ -450,17 +612,22 @@ def report(queries: list[tuple[str, list]], paper: Paper, args) -> int:
         else:
             print("  MATCHED  none")
         if near:
-            print(f"  NEAR MISSES (missing keywords -> add any of these to qualify):")
-            for bno, misses, n_hit, n_miss in near[: args.top]:
-                shown = misses[: args.max_kw]
-                more = n_miss - len(shown)
-                print(f"    block {bno}: {n_hit} hit, missing {n_miss} of {n_miss + n_hit}: "
-                      f"{', '.join(shown)}{' ...' if more else ''}")
+            print("  NEAR MISSES (add any 1 keyword from each group to qualify):")
+            for bno, n_hit, cost, need in near[: args.top]:
+                shown: list[str] = []
+                for g in need[:3]:
+                    shown.extend(g[: args.max_kw])
+                more_groups = len(need) - 3
+                line = (f"    block {bno}: {n_hit} hit, add {cost} keyword(s) "
+                        f"from {len(need)} group(s): {', '.join(shown)}")
+                if more_groups > 0:
+                    line += f" ... +{more_groups} more group(s)"
+                print(line)
         else:
             print("  NEAR MISSES none")
-        if excluded_hits:
-            uniq = sorted(set(excluded_hits))
-            print(f"  EXCLUDED terms found in text (can disqualify a match): {', '.join(uniq)}")
+        if disqualified:
+            uniq = sorted(set(disqualified))
+            print(f"  DISQUALIFIED by excluded term(s) in text (remove them to qualify): {', '.join(uniq)}")
         print()
     return 0 if any_sdg else 1
 

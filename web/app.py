@@ -65,9 +65,10 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # repo root
-from engine.match_paper import (Paper, eval_node, load_queries_from_db,
-                                load_queries_from_dir, parse_paper_text,
-                                term_hit)
+from engine.match_paper import (INF_COST, Paper, collect_sdg_dict, eval_node,
+                                eval_ignore_not, load_queries_from_db,
+                                load_queries_from_dir, min_add, parse_paper_text,
+                                score_keywords, suggest_keywords, term_hit)
 from engine.parse_sdg import FieldWrap, Group, Leaf, Not
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -153,19 +154,55 @@ def scan_with_fields(block, paper: Paper):
     return hits, misses, ex_hits
 
 
+_DICT_CACHE: dict[str, tuple[set[str], set[str]]] = {}
+
+
+def sdg_dict(sdg: str, blocks) -> tuple[set[str], set[str]]:
+    """Cached (unique include keywords, excluded set) of one SDG."""
+    d = _DICT_CACHE.get(sdg)
+    if d is None:
+        d = collect_sdg_dict(blocks)
+        _DICT_CACHE[sdg] = d
+    return d
+
+
 def match_paper(paper: Paper, top: int, max_kw: int) -> list[dict]:
     """Full report: one dict per SDG."""
     out = []
     for sdg, blocks in get_queries():
         matched, near, ex = [], [], []
+        present: set[str] = set()
+        # Keywords that alone qualify the SDG / still need N more keyword(s).
+        solo: set[str] = set()
+        extra: dict[str, int] = {}
         for bno, block in enumerate(blocks):
             hits, misses, ex_hits = scan_with_fields(block, paper)
-            ex.extend(ex_hits)
+            present.update(kw for kw, _ in hits)
             if eval_node(block, (), paper):
                 matched.append((bno, hits))
             else:
-                near.append((bno, misses, len(hits)))
-        near.sort(key=lambda t: len(t[1]))  # fewest missing keywords first
+                # Near-miss analysis: exact minimum keywords to add ("missing
+                # tags"), mirrored from engine/match_paper (no LLM).
+                _val, cost, need = min_add(block, (), paper)
+                if cost == INF_COST:
+                    # Only report excluded terms when the positive side alone
+                    # would have matched (off-topic blocks are dropped).
+                    if eval_ignore_not(block, (), paper):
+                        ex.extend(ex_hits)
+                else:
+                    if cost == 1 and len(need) == 1:
+                        solo.update(need[0])
+                    else:
+                        need_more = cost - 1
+                        for g in need:
+                            for k in g:
+                                if k not in extra or need_more < extra[k]:
+                                    extra[k] = need_more
+                    near.append((bno, hits, cost, need))
+        # Rerank: fewest keywords to add first, then most keywords hit.
+        near.sort(key=lambda t: (t[2], -len(t[1]), sum(len(g) for g in t[3])))
+        inc, exc = sdg_dict(sdg, blocks)
+        suggestions = suggest_keywords(paper.lowered(""), inc, exc, present, 10)
         out.append({
             "sdg": sdg,
             "matched": matched,
@@ -173,6 +210,9 @@ def match_paper(paper: Paper, top: int, max_kw: int) -> list[dict]:
             "near_total": len(near),
             "excluded": sorted({k for k, _ in ex}),
             "max_kw": max_kw,
+            "suggestions": suggestions,
+            "solo": solo,
+            "extra": extra,
         })
     return out
 
@@ -373,7 +413,8 @@ def _meta_str(v) -> str:
 
 
 def _kw_tags(entries, cls, max_kw: int) -> str:
-    """entries: list of (keyword, fields); render keyword chips."""
+    """entries: list of (keyword, fields); render keyword chips + a
+    "Show all N" toggle button revealing the full list (app.js handler)."""
     if not entries:
         return '<span class="none">none</span>'
     shown, rest = entries[:max_kw], entries[max_kw:]
@@ -382,8 +423,41 @@ def _kw_tags(entries, cls, max_kw: int) -> str:
         field = f'<span class="field">[{fields or "TITLE-ABS-KEY"}]</span>' if fields else ""
         out.append(f'<span class="kw {cls}">{escape(kw)}{field}</span>')
     if rest:
-        out.append(f'<span class="muted-text">… +{len(rest)} more</span>')
+        hidden = "".join(
+            f'<span class="kw {cls}">{escape(kw)}{f"<span class=\"field\">[{fields}]</span>" if fields else ""}</span>'
+            for kw, fields in rest
+        )
+        out.append(
+            f'<span class="kw-more" hidden>{hidden}</span>'
+            f'<button type="button" class="kw-toggle" data-all="Show all {len(entries)}" '
+            f'data-few="Show fewer">Show all {len(entries)}</button>'
+        )
     return "".join(out)
+
+
+def _need_chain(body: list, need: list, max_kw: int) -> None:
+    """Append one near-miss path as AND-joined "pick any one" boxes."""
+    body.append('<div class="and-chain">')
+    n_groups = len(need)
+    for gi, group in enumerate(need[:3]):
+        if gi > 0:
+            body.append('<div class="and-op">AND</div>')
+        body.append(f'<div class="and-group"><div class="and-group-label">Box {gi + 1} — pick any ONE:</div>')
+        body.append(_kw_tags([(k, "") for k in group], "missing", max_kw))
+        body.append('</div>')
+    if n_groups > 3:
+        rest = []
+        for gi, group in enumerate(need[3:], start=4):
+            rest.append('<div class="and-op">AND</div>')
+            rest.append(f'<div class="and-group"><div class="and-group-label">Box {gi} — pick any ONE:</div>')
+            rest.append(_kw_tags([(k, "") for k in group], "missing", max_kw))
+            rest.append('</div>')
+        body.append(
+            f'<div class="kw-more kw-more-block" hidden>{"".join(rest)}</div>'
+            f'<button type="button" class="kw-toggle" data-all="Show all {n_groups} boxes" '
+            f'data-few="Show fewer boxes">Show all {n_groups} boxes</button>'
+        )
+    body.append('</div>')
 
 
 def render_results(report: list[dict], paper: Paper, meta: dict, ms: float) -> str:
@@ -440,17 +514,81 @@ def render_results(report: list[dict], paper: Paper, meta: dict, ms: float) -> s
                 body.append(_kw_tags(hits, "hit", r["max_kw"]))
             body.append("</div>")
         if near:
-            body.append('<div class="block"><h4>Near misses — add any of these keywords to qualify</h4>')
-            for bno, misses, n_hit in near:
-                body.append(f'<div class="muted-text" style="margin:4px 0 2px">block {bno}: '
-                            f'{n_hit} keyword(s) already hit</div>')
-                body.append(_kw_tags(misses, "missing", r["max_kw"]))
+            body.append('<div class="block"><h4>How to qualify this SDG</h4>')
+            first, *rest = near
+            bno, first_hits, cost, need = first
+            word = "keyword" if cost == 1 else "keywords"
+            body.append(f'<div class="status-line">Your text is <b>{cost} {word}</b> short of '
+                        f'qualifying for <b>SDG {r["sdg"]} — {escape(sdg_name(r["sdg"]))}</b>.</div>')
+            body.append('<div class="fastest">')
+            body.append(f'<div class="fastest-head">⚡ Fastest — add {cost} {word} '
+                        f'(pick any one from each box):</div>')
+            _need_chain(body, need, r["max_kw"])
+            body.append('<div class="min-hint">1 keyword from each box = the SDG qualifies. '
+                        'Click a chip to add it to your Keywords field.</div>')
+            body.append('<div class="have-line"><b>Already in your text:</b> ')
+            if not first_hits:
+                body.append('<span class="none">none yet</span>')
+            else:
+                body.append(_kw_tags(first_hits, "hit", r["max_kw"]))
+            body.append('</div></div>')
+            if rest:
+                alts = []
+                for ai, (_, _, c, nd) in enumerate(rest, start=2):
+                    w = "keyword" if c == 1 else "keywords"
+                    alts.append(f'<div class="way-head">Way {ai} — add {c} {w}:</div>')
+                    _need_chain(alts, nd, r["max_kw"])
+                body.append(
+                    f'<div class="kw-more kw-more-block" hidden>{"".join(alts)}</div>'
+                    f'<button type="button" class="kw-toggle" '
+                    f'data-all="Show {len(rest)} other ways to qualify" data-few="Hide other ways">'
+                    f'Show {len(rest)} other ways to qualify</button>'
+                )
             if r["near_total"] > len(near):
-                body.append(f'<div class="muted-text">… {r["near_total"] - len(near)} more near-miss blocks not shown</div>')
+                body.append(f'<div class="muted-text">… {r["near_total"] - len(near)} more ways not shown</div>')
             body.append("</div>")
         if ex:
-            body.append('<div class="block"><h4>Excluded terms found in the text (can disqualify a match)</h4>')
+            body.append('<div class="block"><h4>Excluded terms that blocked a near match — remove them from the text to qualify</h4>')
             body.append(_kw_tags([(k, "") for k in ex], "ex", r["max_kw"]))
+            body.append("</div>")
+        if r.get("suggestions"):
+            heading = ("Best-fit keywords to add (click to copy)"
+                       if not matched else
+                       "Related keywords from this SDG — best fit to your text (click to copy)")
+            body.append(f'<div class="block"><h4>{heading}</h4>')
+            if not matched:
+                body.append('<div class="sug-legend">'
+                            '<span class="sug-badge solo">✓ alone</span> qualifies by itself · '
+                            '<span class="sug-badge more">+N</span> still needs N more keyword(s) · '
+                            '<span class="sug-badge block">⚠ blocked</span> excluded term — adding it blocks a match'
+                            '</div>')
+            body.append('<div class="sug-row">')
+            solo, extra = r.get("solo", set()), r.get("extra", {})
+            for s in r["suggestions"][: min(r["max_kw"], 10)]:
+                kw = s["keyword"]
+                if s["excluded"]:
+                    badge = ('<span class="sug-badge block" title="also an excluded (NOT) term in this SDG — '
+                             'adding it can block a match">⚠ blocked</span>')
+                elif not matched and kw in solo:
+                    badge = '<span class="sug-badge solo" title="this keyword alone qualifies the SDG">✓ alone</span>'
+                elif not matched:
+                    n = extra.get(kw)
+                    if n is not None:
+                        badge = (f'<span class="sug-badge more" title="still needs {n} more keyword(s) — '
+                                 f'see the near-miss boxes above">+{n} more</span>')
+                    else:
+                        badge = ('<span class="sug-badge more" title="does not qualify by itself — '
+                                 'see the near-miss boxes above">+ more</span>')
+                else:
+                    badge = ""
+                body.append(
+                    f'<button type="button" class="kw sug" data-kw="{escape(kw)}" '
+                    f'title="add to Keywords field &amp; copy">{escape(kw)}'
+                    f'<span class="score">{s["score"]}%</span>{badge}</button>'
+                )
+            body.append('</div>')
+            body.append(f'<div class="muted-text">Auto-ranked by word overlap with your text — no AI. '
+                        f'Open the <b>Advanced</b> tab for the full SDG {r["sdg"]} keyword list.</div>')
             body.append("</div>")
 
         cards.append(f'''
@@ -474,7 +612,12 @@ def render_results(report: list[dict], paper: Paper, meta: dict, ms: float) -> s
   <div class="papertext">{highlight(text, all_terms)}</div>
 </div>'''
 
-    return (f'<div id="results-inner"><h2 class="section">Results</h2>{info_html}{stat}{chips_html}'
+    explainer = ('<details class="card explainer"><summary>How SDG matching works (30 seconds)</summary>'
+                 '<p>Each SDG is made of several <b>keyword paths</b>. A paper qualifies for an SDG as soon as '
+                 '<b>one full path</b> is present in its text. For every SDG you are close to, we show the '
+                 '<b>shortest missing path</b> first: pick <b>one keyword from each box</b> and the SDG qualifies. '
+                 'Click any suggested keyword to add it to your Keywords field (it is copied to the clipboard too).</p></details>')
+    return (f'<div id="results-inner"><h2 class="section">Results</h2>{info_html}{stat}{chips_html}{explainer}'
             f'<div id="cards">{"".join(cards)}</div>{hl}</div>')
 
 
@@ -600,30 +743,49 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, b"not found", "text/plain")
 
     def do_POST(self):
-        if urlparse(self.path).path != "/match":
-            self._send(404, b"not found", "text/plain")
-            return
+        path = urlparse(self.path).path
         try:
             fields, files = self._read_form()
-            paper = meta = None
-            # 1) separate form fields win if any are filled in
-            form = {k: fields.get(k, "").strip() for k in
-                    ("title", "abstract", "keywords", "authors", "year", "journal", "doi")}
-            if any(form.values()):
-                paper, meta = paper_from_fields(form)
-            else:
-                # 2) raw pasted text, 3) uploaded file
-                text = fields.get("paper", "")
-                if not text:
-                    for fname in ("file", "paper"):  # accept uploads under either name
-                        if fname in files:
-                            text = files[fname].decode("utf-8", "replace")
-                            break
-                if not text.strip():
-                    self._send(200, error_box("No paper entered — fill in the form (Title / Abstract / Keywords), paste raw text, or upload a file.").encode())
+            # POST /api/keywords — full keyword list of one SDG scored against
+            # the paper (Advanced tab; deterministic, no LLM).
+            if path == "/api/keywords":
+                sdg = fields.get("sdg", "10").strip()
+                blocks = None
+                for s, bl in get_queries():
+                    if s == sdg:
+                        blocks = bl
+                        break
+                if blocks is None:
+                    self._send_json(400, {"error": f"unknown sdg {sdg}"})
                     return
-                paper, meta = parse_paper_text(text)
-            top = min(max(int(fields.get("top", "3") or 3), 1), 20)
+                paper, _meta = self._build_paper(fields, files)
+                if paper is None:
+                    self._send_json(400, {"error": "No paper entered"})
+                    return
+                present: set[str] = set()
+                for b in blocks:
+                    hits, _m, _e = scan_with_fields(b, paper)
+                    present.update(kw for kw, _f in hits)
+                inc, exc = sdg_dict(sdg, blocks)
+                limit = min(max(int(fields.get("limit", "300") or 300), 1), 2000)
+                scored = score_keywords(paper.lowered(""), inc, exc, present, limit)
+                self._send_json(200, {
+                    "sdg": sdg,
+                    "sdg_name": sdg_name(sdg),
+                    "total": len(inc),
+                    "present": len([k for k in scored if k["present"]]),
+                    "limit": limit,
+                    "keywords": scored,
+                })
+                return
+            if path != "/match":
+                self._send(404, b"not found", "text/plain")
+                return
+            paper, meta = self._build_paper(fields, files)
+            if paper is None:
+                self._send(200, error_box("No paper entered — fill in the form (Title / Abstract / Keywords), paste raw text, or upload a file.").encode())
+                return
+            top = min(max(int(fields.get("top", "3") or 3), 1), 30)
             max_kw = min(max(int(fields.get("maxkw", "10") or 10), 1), 50)
             t0 = time.perf_counter()
             report = match_paper(paper, top, max_kw)
@@ -633,6 +795,22 @@ class Handler(BaseHTTPRequestHandler):
                        extra_headers={"X-Processing-Time": f"{ms:.1f} ms"})
         except Exception as e:  # noqa: BLE001 — surface any failure to the UI
             self._send(200, error_box(f"Matching failed: {e}").encode())
+
+    def _build_paper(self, fields, files):
+        """(paper, meta) or (None, None) when no paper was entered."""
+        form = {k: fields.get(k, "").strip() for k in
+                ("title", "abstract", "keywords", "authors", "year", "journal", "doi")}
+        if any(form.values()):
+            return paper_from_fields(form)
+        text = fields.get("paper", "")
+        if not text:
+            for fname in ("file", "paper"):  # accept uploads under either name
+                if fname in files:
+                    text = files[fname].decode("utf-8", "replace")
+                    break
+        if not text.strip():
+            return None, None
+        return parse_paper_text(text)
 
     def log_message(self, fmt, *args):
         sys.stderr.write("[web] %s\n" % (fmt % args))

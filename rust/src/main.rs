@@ -211,39 +211,101 @@ fn cmd_match(args: &[String]) -> Result<(), String> {
         .unwrap_or_else(|| Path::new(&path).file_name().map_or(path.clone(), |n| n.to_string_lossy().into_owned()));
     println!("Paper: {title}\n");
 
-    let mut queries = load_queries(Path::new(&dir))?;
-    // Precompile every keyword once into a dense table and resolve each
-    // leaf to its pattern index; scanning is then read-only.
-    let table = matcher::compile_all(queries.iter().flat_map(|q| q.blocks.iter()));
-    let mut nslots = 0u32;
-    for q in &mut queries {
-        matcher::resolve_blocks(&mut q.blocks, &table, &mut nslots);
-    }
+    let qdir = Path::new(&dir);
+    // Boot cache: parsed+resolved ASTs, patterns, flats and pretokenized
+    // dicts are persisted in sdg_cache.bin and validated by query mtimes, so
+    // every CLI invocation skips the Scopus-file parse and the ~70-80 ms
+    // keyword recompile.
+    let (mut queries, table, flats) = match sdg_tools::cache::read_cached(qdir) {
+        Some(data) => {
+            matcher::rebuild_first_quads(data.patterns);
+            (data.queries, data.patterns, data.flats)
+        }
+        None => {
+            let mut queries = load_queries(qdir)?;
+            // Precompile every keyword once into a dense table and resolve
+            // each leaf to its pattern index; scanning is then read-only.
+            let table = matcher::compile_all(queries.iter().flat_map(|q| q.blocks.iter()));
+            let mut nslots = 0u32;
+            for q in &mut queries {
+                matcher::resolve_blocks(&mut q.blocks, &table, &mut nslots);
+            }
+            // Flatten every block to a postfix program (min-add runs on the
+            // flat program with SoA stacks - cache-friendly, no per-node
+            // allocations).
+            let flats: Vec<Vec<matcher::FlatBlock>> = queries
+                .iter()
+                .map(|q| q.blocks.iter().map(|b| matcher::flatten_block(b, &table)).collect())
+                .collect();
+            let dicts: Vec<matcher::SdgDict> =
+                queries.iter().map(|q| matcher::collect_sdg_dict(&q.blocks)).collect();
+            if let Err(e) = sdg_tools::cache::write_cache(
+                qdir,
+                matcher::blob_slice(),
+                &queries,
+                &table,
+                &flats,
+                &dicts,
+            ) {
+                eprintln!("[sdg_tools] warning: could not write boot cache: {e}");
+            }
+            let table: &'static [matcher::Pattern] = Box::leak(table.into_boxed_slice());
+            (queries, table, flats)
+        }
+    };
 
     // One shared memo for the whole scan: buffers are indexed once and each
     // distinct (pattern, field-mask) is searched once. Without this the CLI
     // rebuilt a TextIndex and re-evaluated every term for every block, which
     // is ~60x slower on large papers.
-    let mut memo = matcher::Memo::new(&paper, nslots);
+    let mut memo = matcher::Memo::new(&paper, 0); // 0 -> memo grows on demand
+    let mut mscr = matcher::MinAddScratch::default();
 
-    for q in &queries {
+    for (qi, q) in queries.iter().enumerate() {
         println!("=== SDG {} ===", q.sdg);
-        let mut matched: Vec<(usize, Vec<std::sync::Arc<str>>)> = Vec::new();
-        let mut near: Vec<(usize, Vec<std::sync::Arc<str>>, usize, usize)> = Vec::new();
-        let mut excluded_hits: Vec<std::sync::Arc<str>> = Vec::new();
+        let mut matched: Vec<(usize, Vec<&'static str>)> = Vec::new();
+        // (block_no, keywords already hit, min keywords to add, need groups)
+        let mut near: Vec<(usize, usize, usize, Vec<Vec<&'static str>>)> = Vec::new();
+        let mut disqualified: Vec<&'static str> = Vec::new();
 
         for (bno, block) in q.blocks.iter().enumerate() {
             let (scan, is_match) = matcher::scan_block_shared(block, &paper, &table, &mut memo);
-            excluded_hits.extend(scan.excluded_hits.iter().cloned());
             let n_hit = scan.hits.len();
-            let n_miss = scan.misses.len();
             if is_match {
                 matched.push((bno, scan.hits));
             } else {
-                near.push((bno, scan.misses, n_hit, n_miss));
+                // Exact minimum keywords to add (no LLM): a block whose
+                // required-path NOT is already true cannot qualify by adding
+                // keywords -> report its excluded terms instead. Cost-only
+                // flat pass: sequential, zero-allocation.
+                let (_, cost) = matcher::min_add_flat_cost(&flats[qi][bno], &table, &mut memo, &mut mscr);
+                if cost == matcher::INF_COST as u32 {
+                    // Only report excluded terms when the positive side alone
+                    // would have matched - i.e. the NOT genuinely blocked a
+                    // near-qualifying block (off-topic blocks are dropped).
+                    if matcher::eval_ignore_not_block(block, &table, &mut memo) {
+                        disqualified.extend(scan.excluded_hits.iter().cloned());
+                    }
+                } else {
+                    near.push((bno, n_hit, cost as usize, Vec::new()));
+                }
             }
         }
-        near.sort_by_key(|x| x.1.len());
+        // Rerank by fewest keywords to add, then most keywords already hit.
+        near.sort_by(|a, b| {
+            a.2.cmp(&b.2)
+                .then_with(|| b.1.cmp(&a.1))
+                .then_with(|| need_total(&a.3).cmp(&need_total(&b.3)))
+        });
+        // Materialize the missing-tag groups only for the displayed blocks.
+        let near_shown: Vec<(usize, usize, usize, Vec<Vec<&'static str>>)> = near
+            .into_iter()
+            .take(top)
+            .map(|(bno, n_hit, cost, _)| {
+                let ma = matcher::min_add_flat(&flats[qi][bno], &table, &mut memo, &mut mscr);
+                (bno, n_hit, cost, ma.need)
+            })
+            .collect();
 
         if matched.is_empty() {
             println!("  MATCHED  none");
@@ -260,29 +322,43 @@ fn cmd_match(args: &[String]) -> Result<(), String> {
             }
         }
 
-        if near.is_empty() {
+        if near_shown.is_empty() {
             println!("  NEAR MISSES none");
         } else {
-            println!("  NEAR MISSES (missing keywords -> add any of these to qualify):");
-            for (bno, misses, n_hit, n_miss) in near.iter().take(top) {
-                let shown: Vec<&str> = misses.iter().take(max_kw).map(AsRef::<str>::as_ref).collect();
-                let more = n_miss - shown.len();
-                println!(
-                    "    block {bno}: {n_hit} hit, missing {n_miss} of {}: {}{}",
-                    n_hit + n_miss,
-                    shown.join(", "),
-                    if more > 0 { " ..." } else { "" }
+            println!("  NEAR MISSES (add any 1 keyword from each group to qualify):");
+            for (bno, n_hit, cost, need) in near_shown.iter() {
+                let mut shown: Vec<String> = Vec::new();
+                for g in need.iter().take(3) {
+                    shown.extend(g.iter().take(max_kw).map(AsRef::<str>::as_ref).map(String::from));
+                }
+                let n_groups = need.len();
+                let more_groups = n_groups.saturating_sub(3);
+                let mut line = format!(
+                    "    block {bno}: {n_hit} hit, add {cost} keyword(s) from {n_groups} group(s): {}",
+                    shown.join(", ")
                 );
+                if more_groups > 0 {
+                    line.push_str(&format!(" ... +{more_groups} more group(s)"));
+                }
+                println!("{line}");
             }
         }
 
-        if !excluded_hits.is_empty() {
-            let mut u: Vec<&str> = excluded_hits.iter().map(AsRef::<str>::as_ref).collect();
+        if !disqualified.is_empty() {
+            let mut u: Vec<&str> = disqualified.iter().map(AsRef::<str>::as_ref).collect();
             u.sort_unstable();
             u.dedup();
-            println!("  EXCLUDED terms found in text (can disqualify a match): {}", u.join(", "));
+            println!(
+                "  DISQUALIFIED by excluded term(s) in text (remove them to qualify): {}",
+                u.join(", ")
+            );
         }
         println!();
     }
     Ok(())
+}
+
+/// Total candidate keywords across a near-miss block's need groups.
+fn need_total(need: &[Vec<&'static str>]) -> usize {
+    need.iter().map(|g| g.len()).sum()
 }

@@ -1,4 +1,4 @@
-:root { --bg:#f4f6fa; --card:#fff; --ink:#1c2333; --muted:#68718a; --line:#e3e8f2; }
+:root { --bg:#f4f6fa; --card:#fff; --ink:#1c2333; --muted:#68718a; --line:#e3e8f2; --accent:#19486A; }
 * { box-sizing:border-box; }
 body { margin:0; font-family:ui-sans-serif,system-ui,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
        background:var(--bg); color:var(--ink); line-height:1.5; }
@@ -85,6 +85,46 @@ h2.section { font-size:17px; margin:0 0 12px; display:flex; align-items:center; 
 .badge.ok { background:#e8f5e9; color:#1b5e20; }
 .badge.miss { background:#fff8e1; color:#8a6d00; }
 .badge.ex { background:#fdecea; color:#b71c1c; }
+.badge.min { background:#1b7f3a; color:#fff; }
+
+/* Near-miss blocks: visual AND clause (group boxes joined by AND) */
+.nb-head { font-weight:600; margin:10px 0 4px; font-size:13px; }
+.and-chain { display:flex; flex-wrap:wrap; align-items:stretch; gap:6px; margin:6px 0; }
+.and-group {
+  border:1.5px dashed #c8a24a; background:#fffbf0; border-radius:8px;
+  padding:6px 8px; min-width:170px; flex:1 1 220px;
+}
+.and-group-label { font-size:11px; color:#8a6d1a; margin-bottom:4px; font-weight:600; }
+.and-op {
+  align-self:center; font-size:12px; font-weight:800; color:#b06a00;
+  background:#ffe8c2; border:1px solid #f0c77a; border-radius:10px; padding:2px 9px;
+}
+.min-hint { font-size:12px; color:#1b7f3a; margin:2px 0 10px; font-weight:600; }
+
+/* "How to qualify this SDG" explainer (plain-language near-miss panel) */
+.status-line { font-size:13.5px; margin:6px 0 8px; }
+.fastest {
+  border:1.5px solid #8fc98f; background:#f2faf2; border-radius:8px;
+  padding:8px 10px; margin:6px 0;
+}
+.fastest-head { font-size:13px; font-weight:700; color:#1b5e20; margin-bottom:4px; }
+.fastest .and-group { border-color:#9bcb9b; background:#ffffff; }
+.fastest .and-group-label { color:#2e7d32; }
+.have-line { font-size:12.5px; margin:8px 0 4px; }
+.way-head { font-size:12.5px; font-weight:700; margin:10px 0 2px; color:#555; }
+details.explainer summary { cursor:pointer; font-size:12.5px; color:var(--accent); font-weight:600; }
+details.explainer p { margin:6px 0 0; font-size:13px; line-height:1.5; }
+
+/* Best-fit suggestion chips: per-chip qualification badges */
+.sug-legend { font-size:11.5px; color:var(--muted); margin:2px 0 8px; }
+.sug-badge {
+  display:inline-block; border-radius:9px; padding:0 6px; font-size:10.5px;
+  line-height:1.6; margin-left:2px; white-space:nowrap;
+}
+.sug-badge.solo { background:#d9f2d9; color:#1b7f3a; border:1px solid #8fc98f; }
+.sug-badge.more { background:#fff3d6; color:#9a6b00; border:1px solid #e6c37a; }
+.sug-badge.block { background:#fde2e2; color:#b3261e; border:1px solid #e5a0a0; }
+button.kw.sug.blocked { border-color:#e5a0a0; background:#fdf0f0; }
 .sdg-body { padding:4px 18px 16px; border-top:1px solid var(--line); }
 .block { margin-top:12px; }
 .block h4 { margin:0 0 4px; font-size:12.5px; text-transform:uppercase; letter-spacing:.4px; color:var(--muted); }
@@ -117,3 +157,47 @@ footer a:hover { text-decoration:underline; }
 .legend-item { display:flex; align-items:center; gap:8px; }
 .legend-item .dot { width:10px; height:10px; border-radius:50%; flex:none; }
 .legend-item b { min-width:20px; }
+
+/* "Show all N" keyword / group toggle (server-rendered, app.js handler) */
+/* NB: the `hidden` attribute must win over the display rules below, so the
+   collapsed list really starts hidden and the button really toggles it. */
+.kw-more[hidden], .kw-more-block[hidden] { display:none !important; }
+.kw-more { display:inline; }
+.kw-more-block { display:block; }
+.kw-toggle {
+  display:inline-block; margin:2px 3px 2px 4px; padding:1.5px 9px;
+  background:#fff; border:1px solid var(--line); border-radius:6px;
+  color:var(--accent); font-size:12px; cursor:pointer; line-height:1.5;
+}
+.kw-toggle:hover { background:#f0f4ff; border-color:var(--accent); }
+.kw-toggle:focus-visible { outline:2px solid var(--accent); outline-offset:1px; }
+
+/* ---- Advanced tab (keyword browser) + suggestion chips ---- */
+.adv-bar { display:flex; flex-wrap:wrap; gap:10px; align-items:flex-end; margin-bottom:6px; }
+.adv-bar .small { display:flex; flex-direction:column; gap:3px; font-size:12.5px; color:var(--muted); }
+.adv-bar select, .adv-bar input[type="search"] {
+  padding:5px 8px; border:1px solid var(--line); border-radius:6px; background:#fff;
+  font-size:13px; color:var(--ink); min-height:30px;
+}
+.adv-bar select:focus, .adv-bar input[type="search"]:focus { outline:2px solid var(--accent); outline-offset:1px; }
+.adv-list { display:flex; flex-wrap:wrap; gap:4px; margin:8px 0; }
+
+button.kw.sug {
+  display:inline-flex; align-items:center; gap:6px; cursor:pointer;
+  background:#eef6ff; border:1px solid #c8ddf5; border-radius:6px;
+  padding:3px 8px; margin:2px 3px 2px 0; font-size:12px;
+  font-family:ui-monospace,Menlo,monospace; color:var(--ink);
+}
+button.kw.sug:hover { border-color:var(--accent); background:#e2efff; }
+button.kw.sug.copied { background:#d9f2d9; border-color:#8fc98f; }
+.sug-row { display:flex; flex-wrap:wrap; gap:4px; }
+.kw .score {
+  font-size:10.5px; color:#2a6fb0; background:#dcebfb; border-radius:9px;
+  padding:0 5px; line-height:1.5; font-family:inherit;
+}
+button.kw.sug.copied .score { background:#b9e3b9; color:#256b25; }
+.flag { font-size:11px; line-height:1; }
+.flag.ok { color:#2a9d2a; }
+.flag.warn { color:#c98400; }
+
+select { background:#fff; }

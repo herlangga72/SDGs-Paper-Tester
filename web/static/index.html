@@ -12,16 +12,15 @@
     <div class="logo">SDG</div>
     <div>
       <h1>SDG Paper Matcher</h1>
-      <p>Check a paper's title / abstract / keywords against the Scopus SDG queries — matched, near-missed, or excluded.</p>
+      <p>Check a paper's title / abstract / keywords against the Scopus SDG queries — matched, near-missed, or excluded — and find the exact keyword that unlocks a target SDG.</p>
     </div>
   </header>
 
   <div class="card form-card">
     <div class="tabs">
       <span class="tab active" data-tab="form" onclick="switchTab('form')">✎ Form</span>
-      <span class="tab" data-tab="paste" onclick="switchTab('paste')">⌨ Paste</span>
       <span class="tab" data-tab="samples" onclick="switchTab('samples')">☰ Samples</span>
-      <span class="tab" data-tab="upload" onclick="switchTab('upload')">⇪ Upload</span>
+      <span class="tab" data-tab="advanced" onclick="switchTab('advanced')">🔎 Advanced</span>
     </div>
 
     <div id="tab-form" class="tab-body">
@@ -57,33 +56,36 @@
       <p class="hint">Only <b>Title</b>, <b>Abstract</b> and <b>Keywords</b> are searched by the SDG queries; the rest is metadata shown in the report header. The DOI fetch uses the Crossref API (needs internet) and fills whatever the publisher provides — abstract &amp; keywords are included when available, otherwise add them yourself.</p>
     </div>
 
-    <div id="tab-paste" class="tab-body" hidden>
-      <textarea id="paper" name="paper" spellcheck="false" placeholder="---
-title: &quot;My paper&quot;
-abstract: |
-  The abstract text...
-keywords: [keyword one, keyword two]
----"></textarea>
-      <p class="hint">Markdown with YAML frontmatter: <b>title</b>, <b>abstract</b>, <b>keywords</b>. Press <kbd>Ctrl</kbd>+<kbd>Enter</kbd> to match.</p>
-    </div>
-
     <div id="tab-samples" class="tab-body" hidden>
       <div class="sample-grid" id="sample-grid"></div>
       <p class="hint">Click a sample to load it into the editor, then hit <b>Match SDGs</b>.</p>
     </div>
 
-    <div id="tab-upload" class="tab-body" hidden>
-      <label class="upload-box" for="file">
-        <span class="upload-icon">⇪</span>
-        <span>Choose a .md / .txt paper file</span>
-      </label>
-      <input id="file" type="file" accept=".md,.txt,.markdown" hidden>
-      <p class="hint">The file is read locally and sent only to this local server.</p>
+    <div id="tab-advanced" class="tab-body" hidden>
+      <div class="adv-bar">
+        <label class="small">SDG
+          <select id="adv-sdg" onchange="loadAdvanced()"></select>
+        </label>
+        <label class="small">Sort
+          <select id="adv-sort" onchange="renderAdvanced()">
+            <option value="score">Best fit</option>
+            <option value="az">A–Z</option>
+          </select>
+        </label>
+        <label class="small">Search
+          <input id="adv-search" type="search" placeholder="filter keywords…" oninput="renderAdvanced()" style="width:180px">
+        </label>
+        <button class="ghost" onclick="loadAdvanced()">↻ Refresh</button>
+      </div>
+      <p class="hint">Scores <b>every</b> keyword of the chosen SDG against the paper in the <b>Form</b> tab (title + abstract + keywords) by word overlap — pure math, no AI. A paper qualifies for an SDG as soon as <b>one</b> keyword is present. <b>✓</b> = already in your text, <b>⚠</b> = also an excluded term in this SDG. Click a keyword to add it to the Keywords field and copy it.</p>
+      <div id="adv-status" class="muted-text"></div>
+      <div id="adv-list" class="adv-list"></div>
+      <button class="ghost" id="adv-more" onclick="showMoreAdvanced()" hidden>Show more keywords</button>
     </div>
 
     <div class="row">
       <label class="small">near-misses per SDG
-        <input id="top" type="number" min="1" max="20" value="3" style="width:64px">
+        <input id="top" type="number" min="1" max="30" value="30" style="width:64px">
       </label>
       <label class="small">max keywords
         <input id="maxkw" type="number" min="1" max="50" value="10" style="width:70px">

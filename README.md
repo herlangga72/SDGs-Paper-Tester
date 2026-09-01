@@ -79,9 +79,16 @@ The legacy Python server still works if you prefer it:
   `citation_keywords` meta tag, or the publisher's Keywords block), because
   the Scopus SDG queries also search author keywords.
 - **Per-SDG report**: matched query blocks with the keywords that hit (and
-  the field Scopus looks at), near-miss blocks with the exact keywords to
-  add, excluded terms found in the text, and all matched keywords
-  highlighted in the paper text.
+  the field Scopus looks at), near-miss blocks **reranked by the exact
+  minimum number of keywords needed to qualify** (deterministic AST logic,
+  no LLM) with the missing-tag groups to choose from, excluded terms that
+  genuinely blocked a near match, **best-fit keyword suggestions** (ranked
+  by word-token overlap with your text, click to copy/add), and all matched
+  keywords highlighted in the paper text.
+- **Advanced tab**: browse any SDG's full keyword list (e.g. all ~1,680
+  SDG 10 keywords), auto-scored against your paper, with search, A–Z sort,
+  "already present" and "also excluded" flags — find the one keyword that
+  unlocks a target SDG.
 - **Official UN colors** for the 17 SDGs throughout the UI.
 - **Fast SIMD matching**: case folding, substring search and whitespace
   scans run on AVX-512 (64-byte), AVX2 (32-byte) and an SSE3–SSE4.2
@@ -120,6 +127,7 @@ Step-by-step instructions: [DEPLOY.md](DEPLOY.md).
 | `GET /doi?doi=…` | Crossref lookup → JSON fields (keywords fall back to the DOI landing page) |
 | `POST /match` | form fields or `paper` text / `file` upload → HTML report |
 | `POST /api/match` | same input → JSON report (see [Web API](#web-api)) |
+| `POST /api/keywords` | form fields + `sdg` + `limit` → full keyword list of one SDG scored against the paper (Advanced tab) |
 | `GET /health` | liveness |
 
 Example (match a paper from the command line):
