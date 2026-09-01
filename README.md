@@ -79,12 +79,23 @@ The legacy Python server still works if you prefer it:
   `citation_keywords` meta tag, or the publisher's Keywords block), because
   the Scopus SDG queries also search author keywords.
 - **Per-SDG report**: matched query blocks with the keywords that hit (and
-  the field Scopus looks at), near-miss blocks **reranked by the exact
-  minimum number of keywords needed to qualify** (deterministic AST logic,
-  no LLM) with the missing-tag groups to choose from, excluded terms that
-  genuinely blocked a near match, **best-fit keyword suggestions** (ranked
-  by word-token overlap with your text, click to copy/add), and all matched
-  keywords highlighted in the paper text.
+  the field Scopus looks at), and for every near miss a **plain-language
+  "How to qualify this SDG" panel**: a status line ("your text is N
+  keyword(s) short"), the **fastest missing path** in a green callout with
+  the required keyword groups drawn as boxes joined by **AND** ("pick any
+  ONE from each box"), green **"already in your text"** chips showing your
+  progress, and the other paths collapsed behind a "show other ways"
+  toggle. A collapsible "How SDG matching works" explainer sits at the top
+  of the results. Excluded terms that genuinely blocked a near match are
+  listed separately, and all matched keywords are highlighted in the paper
+  text.
+- **Best-fit keyword suggestions** (ranked by word-token overlap with your
+  text, click to copy/add) that no longer over-promise: every chip carries
+  a badge — green **✓ alone** (this keyword alone qualifies the SDG),
+  amber **+N more** (still needs N more keywords — see the near-miss
+  boxes), or red **⚠ blocked** (an excluded/NOT term — adding it blocks a
+  match). The badge is computed from the exact min-add logic, so "any one
+  qualifies" is only shown when it is actually true.
 - **Advanced tab**: browse any SDG's full keyword list (e.g. all ~1,680
   SDG 10 keywords), auto-scored against your paper, with search, A–Z sort,
   "already present" and "also excluded" flags — find the one keyword that
@@ -97,8 +108,11 @@ The legacy Python server still works if you prefer it:
   memoization skip most searches, so a paper matches in ~15–50 ms locally —
   ~30× faster than the original Python server.
 - **`POST /api/match`**: the same form fields return a machine-readable
-  JSON report (`{ms, sdgs: [{sdg, matched, near, near_total, excluded}]}`)
-  for scripts and batch use.
+  JSON report (`{ms, sdgs: [{sdg, matched, near, near_total, excluded,
+  suggestions: [{keyword, score, excluded, qualifies_alone,
+  extra_needed}]}]}`) for scripts and batch use — each suggestion says
+  whether it qualifies the SDG by itself and how many more keywords it
+  still needs.
 - **Gzip responses**: HTML/JSON are compressed when the client sends
   `Accept-Encoding: gzip`.
 - Matching semantics identical to Scopus: `NOT > AND/W-n > OR` precedence,
