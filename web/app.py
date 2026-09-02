@@ -48,15 +48,20 @@ Endpoints:
 from __future__ import annotations
 
 import argparse
+import datetime
 import html
 import json
+import os
 import re
+import secrets
 import sys
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 import webbrowser
 from email import policy
 from email.parser import BytesParser
@@ -170,11 +175,11 @@ def _record_request(method: str, path: str, status: int, ms: float) -> None:
 
 
 def stats_payload() -> dict:
-    """GET /api/stats — cumulative usage counters + uptime, as JSON."""
+    """GET /api/stats — cumulative usage counters + unique users + uptime."""
     if not _STATS_LOADED:
         _load_stats()
     with _STATS_LOCK:
-        return {"total": _STATS["total"], "pages": _STATS["pages"],
+        base = {"total": _STATS["total"], "pages": _STATS["pages"],
                 "match_html": _STATS["match_html"],
                 "api_match": _STATS["api_match"],
                 "api_keywords": _STATS["api_keywords"],
@@ -182,6 +187,209 @@ def stats_payload() -> dict:
                 "not_found": _STATS["not_found"],
                 "booted_at": _STATS["booted_at"],
                 "uptime_s": round(time.time() - _BOOT_TIME, 1)}
+    base.update(_user_stats())
+    return base
+
+
+# --------------------------------------------------------------------------
+# Unique-user tracking (anonymous uid cookie) — Python mirror of web.rs
+#
+# A page load without a `uid` cookie receives one (32 hex chars, HttpOnly,
+# SameSite=Lax, ~6 months) and is added to engine/data/visitors.json, which
+# maps uid -> last-seen epoch ms. Distinct-user counts for any window are
+# derived from last-seen, so no per-day sets are needed. No IPs, no personal
+# data; only full page loads mint cookies. Standard library only.
+# --------------------------------------------------------------------------
+
+_VISITORS_FILE = ROOT / "engine" / "data" / "visitors.json"
+_VISITORS_LOCK = threading.Lock()
+_VISITORS: dict[str, int] = {}
+_VISITORS_LOADED = False
+
+
+def _load_visitors() -> None:
+    """Resume the uid -> last-seen map saved by a previous run."""
+    global _VISITORS_LOADED
+    with _VISITORS_LOCK:
+        try:
+            data = json.loads(_VISITORS_FILE.read_text(encoding="utf-8"))
+            for uid, last in (data.get("users") or {}).items():
+                try:
+                    ms = int(last)
+                except (TypeError, ValueError):
+                    continue
+                if len(uid) == 32 and all(c in "0123456789abcdef" for c in uid.lower()):
+                    _VISITORS[uid] = ms
+        except Exception:  # noqa: BLE001 — first run / corrupt file: start empty
+            pass
+        _VISITORS_LOADED = True
+
+
+def _save_visitors() -> None:
+    with _VISITORS_LOCK:
+        if len(_VISITORS) > 100_000:  # bound the file: prune idle > 180 days
+            cutoff = int(time.time() * 1000) - 180 * 86_400_000
+            for uid in [u for u, last in _VISITORS.items() if last < cutoff]:
+                del _VISITORS[uid]
+        data = {"users": _VISITORS}
+    try:
+        _VISITORS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _VISITORS_FILE.write_text(json.dumps(data), encoding="utf-8")
+    except Exception:  # noqa: BLE001 — logging must never break a request
+        pass
+
+
+def _cookie_uid(headers) -> str | None:
+    cookie = headers.get("Cookie", "") if headers else ""
+    for part in cookie.split(";"):
+        part = part.strip()
+        if part.startswith("uid="):
+            value = part[4:].strip()
+            if len(value) == 32 and all(c in "0123456789abcdef" for c in value.lower()):
+                return value
+    return None
+
+
+def _track_page_user(handler) -> str | None:
+    """Mint/refresh the uid on a page load; return a Set-Cookie header or None."""
+    if not _VISITORS_LOADED:
+        _load_visitors()
+    uid = _cookie_uid(handler.headers)
+    set_cookie = None
+    if uid is None:
+        uid = secrets.token_hex(16)
+        set_cookie = f"uid={uid}; Path=/; Max-Age=15552000; HttpOnly; SameSite=Lax"
+    now = int(time.time() * 1000)
+    with _VISITORS_LOCK:
+        is_new = uid not in _VISITORS
+        _VISITORS[uid] = now
+    if is_new:
+        _save_visitors()  # new users persist immediately
+    elif len(_VISITORS) % 256 == 0:
+        _save_visitors()  # periodic last-seen refresh
+    return set_cookie
+
+
+def _user_stats() -> dict:
+    if not _VISITORS_LOADED:
+        _load_visitors()
+    today = int(time.time() * 1000) // 86_400_000
+    d1 = d7 = d30 = 0
+    with _VISITORS_LOCK:
+        for last in _VISITORS.values():
+            day = last // 86_400_000
+            if day == today:
+                d1 += 1
+            if day + 6 >= today:
+                d7 += 1
+            if day + 29 >= today:
+                d30 += 1
+        total = len(_VISITORS)
+    return {"users_total": total, "users_today": d1, "users_7d": d7, "users_30d": d30}
+
+
+# --------------------------------------------------------------------------
+# Error reporting (Sentry, optional) — Python mirror of web.rs
+#
+# Reads SENTRY_DSN from the environment. When set, boot events, unhandled
+# handler exceptions and WSGI adapter failures are forwarded to the store
+# over the envelope API with urllib — no sentry-sdk install needed, so the
+# PythonAnywhere deploy stays standard-library only. When unset, everything
+# below is a no-op. Standard library only.
+# --------------------------------------------------------------------------
+
+_SENTRY_DSN = os.environ.get("SENTRY_DSN", "").strip()
+_SENTRY_SDK = {"name": "sdg-tools-web-py", "version": "2.0.0"}
+
+
+def _sentry_target() -> tuple[str, str] | None:
+    """(dsn, envelope ingest url) when SENTRY_DSN looks valid, else None."""
+    if not _SENTRY_DSN:
+        return None
+    try:
+        parsed = urllib.parse.urlsplit(_SENTRY_DSN)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            return None
+        host = parsed.netloc.rsplit("@", 1)[-1]
+        project = (parsed.path or "").strip("/").split("/")[-1]
+        if not host or not project:
+            return None
+        return _SENTRY_DSN, f"{parsed.scheme}://{host}/api/{project}/envelope/"
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _sentry_send(dsn: str, url: str, event: dict) -> bool:
+    now = datetime.datetime.now(datetime.timezone.utc)
+    env_hdr = {"event_id": event["event_id"], "dsn": dsn,
+               "sent_at": now.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+               "sdk": _SENTRY_SDK}
+    event_json = json.dumps(event, ensure_ascii=True)
+    payload = (json.dumps(env_hdr) + "\n" +
+               json.dumps({"type": "event", "length": len(event_json)}) + "\n" +
+               event_json).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=payload, method="POST",
+        headers={"Content-Type": "application/x-sentry-envelope"})
+    with urllib.request.urlopen(req, timeout=4) as resp:
+        return resp.status == 200
+
+
+def sentry_report(level: str, logger: str, message: str,
+                  exc: BaseException | None = None,
+                  tags: dict | None = None, extra: dict | None = None) -> bool:
+    """Best-effort report; returns silently (False) when SENTRY_DSN is unset."""
+    target = _sentry_target()
+    if not target:
+        return False
+    dsn, url = target
+    now = datetime.datetime.now(datetime.timezone.utc)
+    ev = {"event_id": uuid.uuid4().hex,
+          "timestamp": now.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+          "platform": "python", "level": level, "logger": logger,
+          "message": {"formatted": message},
+          "environment": os.environ.get("SENTRY_ENV", "").strip() or "production"}
+    for key in ("RENDER_GIT_COMMIT", "SOURCE_VERSION", "SENTRY_RELEASE"):
+        value = os.environ.get(key, "").strip()
+        if value:
+            ev["release"] = value
+            break
+    if tags:
+        ev["tags"] = {k: str(v) for k, v in tags.items()}
+    if extra:
+        ev["extra"] = {k: (v if isinstance(v, (dict, list)) else str(v))
+                        for k, v in extra.items()}
+    if exc is not None:
+        ev["exception"] = {"values": [
+            {"type": type(exc).__name__, "value": str(exc) or repr(exc)}]}
+    try:
+        sent = _sentry_send(dsn, url, ev)
+    except Exception as e:  # noqa: BLE001 — logging must never break a request
+        sys.stderr.write(f"[sentry] {level} event send failed: {e}\n")
+        return False
+    sys.stderr.write(f"[sentry] {level} event sent ({logger})\n")
+    return sent
+
+
+_PREV_THREAD_EXCEPTHOK = threading.excepthook
+
+
+def _install_thread_excepthook() -> None:
+    """Report unhandled ThreadingHTTPServer handler-thread exceptions."""
+
+    def hook(args) -> None:  # threading.ExceptHookArgs
+        sentry_report("error", "web.thread",
+                      f"Unhandled exception in {args.thread.name}",
+                      exc=args.exc_value,
+                      extra={"traceback": "".join(traceback.format_exception(
+                          args.exc_type, args.exc_value, args.exc_traceback))})
+        try:
+            _PREV_THREAD_EXCEPTHOK(args)
+        except Exception:  # noqa: BLE001 — never break the server
+            sys.stderr.write("".join(traceback.format_exception(
+                args.exc_type, args.exc_value, args.exc_traceback)))
+
+    threading.excepthook = hook
 
 # --------------------------------------------------------------------------
 # SDG metadata (official UN short names + brand colors)
@@ -811,7 +1019,11 @@ class Handler(BaseHTTPRequestHandler):
         url = urlparse(self.path)
         if url.path in ("/", "/index.html"):
             page = (STATIC_DIR / "index.html").read_bytes()
-            self._send(200, page)
+            extra = None
+            set_cookie = _track_page_user(self)  # anonymous uid for unique users
+            if set_cookie:
+                extra = {"Set-Cookie": set_cookie}
+            self._send(200, page, extra_headers=extra)
         elif url.path.startswith("/static/"):
             name = Path(url.path[len("/static/"):]).name  # basename only, no traversal
             path = (STATIC_DIR / name).resolve()
@@ -902,6 +1114,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, html.encode(),
                        extra_headers={"X-Processing-Time": f"{ms:.1f} ms"})
         except Exception as e:  # noqa: BLE001 — surface any failure to the UI
+            sentry_report("error", "web.do_POST", f"Matching failed: {e}", exc=e,
+                          extra={"traceback": traceback.format_exc()})
             self._send(200, error_box(f"Matching failed: {e}").encode())
 
     def _build_paper(self, fields, files):
@@ -956,12 +1170,17 @@ def main() -> int:
 
     # warm the query cache so the first request isn't slow
     _load_stats()
+    _load_visitors()
     total = _STATS["total"]
     pages = _STATS["pages"]
     matches = _STATS["match_html"] + _STATS["api_match"]
     pl = lambda n: "" if n == 1 else "s"  # noqa: E731 — tiny boot-log helper
     print(f"[web] usage so far: {total} request{pl(total)}, {pages} page view{pl(pages)}, "
-          f"{matches} match{pl(matches)} (cumulative; log: logs/access.jsonl)", file=sys.stderr)
+          f"{matches} match{'es' if matches != 1 else ''} "
+          "(cumulative; log: logs/access.jsonl)", file=sys.stderr)
+    print(f"[web] {len(_VISITORS)} unique user{pl(len(_VISITORS))} on file", file=sys.stderr)
+    if _SENTRY_DSN:
+        _install_thread_excepthook()
     try:
         n = len(get_queries())
         print(f"[web] loaded {n} SDG query sets", file=sys.stderr)
@@ -971,6 +1190,10 @@ def main() -> int:
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
     url = f"http://{args.host}:{args.port}/"
     print(f"[web] SDG Paper Matcher running at {url}  (Ctrl-C to stop)")
+    if _SENTRY_DSN:
+        sentry_report("info", "web.boot", "SDG Paper Matcher started",
+                      extra={"queries": n, "addr": f"{args.host}:{args.port}",
+                             "users": len(_VISITORS)})
     if not args.no_browser:
         threading.Timer(0.4, lambda: webbrowser.open(url)).start()
     try:

@@ -29,12 +29,20 @@ report (`{ms, sdgs: [{sdg, matched, near, near_total, excluded}]}`).
 Responses are gzip-compressed when the client sends `Accept-Encoding: gzip`.
 
 **Usage stats:** `GET /api/stats` returns cumulative counters (`total`,
-`pages`, `match_html`, `api_match`, `errors`, ...). Every request is also
+`pages`, `match_html`, `api_match`, `errors`, ...) plus unique users
+(`users_total`, `users_today`, `users_7d`, `users_30d`) from an anonymous
+`uid` cookie, and the footer shows them on the page. Every request is also
 appended to `logs/access.jsonl` (JSONL, no IPs or user agents; ~4 MB
-rotation). Counters persist to `engine/data/site_stats.json` and reload at
-boot, so they survive restarts of the same instance. Render free-tier
-containers are rebuilt on every deploy, which resets the counters — treat
-them as a rough "since last deploy" figure.
+rotation). Counters persist to `engine/data/site_stats.json` and
+`engine/data/visitors.json` and reload at boot, so they survive restarts of
+the same instance. Render free-tier containers are rebuilt on every deploy,
+which resets the counters — treat them as a rough "since last deploy" figure.
+
+**Error reporting (optional):** set the `SENTRY_DSN` env var (pre-wired in
+`render.yaml`) and the servers forward boot events, 5xx responses, panics and
+unhandled exceptions to your Sentry project over the envelope API (no SDK
+install; nothing is sent while the variable is unset). The release is tagged
+from `RENDER_GIT_COMMIT` when present.
 
 ---
 

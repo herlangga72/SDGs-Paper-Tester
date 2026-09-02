@@ -235,10 +235,16 @@ async function loadSiteStats() {
     const s = await r.json();
     const pages = Number(s.pages) || 0;
     const matches = (Number(s.match_html) || 0) + (Number(s.api_match) || 0);
-    if (!pages && !matches) return;
-    el.textContent = `${pages.toLocaleString()} visit${pages === 1 ? '' : 's'} · ` +
-      `${matches.toLocaleString()} paper${matches === 1 ? '' : 's'} matched`;
-    el.title = `cumulative requests: ${(Number(s.total) || 0).toLocaleString()} · resets on redeploy`;
+    const users = Number(s.users_total) || 0;
+    if (!pages && !users && !matches) return;
+    const n = (v, word) => `${v.toLocaleString()} ${word}${v === 1 ? '' : 's'}`;
+    el.textContent = `${n(pages, 'visit')} · ${n(users, 'unique visitor')} · ` +
+      `${n(matches, 'paper matched')}`;
+    el.title = 'today: ' + (Number(s.users_today) || 0).toLocaleString() +
+      ' unique · 7d: ' + (Number(s.users_7d) || 0).toLocaleString() +
+      ' unique · 30d: ' + (Number(s.users_30d) || 0).toLocaleString() +
+      ' unique · total requests: ' + (Number(s.total) || 0).toLocaleString() +
+      ' · resets on redeploy';
   } catch (e) { /* keep the footer clean on older servers */ }
 }
 

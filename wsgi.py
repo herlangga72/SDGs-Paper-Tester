@@ -25,13 +25,14 @@ from __future__ import annotations
 
 import io
 import sys
+import traceback
 from pathlib import Path
 
 # repo root (engine/ is imported by web/app.py from there)
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent / "web"))
 
-from web.app import Handler  # noqa: E402
+from web.app import Handler, sentry_report  # noqa: E402
 
 
 class _Socket(io.BytesIO):
@@ -76,7 +77,9 @@ def application(environ, start_response):
         sock = _Socket(raw)
         Handler(sock, ("127.0.0.1", 0), None)  # constructs -> handles -> responds
         out = sock._wbuf.getvalue()
-    except Exception as exc:  # noqa: BLE001 — surface any failure
+    except Exception as exc:  # noqa: BLE001 — surface any failure + report it
+        sentry_report("error", "wsgi.adapter", f"WSGI adapter error: {exc}", exc=exc,
+                      extra={"traceback": traceback.format_exc()})
         start_response("500 Internal Server Error",
                        [("Content-Type", "text/plain; charset=utf-8")])
         return [("WSGI adapter error: %s" % exc).encode("utf-8")]

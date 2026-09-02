@@ -19,6 +19,7 @@ rust/web-server.log
 # runtime usage logs + cumulative access counters (created by the servers)
 logs/
 engine/data/site_stats.json
+engine/data/visitors.json
 
 # generated boot cache (rebuilt at server start)
 engine/data/queries/sdg_cache.bin

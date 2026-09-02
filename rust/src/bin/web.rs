@@ -30,8 +30,8 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 // ---------------------------------------------------------------------------
@@ -239,6 +239,7 @@ fn stats_json() -> Resp {
     } else {
         now.saturating_sub(booted) as f64 / 1000.0
     };
+    let (u_total, u_today, u_7d, u_30d) = user_stats();
     let v = serde_json::json!({
         "total": S_TOTAL.load(Ordering::Relaxed),
         "pages": S_PAGES.load(Ordering::Relaxed),
@@ -247,10 +248,356 @@ fn stats_json() -> Resp {
         "api_keywords": S_API_KEYWORDS.load(Ordering::Relaxed),
         "errors": S_ERRORS.load(Ordering::Relaxed),
         "not_found": S_NOT_FOUND.load(Ordering::Relaxed),
+        "users_total": u_total,
+        "users_today": u_today,
+        "users_7d": u_7d,
+        "users_30d": u_30d,
         "booted_at": booted,
         "uptime_s": uptime_s,
     });
     Resp::json(200, v.to_string())
+}
+// ---------------------------------------------------------------------------
+// Unique-user tracking (anonymous uid cookie)
+//
+// A page load without a `uid` cookie receives one (32 hex chars, HttpOnly,
+// SameSite=Lax, ~6 months) and is added to engine/data/visitors.json, which
+// maps uid -> last-seen epoch ms. Distinct-user counts for any window are
+// derived from last-seen, so no per-day sets are needed. No IPs, no personal
+// data, and only full page loads mint cookies — health checks, /api/stats and
+// asset/API requests never count as users. Same Render caveat as the other
+// counters: the file lives on the container and resets on redeploy.
+// ---------------------------------------------------------------------------
+
+static VISITORS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+
+fn visitors() -> &'static Mutex<HashMap<String, u64>> {
+    VISITORS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn visitors_path() -> PathBuf {
+    repo_root().join("engine").join("data").join("visitors.json")
+}
+
+fn load_visitors() {
+    let Ok(s) = fs::read_to_string(visitors_path()) else {
+        return;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) else {
+        return;
+    };
+    let mut map = visitors().lock().unwrap();
+    if let Some(users) = v.get("users").and_then(|x| x.as_object()) {
+        for (id, last) in users {
+            if id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()) {
+                if let Some(ms) = last.as_u64() {
+                    map.insert(id.clone(), ms);
+                }
+            }
+        }
+    }
+}
+
+fn save_visitors() {
+    let mut map = visitors().lock().unwrap();
+    // Bound the file: only prune once it gets large, drop ids idle > 180 days.
+    if map.len() > 100_000 {
+        let cutoff = epoch_ms().saturating_sub(180 * 86_400_000);
+        map.retain(|_, last| *last >= cutoff);
+    }
+    let users: serde_json::Map<String, serde_json::Value> = map
+        .iter()
+        .map(|(id, last)| (id.clone(), serde_json::json!(last)))
+        .collect();
+    drop(map);
+    let v = serde_json::json!({ "users": users });
+    if let Some(dir) = visitors_path().parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    if let Ok(s) = serde_json::to_string(&v) {
+        let _ = fs::write(visitors_path(), s);
+    }
+}
+
+fn cookie_uid(headers: &[(String, String)]) -> Option<String> {
+    for (k, v) in headers {
+        if k == "cookie" {
+            for part in v.split(';') {
+                let p = part.trim();
+                if let Some(r) = p.strip_prefix("uid=") {
+                    let r = r.trim();
+                    if r.len() == 32 && r.bytes().all(|b| b.is_ascii_hexdigit()) {
+                        return Some(r.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn new_uid() -> String {
+    let mut buf = [0u8; 16];
+    let ok = fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut buf));
+    if ok.is_err() {
+        // Fallback: time + pid seeded xorshift (good enough for anonymized ids).
+        let ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        let mut x = ns ^ ((std::process::id() as u64) << 32);
+        for b in buf.iter_mut() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *b = x as u8;
+        }
+    }
+    let mut s = String::with_capacity(32);
+    for b in buf {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+/// Count the page load: mint a uid when missing, refresh last-seen, persist
+/// new users immediately so a restart does not lose them.
+fn track_visitor(headers: &[(String, String)], resp: &mut Resp) {
+    let now = epoch_ms();
+    let id = match cookie_uid(headers) {
+        Some(id) => id,
+        None => {
+            let id = new_uid();
+            resp.headers.push((
+                "Set-Cookie".into(),
+                format!("uid={id}; Path=/; Max-Age=15552000; HttpOnly; SameSite=Lax"),
+            ));
+            id
+        }
+    };
+    let is_new = {
+        let mut map = visitors().lock().unwrap();
+        let is_new = !map.contains_key(&id);
+        map.insert(id, now);
+        is_new
+    };
+    if is_new {
+        save_visitors();
+    } else if visitors().lock().unwrap().len() % 256 == 0 {
+        save_visitors(); // periodic refresh of last-seen
+    }
+}
+
+/// (total unique, unique today, unique in 7 days, unique in 30 days).
+fn user_stats() -> (u64, u64, u64, u64) {
+    let map = visitors().lock().unwrap();
+    let today = epoch_ms() / 86_400_000;
+    let mut d1 = 0u64;
+    let mut d7 = 0u64;
+    let mut d30 = 0u64;
+    for last in map.values() {
+        let d = last / 86_400_000;
+        if d == today {
+            d1 += 1;
+        }
+        if d + 6 >= today {
+            d7 += 1;
+        }
+        if d + 29 >= today {
+            d30 += 1;
+        }
+    }
+    (map.len() as u64, d1, d7, d30)
+}
+
+// ---------------------------------------------------------------------------
+// Error reporting (Sentry, optional) — zero-dependency envelope client
+//
+// Reads SENTRY_DSN from the environment (https://<key>@o<org>.ingest.sentry.io/
+// <project> for Sentry cloud). When set, boot events, panics and 5xx responses
+// are forwarded to the store over the envelope API using the same ureq client
+// the app already uses for Crossref — no SDK crate. When unset (the default)
+// every function below is a no-op and the binary behaves exactly as before.
+// Environment tags: SENTRY_ENV (default "production"); the release is taken
+// from RENDER_GIT_COMMIT / SOURCE_VERSION / SENTRY_RELEASE when present.
+// ---------------------------------------------------------------------------
+
+fn sentry_cfg() -> Option<(String, String)> {
+    let dsn = std::env::var("SENTRY_DSN").ok()?;
+    let dsn = dsn.trim().to_string();
+    if dsn.is_empty() {
+        return None;
+    }
+    let (scheme, rest) = if let Some(r) = dsn.strip_prefix("https://") {
+        ("https", r)
+    } else if let Some(r) = dsn.strip_prefix("http://") {
+        ("http", r)
+    } else {
+        return None;
+    };
+    let (netloc, path) = rest.split_once('/')?;
+    let host = netloc.rsplit('@').next().unwrap_or(netloc);
+    let project = path.trim_end_matches('/');
+    if host.is_empty() || project.is_empty() {
+        return None;
+    }
+    let url = format!("{scheme}://{host}/api/{project}/envelope/");
+    Some((dsn, url))
+}
+
+fn sentry_env() -> String {
+    std::env::var("SENTRY_ENV")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "production".into())
+}
+
+fn sentry_release() -> Option<String> {
+    for k in ["RENDER_GIT_COMMIT", "SOURCE_VERSION", "SENTRY_RELEASE"] {
+        if let Ok(v) = std::env::var(k) {
+            if !v.is_empty() {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+/// RFC 3339 UTC with millisecond precision (no external crates).
+fn iso8601_ms(secs: u64, millis: u32) -> String {
+    let days = (secs / 86400) as i64;
+    let rem = secs % 86400;
+    let (h, m, s) = ((rem / 3600) as u32, ((rem % 3600) / 60) as u32, (rem % 60) as u32);
+    // Civil-from-days (Howard Hinnant's algorithm).
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    let y = if mo <= 2 { y + 1 } else { y };
+    let y = if y < 0 { 1970 } else { y } as u64; // floor: only dates >= 1970 are real here
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}.{millis:03}Z")
+}
+
+fn sentry_event_id() -> String {
+    static CTR: AtomicU64 = AtomicU64::new(0);
+    let ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let hi = ns ^ (std::process::id() as u64).rotate_left(32);
+    let lo = CTR.fetch_add(1, Ordering::Relaxed).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    format!("{hi:016x}{lo:016x}")
+}
+
+fn sentry_send(dsn: &str, url: &str, event: &serde_json::Value) -> bool {
+    let sent_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| iso8601_ms(d.as_secs(), d.subsec_millis()))
+        .unwrap_or_default();
+    let env_hdr = serde_json::json!({
+        "event_id": event.get("event_id").and_then(|v| v.as_str()).unwrap_or(""),
+        "dsn": dsn,
+        "sent_at": sent_at,
+        "sdk": {"name": "sdg-tools-web", "version": env!("CARGO_PKG_VERSION")},
+    });
+    let event_s = event.to_string();
+    let mut body = env_hdr.to_string();
+    body.push('\n');
+    body.push_str(&format!("{{\"type\":\"event\",\"length\":{}}}\n", event_s.len()));
+    body.push_str(&event_s);
+    let agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(4)))
+        .build()
+        .new_agent();
+    agent
+        .post(url)
+        .header("Content-Type", "application/x-sentry-envelope")
+        .send(&body)
+        .is_ok()
+}
+
+/// Best-effort report. Every path returns silently when SENTRY_DSN is unset.
+fn sentry_report(
+    level: &str,
+    logger: &str,
+    message: &str,
+    ty: Option<&str>,
+    value: Option<&str>,
+    tags: &[(&str, &str)],
+    extra: serde_json::Value,
+) {
+    let Some((dsn, url)) = sentry_cfg() else {
+        return;
+    };
+    let dur = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let mut ev = serde_json::json!({
+        "event_id": sentry_event_id(),
+        "timestamp": iso8601_ms(dur.as_secs(), dur.subsec_millis()),
+        "platform": "rust",
+        "level": level,
+        "logger": logger,
+        "message": {"formatted": message},
+        "environment": sentry_env(),
+    });
+    if let Some(rel) = sentry_release() {
+        ev["release"] = rel.into();
+    }
+    if !tags.is_empty() {
+        let mut m = serde_json::Map::new();
+        for (k, v) in tags {
+            m.insert(k.to_string(), (*v).into());
+        }
+        ev["tags"] = serde_json::Value::Object(m);
+    }
+    if !extra.is_null() {
+        ev["extra"] = extra;
+    }
+    if let (Some(t), Some(v)) = (ty, value) {
+        ev["exception"] = serde_json::json!({"values": [{"type": t, "value": v}]});
+    }
+    let ok = sentry_send(&dsn, &url, &ev);
+    eprintln!(
+        "[sentry] {level} event {} ({logger})",
+        if ok { "sent" } else { "send failed" }
+    );
+}
+
+fn panic_summary(p: &std::panic::PanicHookInfo) -> String {
+    if let Some(s) = p.payload().downcast_ref::<&str>() {
+        return (*s).to_string();
+    }
+    if let Some(s) = p.payload().downcast_ref::<String>() {
+        return s.clone();
+    }
+    p.location()
+        .map(|l| format!("panic at {}:{}", l.file(), l.line()))
+        .unwrap_or_else(|| "panic (no payload)".into())
+}
+
+fn sentry_install_panic_hook() {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let msg = panic_summary(info);
+        let loc = info
+            .location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_default();
+        sentry_report(
+            "fatal",
+            "web.panic",
+            &msg,
+            Some("panic"),
+            Some(&msg),
+            &[("location", loc.as_str())],
+            serde_json::json!({}),
+        );
+        prev(info);
+    }));
 }
 
 // ---------------------------------------------------------------------------
@@ -2133,6 +2480,24 @@ fn handle_conn(stream: &mut TcpStream) {
 
     let t_req = Instant::now();
     let mut resp = route(&method, &target, &headers, &body);
+    if resp.code >= 500 {
+        // Outage/5xx: report the request that produced it (Sentry, if DSN set).
+        let path = target.split('?').next().unwrap_or(&target).to_string();
+        sentry_report(
+            "error",
+            "web.http",
+            &format!("{method} {path} -> {}", resp.code),
+            None,
+            None,
+            &[("method", method.as_str())],
+            serde_json::json!({"path": path, "status": resp.code}),
+        );
+    }
+    // Unique-user tracking: only full page loads mint/count the uid cookie.
+    let req_path = target.split('?').next().unwrap_or(&target).to_string();
+    if method == "GET" && (req_path == "/" || req_path == "/index.html") {
+        track_visitor(&headers, &mut resp);
+    }
     maybe_gzip(&mut resp, &headers);
     let mut out = Vec::with_capacity(resp.body.len() + 256);
     let mut head = format!(
@@ -2253,17 +2618,20 @@ fn main() {
     S_ERRORS.store(t[5], Ordering::Relaxed);
     S_NOT_FOUND.store(t[6], Ordering::Relaxed);
     S_BOOTED_MS.store(epoch_ms(), Ordering::Relaxed);
+    load_visitors();
+    let n_users = visitors().lock().unwrap().len();
     let m = t[2] + t[3];
     eprintln!(
-        "[web] usage so far: {} request{}, {} page view{}, {} match{} (cumulative; log: {})",
+        "[web] usage so far: {} request{}, {} page view{}, {} {} (cumulative; log: {})",
         t[0],
         if t[0] == 1 { "" } else { "s" },
         t[1],
         if t[1] == 1 { "" } else { "s" },
         m,
-        if m == 1 { "" } else { "s" },
+        if m == 1 { "match" } else { "matches" },
         access_log_path().display()
     );
+    eprintln!("[web] {n_users} unique user{} on file", if n_users == 1 { "" } else { "s" });
 
     let n = get_queries().len();
     eprintln!("[web] loaded {n} SDG query sets");
@@ -2278,6 +2646,18 @@ fn main() {
     };
     let url = format!("http://{host}:{port}/");
     eprintln!("[web] SDG Paper Matcher (Rust + SIMD) running at {url}  (Ctrl-C to stop)");
+    if sentry_cfg().is_some() {
+        sentry_install_panic_hook();
+        sentry_report(
+            "info",
+            "web.boot",
+            "SDG Paper Matcher started",
+            None,
+            None,
+            &[],
+            serde_json::json!({"queries": n, "addr": addr}),
+        );
+    }
     if !no_browser {
         open_browser(&url);
     }
@@ -2287,7 +2667,12 @@ fn main() {
             Ok(s) => {
                 std::thread::spawn(move || {
                     let mut s = s;
-                    handle_conn(&mut s);
+                    // A panicking handler must never take down the accept loop.
+                    // The panic hook reports to Sentry first; the thread then
+                    // dies exactly as it did before.
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        handle_conn(&mut s);
+                    }));
                 });
             }
             Err(e) => eprintln!("[web] accept error: {e}"),

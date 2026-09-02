@@ -117,10 +117,18 @@ The legacy Python server still works if you prefer it:
   `Accept-Encoding: gzip`.
 - **Usage stats**: every request is written to `logs/access.jsonl` (JSONL,
   no IPs/user agents, rotates at ~4 MB) and counted in memory; cumulative
-  totals persist to `engine/data/site_stats.json` and reload on restart, so
-  the footer shows **"N visits · M papers matched"** and `GET /api/stats`
-  returns the raw counters. Counts exclude `/health` checks; free-tier hosts
-  that rebuild the container on deploy (Render) reset the counters.
+  totals persist to `engine/data/site_stats.json` and reload on restart. The
+  footer shows **"N visits · U unique visitors · M papers matched"** and
+  `GET /api/stats` returns the raw counters plus `users_total` / `users_today`
+  / `users_7d` / `users_30d`. Unique users are tracked with an anonymous,
+  HttpOnly, SameSite `uid` cookie (no IPs, no personal data); only full page
+  loads mint cookies. Counts exclude `/health` checks; free-tier hosts that
+  rebuild the container on deploy (Render) reset the counters.
+- **Optional Sentry error reporting**: set `SENTRY_DSN` (env var, also wired
+  in `render.yaml`) and boot events, 5xx responses, panics and unhandled
+  handler exceptions are forwarded to your Sentry project over the envelope
+  API — a tiny hand-rolled client in both servers, so no SDK dependency.
+  When unset, nothing is sent. Release tags come from `RENDER_GIT_COMMIT`.
 - Matching semantics identical to Scopus: `NOT > AND/W-n > OR` precedence,
   whole-word matching, `*`/`?` wildcards (`*` matches within a word only, so
   `financ* cris*` needs "financial crisis", not "financ … crisis" anywhere
