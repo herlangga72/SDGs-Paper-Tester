@@ -223,4 +223,24 @@ document.addEventListener('click', e => {
 
 buildSamples();
 buildLegend();
+
+/* Usage footer: fetch the cumulative counters and show a compact line.
+   Hidden when /api/stats is unavailable (older servers) or still zero. */
+async function loadSiteStats() {
+  const el = document.getElementById('site-stats');
+  if (!el) return;
+  try {
+    const r = await fetch('/api/stats');
+    if (!r.ok) return;
+    const s = await r.json();
+    const pages = Number(s.pages) || 0;
+    const matches = (Number(s.match_html) || 0) + (Number(s.api_match) || 0);
+    if (!pages && !matches) return;
+    el.textContent = `${pages.toLocaleString()} visit${pages === 1 ? '' : 's'} · ` +
+      `${matches.toLocaleString()} paper${matches === 1 ? '' : 's'} matched`;
+    el.title = `cumulative requests: ${(Number(s.total) || 0).toLocaleString()} · resets on redeploy`;
+  } catch (e) { /* keep the footer clean on older servers */ }
+}
+
+loadSiteStats();
 buildSdgSelect();

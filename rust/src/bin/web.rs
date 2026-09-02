@@ -14,6 +14,7 @@
 //!     GET  /doi?doi=...            Crossref lookup -> JSON fields
 //!     POST /match                  fields -> HTML report
 //!     GET  /health                 liveness
+//!     GET  /api/stats              usage counters (visits, matches; cumulative)
 //!
 //! Usage:
 //!     cargo run --bin web --release [--host 127.0.0.1] [--port 8000] [--no-browser]
@@ -30,7 +31,8 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 // ---------------------------------------------------------------------------
 // SDG metadata (official UN short names + brand colors)
@@ -93,6 +95,162 @@ fn papers_dir() -> PathBuf {
 
 fn queries_dir() -> PathBuf {
     repo_root().join("engine").join("data").join("queries")
+}
+
+// ---------------------------------------------------------------------------
+// Usage logging: per-request access log + durable visit/match counters
+//
+// Every request (except /health and /api/stats themselves) is appended to
+// logs/access.jsonl (one JSON line each, no IPs or user agents) and counted
+// in-process. Counters persist to engine/data/site_stats.json every 25
+// requests and reload at boot, so totals survive restarts of the same
+// instance (local dev, PythonAnywhere). Free-tier hosts like Render rebuild
+// the container on every deploy, which resets the file; the UI hides the
+// footer counter when /api/stats is missing or empty. Zero new dependencies.
+// ---------------------------------------------------------------------------
+
+static S_TOTAL: AtomicU64 = AtomicU64::new(0);
+static S_PAGES: AtomicU64 = AtomicU64::new(0);
+static S_MATCH_HTML: AtomicU64 = AtomicU64::new(0);
+static S_API_MATCH: AtomicU64 = AtomicU64::new(0);
+static S_API_KEYWORDS: AtomicU64 = AtomicU64::new(0);
+static S_ERRORS: AtomicU64 = AtomicU64::new(0);
+static S_NOT_FOUND: AtomicU64 = AtomicU64::new(0);
+/// Epoch ms of process boot (for /api/stats uptime).
+static S_BOOTED_MS: AtomicU64 = AtomicU64::new(0);
+
+fn stats_path() -> PathBuf {
+    repo_root().join("engine").join("data").join("site_stats.json")
+}
+
+fn access_log_path() -> PathBuf {
+    repo_root().join("logs").join("access.jsonl")
+}
+
+fn epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Load the cumulative counters saved by a previous run (zeros if absent).
+fn load_saved_stats() -> [u64; 7] {
+    let mut t = [0u64; 7];
+    let Ok(s) = fs::read_to_string(stats_path()) else {
+        return t;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) else {
+        return t;
+    };
+    for (i, name) in ["total", "pages", "match_html", "api_match", "api_keywords", "errors", "not_found"]
+        .iter()
+        .enumerate()
+    {
+        if let Some(n) = v.get(*name).and_then(|x| x.as_u64()) {
+            t[i] = n;
+        }
+    }
+    t
+}
+
+fn save_stats() {
+    let v = serde_json::json!({
+        "total": S_TOTAL.load(Ordering::Relaxed),
+        "pages": S_PAGES.load(Ordering::Relaxed),
+        "match_html": S_MATCH_HTML.load(Ordering::Relaxed),
+        "api_match": S_API_MATCH.load(Ordering::Relaxed),
+        "api_keywords": S_API_KEYWORDS.load(Ordering::Relaxed),
+        "errors": S_ERRORS.load(Ordering::Relaxed),
+        "not_found": S_NOT_FOUND.load(Ordering::Relaxed),
+        "booted_at": S_BOOTED_MS.load(Ordering::Relaxed),
+    });
+    if let Some(dir) = stats_path().parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    if let Ok(s) = serde_json::to_string_pretty(&v) {
+        let _ = fs::write(stats_path(), s);
+    }
+}
+
+/// Append one JSON line per real request. Rotates the file once it exceeds
+/// ~4 MB (previous file kept as access.jsonl.1, then overwritten).
+fn access_log_append(method: &str, target: &str, code: u16, ms: f64) {
+    let p = access_log_path();
+    if let Some(dir) = p.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    if let Ok(md) = fs::metadata(&p) {
+        if md.len() > 4 << 20 {
+            let _ = fs::rename(&p, p.with_file_name("access.jsonl.1"));
+        }
+    }
+    // Cap pathological targets; jstr() quotes+escapes for JSON.
+    let target: String = target.chars().take(512).collect();
+    let line = format!(
+        "{{\"ts\":{},\"method\":{},\"path\":{},\"status\":{},\"ms\":{:.1}}}\n",
+        epoch_ms(),
+        jstr(method),
+        jstr(&target),
+        code,
+        ms
+    );
+    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&p) {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
+/// Classify + count one request. Health checks and the stats endpoint itself
+/// are excluded so they cannot inflate the numbers.
+fn observe_request(method: &str, target: &str, code: u16, ms: f64) {
+    let path = target.split('?').next().unwrap_or(target);
+    if path == "/health" || path == "/api/stats" {
+        return;
+    }
+    S_TOTAL.fetch_add(1, Ordering::Relaxed);
+    if code >= 500 {
+        S_ERRORS.fetch_add(1, Ordering::Relaxed);
+    } else if code == 404 {
+        S_NOT_FOUND.fetch_add(1, Ordering::Relaxed);
+    }
+    if code < 400 {
+        if (method, path) == ("GET", "/") || (method, path) == ("GET", "/index.html") {
+            S_PAGES.fetch_add(1, Ordering::Relaxed);
+        } else if method == "POST" && path == "/match" {
+            S_MATCH_HTML.fetch_add(1, Ordering::Relaxed);
+        } else if method == "POST" && path == "/api/match" {
+            S_API_MATCH.fetch_add(1, Ordering::Relaxed);
+        } else if method == "POST" && path == "/api/keywords" {
+            S_API_KEYWORDS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    access_log_append(method, path, code, ms);
+    if S_TOTAL.load(Ordering::Relaxed) % 25 == 0 {
+        save_stats();
+    }
+}
+
+/// GET /api/stats — cumulative usage counters + uptime, as JSON.
+fn stats_json() -> Resp {
+    let now = epoch_ms();
+    let booted = S_BOOTED_MS.load(Ordering::Relaxed);
+    let uptime_s = if booted == 0 {
+        0.0
+    } else {
+        now.saturating_sub(booted) as f64 / 1000.0
+    };
+    let v = serde_json::json!({
+        "total": S_TOTAL.load(Ordering::Relaxed),
+        "pages": S_PAGES.load(Ordering::Relaxed),
+        "match_html": S_MATCH_HTML.load(Ordering::Relaxed),
+        "api_match": S_API_MATCH.load(Ordering::Relaxed),
+        "api_keywords": S_API_KEYWORDS.load(Ordering::Relaxed),
+        "errors": S_ERRORS.load(Ordering::Relaxed),
+        "not_found": S_NOT_FOUND.load(Ordering::Relaxed),
+        "booted_at": booted,
+        "uptime_s": uptime_s,
+    });
+    Resp::json(200, v.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -1642,6 +1800,7 @@ fn route_get(path: &str, qs: &str) -> Resp {
             }
         }
         "/health" => Resp::text(200, "ok"),
+        "/api/stats" => stats_json(),
         "/samples" => Resp::json(200, samples_json()),
         "/sample" => {
             let params = parse_urlencoded(qs.as_bytes());
@@ -1972,6 +2131,7 @@ fn handle_conn(stream: &mut TcpStream) {
     }
     body.truncate(content_length);
 
+    let t_req = Instant::now();
     let mut resp = route(&method, &target, &headers, &body);
     maybe_gzip(&mut resp, &headers);
     let mut out = Vec::with_capacity(resp.body.len() + 256);
@@ -1991,7 +2151,9 @@ fn handle_conn(stream: &mut TcpStream) {
     out.extend_from_slice(head.as_bytes());
     out.extend_from_slice(&resp.body);
     let _ = stream.write_all(&out);
-    eprintln!("[web] {method} {target} -> {}", resp.code);
+    let ms = t_req.elapsed().as_secs_f64() * 1000.0;
+    eprintln!("[web] {method} {target} -> {} ({ms:.1} ms)", resp.code);
+    observe_request(&method, &target, resp.code, ms);
 }
 
 // ---------------------------------------------------------------------------
@@ -2080,6 +2242,24 @@ fn main() {
             other => eprintln!("[web] unknown option {other}"),
         }
     }
+
+    // Usage counters: resume the cumulative totals from the previous run.
+    let t = load_saved_stats();
+    S_TOTAL.store(t[0], Ordering::Relaxed);
+    S_PAGES.store(t[1], Ordering::Relaxed);
+    S_MATCH_HTML.store(t[2], Ordering::Relaxed);
+    S_API_MATCH.store(t[3], Ordering::Relaxed);
+    S_API_KEYWORDS.store(t[4], Ordering::Relaxed);
+    S_ERRORS.store(t[5], Ordering::Relaxed);
+    S_NOT_FOUND.store(t[6], Ordering::Relaxed);
+    S_BOOTED_MS.store(epoch_ms(), Ordering::Relaxed);
+    eprintln!(
+        "[web] usage so far: {} requests, {} page views, {} matches (cumulative; log: {})",
+        t[0],
+        t[1],
+        t[2] + t[3],
+        access_log_path().display()
+    );
 
     let n = get_queries().len();
     eprintln!("[web] loaded {n} SDG query sets");

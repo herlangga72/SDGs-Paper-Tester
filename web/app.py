@@ -42,6 +42,7 @@ Endpoints:
     GET  /doi?doi=...            Crossref lookup -> JSON fields
     POST /match                  fields -> HTML report
     GET  /health                 liveness
+    GET  /api/stats              usage counters (visits, matches; cumulative)
 """
 
 from __future__ import annotations
@@ -76,6 +77,111 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 PAPERS_DIR = ROOT / "papers"
 QUERY_DIR = ROOT / "engine" / "data" / "queries"
 DEFAULT_DB = QUERY_DIR / "sdg_queries.sqlite3"
+
+# --------------------------------------------------------------------------
+# Usage logging: durable visit/match counters + per-request access log
+#
+# Every request (except /health and /api/stats themselves) is appended to
+# logs/access.jsonl (one JSON line each, no IPs or user agents) and counted
+# in-process. Counters persist to engine/data/site_stats.json every 25
+# requests and reload at boot, so totals survive restarts of the same
+# instance (local dev, PythonAnywhere). Free-tier hosts that rebuild the
+# container on every deploy reset the file; the UI hides the footer counter
+# when /api/stats is missing or empty. Standard library only.
+# --------------------------------------------------------------------------
+
+_STATS_FILE = ROOT / "engine" / "data" / "site_stats.json"
+_ACCESS_LOG = ROOT / "logs" / "access.jsonl"
+_STATS_LOCK = threading.Lock()
+_BOOT_TIME = time.time()
+_STATS = {"total": 0, "pages": 0, "match_html": 0, "api_match": 0,
+          "api_keywords": 0, "errors": 0, "not_found": 0, "booted_at": 0}
+_STATS_LOADED = False
+
+
+def _load_stats() -> None:
+    """Resume cumulative counters saved by a previous run (zeros if absent)."""
+    global _STATS_LOADED
+    with _STATS_LOCK:
+        try:
+            data = json.loads(_STATS_FILE.read_text(encoding="utf-8"))
+            for key in _STATS:
+                if key in data:
+                    _STATS[key] = int(data[key])
+        except Exception:  # noqa: BLE001 — first run / corrupt file: start at zero
+            pass
+        _STATS["booted_at"] = int(_BOOT_TIME * 1000)
+        _STATS_LOADED = True
+
+
+def _save_stats() -> None:
+    try:
+        _STATS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _STATS_FILE.write_text(json.dumps(_STATS, indent=2) + "\n",
+                               encoding="utf-8")
+    except Exception:  # noqa: BLE001 — logging must never break a request
+        pass
+
+
+def _append_access_line(line: str) -> None:
+    """One JSON line per request; rotate at ~4 MB (keep access.jsonl.1)."""
+    try:
+        _ACCESS_LOG.parent.mkdir(parents=True, exist_ok=True)
+        if _ACCESS_LOG.exists() and _ACCESS_LOG.stat().st_size > 4 << 20:
+            _ACCESS_LOG.replace(_ACCESS_LOG.with_name("access.jsonl.1"))
+        with _ACCESS_LOG.open("a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _record_request(method: str, path: str, status: int, ms: float) -> None:
+    """Classify + count one request; /health and /api/stats are excluded."""
+    if not _STATS_LOADED:
+        _load_stats()
+    path = path.split("?", 1)[0]
+    if path in ("/health", "/api/stats"):
+        return
+    with _STATS_LOCK:
+        _STATS["total"] += 1
+        if status >= 500:
+            _STATS["errors"] += 1
+        elif status == 404:
+            _STATS["not_found"] += 1
+        if (method, path) in (("GET", "/"), ("GET", "/index.html")):
+            if status < 400:
+                _STATS["pages"] += 1
+        elif (method, path) == ("POST", "/match"):
+            if status < 400:
+                _STATS["match_html"] += 1
+        elif (method, path) == ("POST", "/api/match"):
+            if status < 400:
+                _STATS["api_match"] += 1
+        elif (method, path) == ("POST", "/api/keywords"):
+            if status < 400:
+                _STATS["api_keywords"] += 1
+        total = _STATS["total"]
+        line = json.dumps({"ts": int(time.time() * 1000), "method": method,
+                           "path": path, "status": status,
+                           "ms": round(ms, 1)}, ensure_ascii=True)
+    _append_access_line(line)
+    if total % 25 == 0:
+        _save_stats()
+
+
+def stats_payload() -> dict:
+    """GET /api/stats — cumulative usage counters + uptime, as JSON."""
+    if not _STATS_LOADED:
+        _load_stats()
+    with _STATS_LOCK:
+        return {"total": _STATS["total"], "pages": _STATS["pages"],
+                "match_html": _STATS["match_html"],
+                "api_match": _STATS["api_match"],
+                "api_keywords": _STATS["api_keywords"],
+                "errors": _STATS["errors"],
+                "not_found": _STATS["not_found"],
+                "booted_at": _STATS["booted_at"],
+                "uptime_s": round(time.time() - _BOOT_TIME, 1)}
 
 # --------------------------------------------------------------------------
 # SDG metadata (official UN short names + brand colors)
@@ -739,6 +845,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(502, {"error": str(e)})
         elif url.path == "/health":
             self._send(200, b"ok", "text/plain")
+        elif url.path == "/api/stats":
+            self._send_json(200, stats_payload())
         else:
             self._send(404, b"not found", "text/plain")
 
@@ -812,8 +920,27 @@ class Handler(BaseHTTPRequestHandler):
             return None, None
         return parse_paper_text(text)
 
+    def handle_one_request(self):
+        """Start a per-request timer so log_message can record latency."""
+        self._t0 = time.perf_counter()
+        super().handle_one_request()
+
     def log_message(self, fmt, *args):
-        sys.stderr.write("[web] %s\n" % (fmt % args))
+        msg = fmt % args
+        sys.stderr.write("[web] %s\n" % msg)
+        # BaseHTTPRequestHandler calls this as '"%s" %s %s' with
+        # (requestline, code, size) after each response.
+        try:
+            parts = msg.split('"')
+            rl = parts[1] if len(parts) > 1 else ""
+            bits = rl.split()
+            method = bits[0] if bits else "-"
+            target = bits[1] if len(bits) > 1 else "-"
+            status = next((int(tok) for tok in parts[-1].split() if tok.isdigit()), 0)
+            ms = (time.perf_counter() - getattr(self, "_t0", time.perf_counter())) * 1000.0
+            _record_request(method, target, status, ms)
+        except Exception:  # noqa: BLE001 — logging must never break a request
+            pass
 
 
 # --------------------------------------------------------------------------
@@ -828,6 +955,10 @@ def main() -> int:
     args = ap.parse_args()
 
     # warm the query cache so the first request isn't slow
+    _load_stats()
+    print(f"[web] usage so far: {_STATS['total']} requests, {_STATS['pages']} page views, "
+          f"{_STATS['match_html'] + _STATS['api_match']} matches "
+          "(cumulative; log: logs/access.jsonl)", file=sys.stderr)
     try:
         n = len(get_queries())
         print(f"[web] loaded {n} SDG query sets", file=sys.stderr)

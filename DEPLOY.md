@@ -28,6 +28,14 @@ HTTPS is allowed.
 report (`{ms, sdgs: [{sdg, matched, near, near_total, excluded}]}`).
 Responses are gzip-compressed when the client sends `Accept-Encoding: gzip`.
 
+**Usage stats:** `GET /api/stats` returns cumulative counters (`total`,
+`pages`, `match_html`, `api_match`, `errors`, ...). Every request is also
+appended to `logs/access.jsonl` (JSONL, no IPs or user agents; ~4 MB
+rotation). Counters persist to `engine/data/site_stats.json` and reload at
+boot, so they survive restarts of the same instance. Render free-tier
+containers are rebuilt on every deploy, which resets the counters — treat
+them as a rough "since last deploy" figure.
+
 ---
 
 ## Option 1 — Render (recommended, lowest effort)
@@ -108,5 +116,7 @@ history (`git show <commit>:.github/workflows/deploy-hf.yml`).
 - **Render free:** $0, no card, sleeps after 15 min idle, 750 h/month.
 - **PythonAnywhere free:** $0, no card, always on, throttled CPU.
 - **DOI auto-fill:** works on both (outbound HTTPS to Crossref allowed).
-- **No data is stored server-side** — papers are matched in memory and never
-  persisted, so there's nothing to migrate or clean up.
+- **No paper data is stored server-side** — papers are matched in memory and
+  never persisted. The only runtime files are the aggregated usage counters
+  and the request-path access log described above (no IPs, no paper text), so
+  there's nothing sensitive to migrate or clean up.

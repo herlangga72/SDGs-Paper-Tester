@@ -115,6 +115,12 @@ The legacy Python server still works if you prefer it:
   still needs.
 - **Gzip responses**: HTML/JSON are compressed when the client sends
   `Accept-Encoding: gzip`.
+- **Usage stats**: every request is written to `logs/access.jsonl` (JSONL,
+  no IPs/user agents, rotates at ~4 MB) and counted in memory; cumulative
+  totals persist to `engine/data/site_stats.json` and reload on restart, so
+  the footer shows **"N visits · M papers matched"** and `GET /api/stats`
+  returns the raw counters. Counts exclude `/health` checks; free-tier hosts
+  that rebuild the container on deploy (Render) reset the counters.
 - Matching semantics identical to Scopus: `NOT > AND/W-n > OR` precedence,
   whole-word matching, `*`/`?` wildcards (`*` matches within a word only, so
   `financ* cris*` needs "financial crisis", not "financ … crisis" anywhere
