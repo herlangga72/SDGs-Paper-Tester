@@ -289,16 +289,23 @@ def _user_stats() -> dict:
 
 
 # --------------------------------------------------------------------------
-# Error reporting (Sentry, optional) — Python mirror of web.rs
+# Error reporting (Sentry) — Python mirror of web.rs
 #
-# Reads SENTRY_DSN from the environment. When set, boot events, unhandled
-# handler exceptions and WSGI adapter failures are forwarded to the store
-# over the envelope API with urllib — no sentry-sdk install needed, so the
-# PythonAnywhere deploy stays standard-library only. When unset, everything
-# below is a no-op. Standard library only.
+# The DSN is a hard-coded default (public client key by design), so reporting
+# is on out of the box; set SENTRY_DSN to override or SENTRY_DSN=0/off to
+# disable. Boot events, unhandled handler exceptions and WSGI adapter
+# failures are forwarded to the store over the envelope API with urllib — no
+# sentry-sdk install needed, so the PythonAnywhere deploy stays
+# standard-library only. Standard library only.
 # --------------------------------------------------------------------------
 
+_DEFAULT_SENTRY_DSN = ("https://b7a8b16ab31f6a94ee2944534183f03e"
+                       "@o4512018920439808.ingest.us.sentry.io/4512018935447552")
 _SENTRY_DSN = os.environ.get("SENTRY_DSN", "").strip()
+if _SENTRY_DSN.lower() in ("0", "off"):
+    _SENTRY_DSN = ""  # explicit opt-out
+elif not _SENTRY_DSN:
+    _SENTRY_DSN = _DEFAULT_SENTRY_DSN
 _SENTRY_SDK = {"name": "sdg-tools-web-py", "version": "2.0.0"}
 
 

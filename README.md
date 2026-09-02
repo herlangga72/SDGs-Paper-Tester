@@ -124,11 +124,12 @@ The legacy Python server still works if you prefer it:
   HttpOnly, SameSite `uid` cookie (no IPs, no personal data); only full page
   loads mint cookies. Counts exclude `/health` checks; free-tier hosts that
   rebuild the container on deploy (Render) reset the counters.
-- **Optional Sentry error reporting**: set `SENTRY_DSN` (env var, also wired
-  in `render.yaml`) and boot events, 5xx responses, panics and unhandled
-  handler exceptions are forwarded to your Sentry project over the envelope
-  API — a tiny hand-rolled client in both servers, so no SDK dependency.
-  When unset, nothing is sent. Release tags come from `RENDER_GIT_COMMIT`.
+- **Sentry error reporting (default on)**: the DSN is hard-coded in both
+  servers (public client key by design); boot events, 5xx responses, panics
+  and unhandled handler exceptions are forwarded to your Sentry project over
+  the envelope API — a tiny hand-rolled client, so no SDK dependency.
+  Override with `SENTRY_DSN`, or disable with `SENTRY_DSN=0` / `off`. Release
+  tags come from `RENDER_GIT_COMMIT`.
 - Matching semantics identical to Scopus: `NOT > AND/W-n > OR` precedence,
   whole-word matching, `*`/`?` wildcards (`*` matches within a word only, so
   `financ* cris*` needs "financial crisis", not "financ … crisis" anywhere

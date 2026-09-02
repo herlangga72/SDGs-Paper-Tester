@@ -413,21 +413,30 @@ fn user_stats() -> (u64, u64, u64, u64) {
 // ---------------------------------------------------------------------------
 // Error reporting (Sentry, optional) — zero-dependency envelope client
 //
-// Reads SENTRY_DSN from the environment (https://<key>@o<org>.ingest.sentry.io/
-// <project> for Sentry cloud). When set, boot events, panics and 5xx responses
-// are forwarded to the store over the envelope API using the same ureq client
-// the app already uses for Crossref — no SDK crate. When unset (the default)
-// every function below is a no-op and the binary behaves exactly as before.
-// Environment tags: SENTRY_ENV (default "production"); the release is taken
-// from RENDER_GIT_COMMIT / SOURCE_VERSION / SENTRY_RELEASE when present.
+// The DSN below is a hard-coded default (hysoftware org, sdg-paper-matcher
+// project; a public client key by design), so error reporting is on out of the
+// box on every host. Set SENTRY_DSN to override, or set SENTRY_DSN=0/off to
+// disable. Boot events, panics and 5xx responses are forwarded to the store
+// over the envelope API using the same ureq client the app already uses for
+// Crossref — no SDK crate. Environment tags: SENTRY_ENV (default
+// "production"); the release is taken from RENDER_GIT_COMMIT / SOURCE_VERSION
+// / SENTRY_RELEASE when present.
 // ---------------------------------------------------------------------------
 
+const DEFAULT_SENTRY_DSN: &str =
+    "https://b7a8b16ab31f6a94ee2944534183f03e@o4512018920439808.ingest.us.sentry.io/4512018935447552";
+
 fn sentry_cfg() -> Option<(String, String)> {
-    let dsn = std::env::var("SENTRY_DSN").ok()?;
-    let dsn = dsn.trim().to_string();
-    if dsn.is_empty() {
-        return None;
-    }
+    let dsn = match std::env::var("SENTRY_DSN") {
+        Ok(v) => {
+            let v = v.trim().to_string();
+            if v.is_empty() || v == "0" || v.eq_ignore_ascii_case("off") {
+                return None;
+            }
+            v
+        }
+        Err(_) => DEFAULT_SENTRY_DSN.to_string(),
+    };
     let (scheme, rest) = if let Some(r) = dsn.strip_prefix("https://") {
         ("https", r)
     } else if let Some(r) = dsn.strip_prefix("http://") {

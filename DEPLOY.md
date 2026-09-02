@@ -38,11 +38,12 @@ rotation). Counters persist to `engine/data/site_stats.json` and
 the same instance. Render free-tier containers are rebuilt on every deploy,
 which resets the counters — treat them as a rough "since last deploy" figure.
 
-**Error reporting (optional):** set the `SENTRY_DSN` env var (pre-wired in
-`render.yaml`) and the servers forward boot events, 5xx responses, panics and
-unhandled exceptions to your Sentry project over the envelope API (no SDK
-install; nothing is sent while the variable is unset). The release is tagged
-from `RENDER_GIT_COMMIT` when present.
+**Error reporting (default on):** the DSN is hard-coded in both servers (a
+public client key by design), so boot events, 5xx responses, panics and
+unhandled exceptions are forwarded to your Sentry project over the envelope
+API with no SDK install. Override the project with the `SENTRY_DSN` env var
+or disable entirely with `SENTRY_DSN=0` / `off`. The release is tagged from
+`RENDER_GIT_COMMIT` when present.
 
 ---
 

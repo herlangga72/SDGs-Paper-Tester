@@ -14,11 +14,5 @@ services:
     envVars:
       - key: PORT
         value: 10000
-      # Optional error reporting (Sentry). The DSN is a public client key by
-      # design; events are only sent while this variable is set. To keep it out
-      # of the repo, delete the two lines below and set SENTRY_DSN as a Render
-      # dashboard env var instead.
-      - key: SENTRY_DSN
-        value: https://b7a8b16ab31f6a94ee2944534183f03e@o4512018920439808.ingest.us.sentry.io/4512018935447552
-      - key: SENTRY_ENV
-        value: production
+      # Sentry error reporting is enabled by default (DSN hard-coded in the
+      # servers). Override with SENTRY_DSN or disable with SENTRY_DSN=0.
