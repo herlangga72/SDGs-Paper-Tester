@@ -2253,11 +2253,15 @@ fn main() {
     S_ERRORS.store(t[5], Ordering::Relaxed);
     S_NOT_FOUND.store(t[6], Ordering::Relaxed);
     S_BOOTED_MS.store(epoch_ms(), Ordering::Relaxed);
+    let m = t[2] + t[3];
     eprintln!(
-        "[web] usage so far: {} requests, {} page views, {} matches (cumulative; log: {})",
+        "[web] usage so far: {} request{}, {} page view{}, {} match{} (cumulative; log: {})",
         t[0],
+        if t[0] == 1 { "" } else { "s" },
         t[1],
-        t[2] + t[3],
+        if t[1] == 1 { "" } else { "s" },
+        m,
+        if m == 1 { "" } else { "s" },
         access_log_path().display()
     );
 

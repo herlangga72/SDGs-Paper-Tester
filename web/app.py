@@ -956,9 +956,12 @@ def main() -> int:
 
     # warm the query cache so the first request isn't slow
     _load_stats()
-    print(f"[web] usage so far: {_STATS['total']} requests, {_STATS['pages']} page views, "
-          f"{_STATS['match_html'] + _STATS['api_match']} matches "
-          "(cumulative; log: logs/access.jsonl)", file=sys.stderr)
+    total = _STATS["total"]
+    pages = _STATS["pages"]
+    matches = _STATS["match_html"] + _STATS["api_match"]
+    pl = lambda n: "" if n == 1 else "s"  # noqa: E731 — tiny boot-log helper
+    print(f"[web] usage so far: {total} request{pl(total)}, {pages} page view{pl(pages)}, "
+          f"{matches} match{pl(matches)} (cumulative; log: logs/access.jsonl)", file=sys.stderr)
     try:
         n = len(get_queries())
         print(f"[web] loaded {n} SDG query sets", file=sys.stderr)
