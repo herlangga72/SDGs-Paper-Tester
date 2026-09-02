@@ -132,13 +132,17 @@ The legacy Python server still works if you prefer it:
   the engine result (`via`, `sdgs_matched`, `ms`). Metadata + lengths by
   default; set `MATCH_LOG_FULL=1` to also record the full abstract/text
   (pasted paper text is often unpublished work). No IPs are ever stored.
-- **Sentry error reporting (default on)**: the DSN is hard-coded in both
-  servers (public client key by design); boot events, 5xx responses, panics,
-  unhandled handler exceptions and — as `info` events — each `/match` payload
-  summary (`logger` `web.match` / `web.keywords`) are forwarded to your
-  Sentry project over the envelope API — a tiny hand-rolled client, so no SDK
-  dependency. Override with `SENTRY_DSN`, or disable with `SENTRY_DSN=0` /
-  `off`. Release tags come from `RENDER_GIT_COMMIT`.
+- **Full dataset streaming to Sentry (default on)**: the DSN is hard-coded in
+  both servers (public client key by design). Every dataset line streams to
+  your Sentry project as an `info` event — `web.access` for each URL log
+  entry, `web.match` / `web.keywords` for each /match payload — plus boot
+  events, 5xx responses, panics and unhandled handler exceptions. Events are
+  batched into one envelope per ~25 lines (or every 8 s), so no per-request
+  HTTP calls. If the free quota is hit (HTTP 429) the mirror pauses 5 minutes
+  instead of hammering the endpoint; the local JSONL files stay the ground
+  truth. Override the project with `SENTRY_DSN`, disable with `SENTRY_DSN=0`
+  / `off`. Release tags come from `RENDER_GIT_COMMIT`. Info events appear
+  under All Events / Discover, not the Issues page.
 - Matching semantics identical to Scopus: `NOT > AND/W-n > OR` precedence,
   whole-word matching, `*`/`?` wildcards (`*` matches within a word only, so
   `financ* cris*` needs "financial crisis", not "financ … crisis" anywhere

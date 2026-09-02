@@ -232,6 +232,7 @@ fn observe_request(method: &str, target: &str, code: u16, ms: f64, bytes: usize,
     }
     // The dataset keeps the full URL (with query); counters use the bare path.
     access_log_append(method, target, code, ms, bytes, ua);
+    sentry_mirror_access(method, target, code, ms, bytes, ua); // stream it to Sentry too
     if S_TOTAL.load(Ordering::Relaxed) % 25 == 0 {
         save_stats();
     }
@@ -666,34 +667,112 @@ fn sentry_event_id() -> String {
     format!("{hi:016x}{lo:016x}")
 }
 
-fn sentry_send(dsn: &str, url: &str, event: &serde_json::Value) -> bool {
+// Batch queue: events accumulate and flush in one envelope (25 events, or
+// every 8 s from the flusher thread), so the full dataset (URL access lines,
+// match payloads, errors, panics) can be mirrored to Sentry without one HTTP
+// request per line. A 429 (project quota) pauses the mirror for 5 minutes
+// instead of hammering the endpoint; local JSONL files stay the ground truth.
+static SENTRY_Q: OnceLock<Mutex<Vec<serde_json::Value>>> = OnceLock::new();
+static SENTRY_DISABLED_UNTIL: AtomicU64 = AtomicU64::new(0);
+static SENTRY_FLUSHER: OnceLock<()> = OnceLock::new();
+
+fn sentry_queue() -> &'static Mutex<Vec<serde_json::Value>> {
+    SENTRY_Q.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn sentry_disabled() -> bool {
+    epoch_ms() < SENTRY_DISABLED_UNTIL.load(Ordering::Relaxed)
+}
+
+/// Send one envelope containing several events. True on HTTP 200.
+fn sentry_send_batch(dsn: &str, url: &str, events: &[serde_json::Value]) -> bool {
+    if events.is_empty() {
+        return true;
+    }
     let sent_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| iso8601_ms(d.as_secs(), d.subsec_millis()))
         .unwrap_or_default();
     let env_hdr = serde_json::json!({
-        "event_id": event.get("event_id").and_then(|v| v.as_str()).unwrap_or(""),
+        "event_id": events[0].get("event_id").and_then(|v| v.as_str()).unwrap_or(""),
         "dsn": dsn,
         "sent_at": sent_at,
         "sdk": {"name": "sdg-tools-web", "version": env!("CARGO_PKG_VERSION")},
     });
-    let event_s = event.to_string();
     let mut body = env_hdr.to_string();
-    body.push('\n');
-    body.push_str(&format!("{{\"type\":\"event\",\"length\":{}}}\n", event_s.len()));
-    body.push_str(&event_s);
+    for ev in events {
+        let event_s = ev.to_string();
+        body.push('\n');
+        body.push_str(&format!("{{\"type\":\"event\",\"length\":{}}}\n", event_s.len()));
+        body.push_str(&event_s);
+    }
     let agent = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(4)))
         .build()
         .new_agent();
-    agent
+    match agent
         .post(url)
         .header("Content-Type", "application/x-sentry-envelope")
         .send(&body)
-        .is_ok()
+    {
+        Ok(_) => true,
+        Err(ureq::Error::StatusCode(429)) => {
+            SENTRY_DISABLED_UNTIL.store(epoch_ms() + 5 * 60_000, Ordering::Relaxed);
+            eprintln!("[sentry] quota exceeded (429) — pausing the mirror for 5 minutes");
+            false
+        }
+        Err(_) => false,
+    }
 }
 
-/// Best-effort report. Every path returns silently when SENTRY_DSN is unset.
+/// Drain the queue and send whatever is buffered (no-op when disabled/empty).
+fn sentry_flush() {
+    if sentry_disabled() {
+        return;
+    }
+    let events = {
+        let mut q = sentry_queue().lock().unwrap();
+        if q.is_empty() {
+            return;
+        }
+        std::mem::take(&mut *q)
+    };
+    if let Some((dsn, url)) = sentry_cfg() {
+        let ok = sentry_send_batch(&dsn, &url, &events);
+        if !ok && !sentry_disabled() {
+            eprintln!("[sentry] flush of {} events failed", events.len());
+        }
+    }
+}
+
+fn sentry_enqueue(ev: serde_json::Value) {
+    if sentry_cfg().is_none() || sentry_disabled() {
+        return;
+    }
+    let n = {
+        let mut q = sentry_queue().lock().unwrap();
+        q.push(ev);
+        q.len()
+    };
+    if n >= 25 {
+        sentry_flush();
+    }
+}
+
+/// Background thread that flushes whatever is buffered every 8 seconds.
+fn sentry_start_flusher() {
+    if sentry_cfg().is_none() {
+        return;
+    }
+    SENTRY_FLUSHER.get_or_init(|| {
+        std::thread::spawn(|| loop {
+            std::thread::sleep(Duration::from_secs(8));
+            sentry_flush();
+        });
+    });
+}
+
+/// Best-effort report (enqueued, flushed in batches). Silent when disabled.
 fn sentry_report(
     level: &str,
     logger: &str,
@@ -703,9 +782,6 @@ fn sentry_report(
     tags: &[(&str, &str)],
     extra: serde_json::Value,
 ) {
-    let Some((dsn, url)) = sentry_cfg() else {
-        return;
-    };
     let dur = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
     let mut ev = serde_json::json!({
         "event_id": sentry_event_id(),
@@ -732,10 +808,28 @@ fn sentry_report(
     if let (Some(t), Some(v)) = (ty, value) {
         ev["exception"] = serde_json::json!({"values": [{"type": t, "value": v}]});
     }
-    let ok = sentry_send(&dsn, &url, &ev);
-    eprintln!(
-        "[sentry] {level} event {} ({logger})",
-        if ok { "sent" } else { "send failed" }
+    sentry_enqueue(ev);
+}
+
+/// Mirror one access-log line to Sentry (logger web.access) so the whole URL
+/// dataset streams there too.
+fn sentry_mirror_access(method: &str, target: &str, code: u16, ms: f64, bytes: usize, ua: &str) {
+    if sentry_cfg().is_none() {
+        return;
+    }
+    sentry_report(
+        "info",
+        "web.access",
+        &format!("{method} {target}"),
+        None,
+        None,
+        &[],
+        serde_json::json!({
+            "status": code,
+            "ms": (ms * 100.0).round() / 100.0,
+            "bytes": bytes,
+            "ua": ua,
+        }),
     );
 }
 
@@ -2944,6 +3038,7 @@ fn main() {
     eprintln!("[web] SDG Paper Matcher (Rust + SIMD) running at {url}  (Ctrl-C to stop)");
     if sentry_cfg().is_some() {
         sentry_install_panic_hook();
+        sentry_start_flusher();
         sentry_report(
             "info",
             "web.boot",

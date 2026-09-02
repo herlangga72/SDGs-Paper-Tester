@@ -174,6 +174,7 @@ def _record_request(method: str, target: str, status: int, ms: float,
                            "ms": round(ms, 1), "bytes": size, "ua": ua[:256]},
                           ensure_ascii=True)
     _append_access_line(line)
+    sentry_mirror_access(method, target, status, ms, size, ua)  # stream to Sentry too
     if total % 25 == 0:
         _save_stats()
 
@@ -357,6 +358,14 @@ if _SENTRY_DSN.lower() in ("0", "off"):
 elif not _SENTRY_DSN:
     _SENTRY_DSN = _DEFAULT_SENTRY_DSN
 _SENTRY_SDK = {"name": "sdg-tools-web-py", "version": "2.0.0"}
+# Batch queue: events accumulate and flush in one envelope (25 events, or
+# every 8 s from the daemon flusher), so the full dataset streams to Sentry
+# without one HTTP request per line. A 429 (project quota) pauses the mirror
+# for 5 minutes; local JSONL files stay the ground truth.
+_SENTRY_Q: list[dict] = []
+_SENTRY_Q_LOCK = threading.Lock()
+_SENTRY_DISABLED_UNTIL = 0.0  # epoch seconds; 0 = enabled
+_SENTRY_FLUSHER_STARTED = False
 
 
 def _sentry_target() -> tuple[str, str] | None:
@@ -376,30 +385,89 @@ def _sentry_target() -> tuple[str, str] | None:
         return None
 
 
-def _sentry_send(dsn: str, url: str, event: dict) -> bool:
+def _sentry_disabled() -> bool:
+    return time.time() < _SENTRY_DISABLED_UNTIL
+
+
+def _sentry_send_batch(dsn: str, url: str, events: list[dict]) -> bool:
+    """POST one envelope containing several events; True on HTTP 200."""
     now = datetime.datetime.now(datetime.timezone.utc)
-    env_hdr = {"event_id": event["event_id"], "dsn": dsn,
+    env_hdr = {"event_id": events[0]["event_id"], "dsn": dsn,
                "sent_at": now.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
                "sdk": _SENTRY_SDK}
-    event_json = json.dumps(event, ensure_ascii=True)
-    payload = (json.dumps(env_hdr) + "\n" +
-               json.dumps({"type": "event", "length": len(event_json)}) + "\n" +
-               event_json).encode("utf-8")
+    chunks = [json.dumps(env_hdr, ensure_ascii=True)]
+    for ev in events:
+        event_json = json.dumps(ev, ensure_ascii=True)
+        chunks.append(json.dumps({"type": "event", "length": len(event_json)}))
+        chunks.append(event_json)
+    payload = "\n".join(chunks).encode("utf-8")
     req = urllib.request.Request(
         url, data=payload, method="POST",
         headers={"Content-Type": "application/x-sentry-envelope"})
-    with urllib.request.urlopen(req, timeout=4) as resp:
-        return resp.status == 200
+    try:
+        with urllib.request.urlopen(req, timeout=4) as resp:
+            return resp.status == 200
+    except urllib.error.HTTPError as e:
+        if e.code == 429:
+            global _SENTRY_DISABLED_UNTIL
+            _SENTRY_DISABLED_UNTIL = time.time() + 5 * 60
+            sys.stderr.write("[sentry] quota exceeded (429) — "
+                             "pausing the mirror for 5 minutes\n")
+        return False
+    except Exception:  # noqa: BLE001 — network hiccup; events are dropped
+        return False
+
+
+def _sentry_flush() -> None:
+    """Drain the queue and send whatever is buffered (no-op when disabled)."""
+    if _sentry_disabled():
+        return
+    with _SENTRY_Q_LOCK:
+        if not _SENTRY_Q:
+            return
+        events = _SENTRY_Q[:]
+        _SENTRY_Q.clear()
+    target = _sentry_target()
+    if not target:
+        return
+    dsn, url = target
+    ok = _sentry_send_batch(dsn, url, events)
+    if not ok and not _sentry_disabled():
+        sys.stderr.write(f"[sentry] flush of {len(events)} events failed\n")
+
+
+def _sentry_enqueue(ev: dict) -> bool:
+    if not _SENTRY_DSN or _sentry_disabled():
+        return False
+    with _SENTRY_Q_LOCK:
+        _SENTRY_Q.append(ev)
+        size = len(_SENTRY_Q)
+    if size >= 25:
+        _sentry_flush()
+    return True
+
+
+def _sentry_start_flusher() -> None:
+    """Daemon thread that flushes the queue every 8 seconds."""
+    global _SENTRY_FLUSHER_STARTED
+    if _SENTRY_FLUSHER_STARTED or not _SENTRY_DSN:
+        return
+    _SENTRY_FLUSHER_STARTED = True
+
+    def run():
+        while True:
+            time.sleep(8)
+            _sentry_flush()
+
+    threading.Thread(target=run, daemon=True).start()
 
 
 def sentry_report(level: str, logger: str, message: str,
                   exc: BaseException | None = None,
                   tags: dict | None = None, extra: dict | None = None) -> bool:
-    """Best-effort report; returns silently (False) when SENTRY_DSN is unset."""
-    target = _sentry_target()
-    if not target:
+    """Best-effort report (enqueued, flushed in batches). Silent when unset."""
+    if not _SENTRY_DSN:
         return False
-    dsn, url = target
     now = datetime.datetime.now(datetime.timezone.utc)
     ev = {"event_id": uuid.uuid4().hex,
           "timestamp": now.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
@@ -419,13 +487,15 @@ def sentry_report(level: str, logger: str, message: str,
     if exc is not None:
         ev["exception"] = {"values": [
             {"type": type(exc).__name__, "value": str(exc) or repr(exc)}]}
-    try:
-        sent = _sentry_send(dsn, url, ev)
-    except Exception as e:  # noqa: BLE001 — logging must never break a request
-        sys.stderr.write(f"[sentry] {level} event send failed: {e}\n")
-        return False
-    sys.stderr.write(f"[sentry] {level} event sent ({logger})\n")
-    return sent
+    return _sentry_enqueue(ev)
+
+
+def sentry_mirror_access(method: str, target: str, status: int, ms: float,
+                         size: int | None, ua: str) -> bool:
+    """Mirror one access-log line to Sentry (logger web.access)."""
+    return sentry_report("info", "web.access", f"{method} {target}",
+                         extra={"status": status, "ms": round(ms, 1),
+                                "bytes": size, "ua": ua})
 
 
 _PREV_THREAD_EXCEPTHOK = threading.excepthook
@@ -447,6 +517,9 @@ def _install_thread_excepthook() -> None:
                 args.exc_type, args.exc_value, args.exc_traceback)))
 
     threading.excepthook = hook
+
+
+_sentry_start_flusher()  # daemon: flush buffered events every 8 s
 
 # --------------------------------------------------------------------------
 # SDG metadata (official UN short names + brand colors)

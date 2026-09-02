@@ -48,12 +48,17 @@ abstract/text. No IPs are stored; a summary of each match also lands in
 Sentry as an `info` event (`web.match` / `web.keywords`). Pull the files
 before redeploying, since Render's disk is ephemeral.
 
-**Error reporting (default on):** the DSN is hard-coded in both servers (a
-public client key by design), so boot events, 5xx responses, panics and
-unhandled exceptions are forwarded to your Sentry project over the envelope
-API with no SDK install. Override the project with the `SENTRY_DSN` env var
-or disable entirely with `SENTRY_DSN=0` / `off`. The release is tagged from
-`RENDER_GIT_COMMIT` when present.
+**Sentry (default on, full dataset):** the DSN is hard-coded in both servers
+(a public client key by design). Every dataset line is mirrored to your
+Sentry project as an `info` event — `web.access` (each URL log entry),
+`web.match` / `web.keywords` (each /match payload) — plus boot events, 5xx
+responses, panics and unhandled exceptions, all over the envelope API with
+no SDK install. Events are batched (~25 per envelope or every 8 s); on a 429
+(free-tier quota) the mirror pauses 5 minutes and local JSONL files remain
+the ground truth. Override the project with the `SENTRY_DSN` env var or
+disable entirely with `SENTRY_DSN=0` / `off`. Info events appear under All
+Events / Discover. The release is tagged from `RENDER_GIT_COMMIT` when
+present.
 
 ---
 
