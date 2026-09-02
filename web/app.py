@@ -366,6 +366,8 @@ _SENTRY_Q: list[dict] = []
 _SENTRY_Q_LOCK = threading.Lock()
 _SENTRY_DISABLED_UNTIL = 0.0  # epoch seconds; 0 = enabled
 _SENTRY_FLUSHER_STARTED = False
+_SENTRY_DAY = 0
+_SENTRY_DAY_COUNT = 0
 
 
 def _sentry_target() -> tuple[str, str] | None:
@@ -437,9 +439,22 @@ def _sentry_flush() -> None:
 
 
 def _sentry_enqueue(ev: dict) -> bool:
+    global _SENTRY_DAY, _SENTRY_DAY_COUNT
     if not _SENTRY_DSN or _sentry_disabled():
         return False
     with _SENTRY_Q_LOCK:
+        cap = int(os.environ.get("SENTRY_CAP", "1500") or 1500)
+        day = int(time.time()) // 86400
+        if _SENTRY_DAY != day:
+            _SENTRY_DAY = day
+            _SENTRY_DAY_COUNT = 0
+        n = _SENTRY_DAY_COUNT
+        _SENTRY_DAY_COUNT += 1
+        if n == cap:
+            sys.stderr.write("[sentry] daily cap reached — "
+                             "mirror paused until midnight UTC\n")
+        if n >= cap:
+            return False
         _SENTRY_Q.append(ev)
         size = len(_SENTRY_Q)
     if size >= 25:
@@ -492,7 +507,20 @@ def sentry_report(level: str, logger: str, message: str,
 
 def sentry_mirror_access(method: str, target: str, status: int, ms: float,
                          size: int | None, ua: str) -> bool:
-    """Mirror one access-log line to Sentry (logger web.access)."""
+    """Mirror one access-log line to Sentry (logger web.access). Only
+    meaningful routes stream: page loads, sample/DOI lookups and match
+    endpoints. Static assets (/static/*.css, *.js, ...), /samples auto-fetch,
+    health checks and the stats/logs endpoints never reach Sentry.
+    SENTRY_STREAM=off disables even this."""
+    if os.environ.get("SENTRY_STREAM", "").strip().lower() == "off":
+        return False
+    path = target.split("?", 1)[0]
+    worthy = (path in ("/", "/index.html")
+              or (path.startswith("/sample") and path != "/samples")
+              or path.startswith("/doi")
+              or path in ("/match", "/api/match", "/api/keywords"))
+    if not worthy:
+        return False
     return sentry_report("info", "web.access", f"{method} {target}",
                          extra={"status": status, "ms": round(ms, 1),
                                 "bytes": size, "ua": ua})

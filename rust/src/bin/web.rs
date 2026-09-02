@@ -675,6 +675,31 @@ fn sentry_event_id() -> String {
 static SENTRY_Q: OnceLock<Mutex<Vec<serde_json::Value>>> = OnceLock::new();
 static SENTRY_DISABLED_UNTIL: AtomicU64 = AtomicU64::new(0);
 static SENTRY_FLUSHER: OnceLock<()> = OnceLock::new();
+static SENTRY_DAY: AtomicU64 = AtomicU64::new(0);
+static SENTRY_DAY_COUNT: AtomicU64 = AtomicU64::new(0);
+
+fn sentry_daily_cap() -> u64 {
+    std::env::var("SENTRY_CAP")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(1500)
+}
+
+/// Count one event against the per-UTC-day cap; returns false when paused.
+fn sentry_count_event() -> bool {
+    let cap = sentry_daily_cap();
+    let day = epoch_ms() / 86_400_000;
+    let cur = SENTRY_DAY.load(Ordering::Relaxed);
+    if cur != day {
+        let _ = SENTRY_DAY.compare_exchange(cur, day, Ordering::Relaxed, Ordering::Relaxed);
+        SENTRY_DAY_COUNT.store(0, Ordering::Relaxed);
+    }
+    let n = SENTRY_DAY_COUNT.fetch_add(1, Ordering::Relaxed);
+    if n == cap {
+        eprintln!("[sentry] daily cap {cap} reached — mirror paused until midnight UTC");
+    }
+    n < cap
+}
 
 fn sentry_queue() -> &'static Mutex<Vec<serde_json::Value>> {
     SENTRY_Q.get_or_init(|| Mutex::new(Vec::new()))
@@ -746,7 +771,7 @@ fn sentry_flush() {
 }
 
 fn sentry_enqueue(ev: serde_json::Value) {
-    if sentry_cfg().is_none() || sentry_disabled() {
+    if sentry_cfg().is_none() || sentry_disabled() || !sentry_count_event() {
         return;
     }
     let n = {
@@ -811,10 +836,28 @@ fn sentry_report(
     sentry_enqueue(ev);
 }
 
-/// Mirror one access-log line to Sentry (logger web.access) so the whole URL
-/// dataset streams there too.
+/// Mirror one access-log line to Sentry (logger web.access). Only meaningful
+/// routes stream: page loads, sample/DOI lookups and match endpoints. Static
+/// assets (/static/*.css, *.js, ...), /samples auto-fetch, health checks and
+/// the stats/logs endpoints never reach Sentry — request-based hosts would
+/// otherwise burn the monthly event quota on CSS/JS. SENTRY_STREAM=off
+/// disables even this. All events also count against the daily cap.
 fn sentry_mirror_access(method: &str, target: &str, code: u16, ms: f64, bytes: usize, ua: &str) {
-    if sentry_cfg().is_none() {
+    if std::env::var("SENTRY_STREAM")
+        .map(|v| v.eq_ignore_ascii_case("off"))
+        .unwrap_or(false)
+    {
+        return;
+    }
+    let path = target.split('?').next().unwrap_or(target);
+    let worthy = path == "/"
+        || path == "/index.html"
+        || (path.starts_with("/sample") && path != "/samples")
+        || path.starts_with("/doi")
+        || path == "/match"
+        || path == "/api/match"
+        || path == "/api/keywords";
+    if !worthy {
         return;
     }
     sentry_report(

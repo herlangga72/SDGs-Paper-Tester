@@ -48,17 +48,18 @@ abstract/text. No IPs are stored; a summary of each match also lands in
 Sentry as an `info` event (`web.match` / `web.keywords`). Pull the files
 before redeploying, since Render's disk is ephemeral.
 
-**Sentry (default on, full dataset):** the DSN is hard-coded in both servers
-(a public client key by design). Every dataset line is mirrored to your
-Sentry project as an `info` event — `web.access` (each URL log entry),
-`web.match` / `web.keywords` (each /match payload) — plus boot events, 5xx
-responses, panics and unhandled exceptions, all over the envelope API with
-no SDK install. Events are batched (~25 per envelope or every 8 s); on a 429
-(free-tier quota) the mirror pauses 5 minutes and local JSONL files remain
-the ground truth. Override the project with the `SENTRY_DSN` env var or
-disable entirely with `SENTRY_DSN=0` / `off`. Info events appear under All
-Events / Discover. The release is tagged from `RENDER_GIT_COMMIT` when
-present.
+**Sentry (default on, quota-safe):** the DSN is hard-coded in both servers
+(a public client key by design). Boot events, 5xx responses, panics,
+unhandled exceptions and every /match payload (`web.match` / `web.keywords`)
+always stream. Meaningful URL events (`web.access`) also stream — page
+loads, sample/DOI lookups, match submissions — but never static CSS/JS, the
+`/samples` auto-fetch, health checks or the stats/logs endpoints. Events are
+batched (~25 per envelope or every 8 s) and capped per UTC day (`SENTRY_CAP`,
+default 1500), so a busy day pauses instead of exhausting the monthly quota;
+`SENTRY_STREAM=off` disables the URL mirror. Local JSONL files remain the
+ground truth. Override the project with the `SENTRY_DSN` env var or disable
+the mirror entirely with `SENTRY_DSN=0` / `off`. The release is tagged from
+`RENDER_GIT_COMMIT` when present.
 
 ---
 
