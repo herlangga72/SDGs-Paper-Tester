@@ -1,0 +1,63 @@
+
+digraph D3 {
+  graph [rankdir=TB, splines=polyline, nodesep=0.28, ranksep=0.45, fontname="Helvetica", fontsize=10, bgcolor="white", pad="0.15"];
+  node  [shape=box, style="rounded,filled", fillcolor="#eef3fb", color="#4472c4", fontname="Helvetica", fontsize=10, margin="0.12,0.05"];
+  edge  [color="#5b5b5b", arrowsize=0.7, fontname="Helvetica", fontsize=9];
+
+  acc [label="ACCEPT LOOP (web.rs:2061)\nfor stream in listener.incoming()  { spawn thread }", shape=ellipse, style=filled, fillcolor="#fde9d9", color="#c55a11"];
+
+  subgraph cluster_conn {
+    label="ONE CONNECTION = ONE THREAD  (handle_conn, web.rs:1885)";
+    style="rounded,dashed"; color="#999"; fontname="Helvetica-Bold"; fontsize=11;
+    h1 [label="HEADER READ LOOP (1889-1903)\nread() 8 KiB chunks into buf until '\\r\\n\\r\\n'\n(or > 1 MiB -> drop)"];
+    h2 [label="parse request line + headers (1904-1922)\ncontent-length captured"];
+    h3 [label="BODY READ LOOP (1926-1933)\nkeep read()ing until content-length reached"];
+    h4 [label="route(method, path, headers, body)\n(1842) : match on method + path"];
+    h1 -> h2 -> h3 -> h4;
+  }
+
+  subgraph cluster_get {
+    label="GET routes (route_get 1597)";
+    style="rounded,dashed"; color="#999"; fontname="Helvetica-Bold"; fontsize=11;
+    g1 [label="'/' -> index.html from disk\n'/static/x' -> css/js (basename only)\n'/samples' -> samples_json()\n(scan papers dir)\n'/sample?name=&format=json' ->\nPaper::from_owned_with_meta(sample)"];
+    g2 [label="'/doi?doi=' -> network\nnormalize/validate DOI (665-700)\nCrossref REST API (fetch_doi 919)\nif no subject: fetch landing page\nHTML -> citation_keywords meta tag\nor publisher Keywords block\n(GET only; slow, outside match timer)"];
+    g3 [label="'/health' -> 'ok'"];
+    g1; g2; g3;
+  }
+
+  subgraph cluster_post {
+    label="POST pipelines  (shared run_match 1692)";
+    style="rounded,dashed"; color="#999"; fontname="Helvetica-Bold"; fontsize=11;
+    p1 [label="parse body: multipart/form-data OR\nurlencoded -> (fields, files)\n(parse_urlencoded 1351 /\nparse_multipart 1408)"];
+    p2 [label="paper_from_request (1660)\nA) any of title/abstract/keywords/...\n   -> paper_from_fields (350)\nB) else raw 'paper' text or uploaded\n   file -> Paper::from_owned_with_meta"];
+    p3 [label="PAPER BUILD (paper.rs)\nYAML-subset frontmatter parse\n+ legacy TITLE:/ABSTRACT:/KEYWORDS:\nmarkers (line scan)\nsections [TITLE,ABS,KEY,AUTHKEY]\nlower_ascii() each section\n+ full text (SIMD)\nfull_covers_sections flag\nzero-copy body slice"];
+    p4 [label="run_match: clamp top (1..30),\nmaxkw (1..50); t0 = Instant::now()\n-> match_report(&paper)  [see D4]\n-> ms = elapsed  (X-Processing-Time)"];
+    p5 [label="'/match' -> render_results HTML\n(render + highlight, web.rs:1059)"];
+    p6 [label="'/api/match' -> serde_json report\n{ms, sdgs:[{sdg, matched, near,\nnear_total, excluded, suggestions}]}"];
+    p1 -> p2 -> p3 -> p4;
+    p4 -> p5 [label="/match"];
+    p4 -> p6 [label="/api/match"];
+  }
+
+  subgraph cluster_kw {
+    label="Advanced tab:  POST /api/keywords (1784)";
+    style="rounded,dashed"; color="#999"; fontname="Helvetica-Bold"; fontsize=11;
+    k1 [label="parse body -> paper (same as above)\nsdg param -> index qi\nlimit (1..2000)"];
+    k2 [label="scan every FlatBlock of SDG qi\n(scan_flat_into, hits only) ->\n'present' keyword set (memozed)"];
+    k3 [label="text_words(paper) once\nscore_keywords() ALL unique keywords\nof that SDG (sort desc, truncate)"];
+    k4 [label="JSON {total, present, keywords}"];
+    k1 -> k2 -> k3 -> k4;
+  }
+
+  gz [label="maybe_gzip (1870): if body >= 512 B\nand Accept-Encoding: gzip and\ntext/json/js -> flate2 GzEncoder\n(fast level)"];
+  out [label="write HTTP/1.1 response head + body,\nConnection: close (1953)\nlog [web] METHOD target -> code", shape=ellipse, style=filled, fillcolor="#dff0d8", color="#3c763d"];
+
+  acc -> h1;
+  h4 -> g1 [label="GET"];
+  h4 -> p1 [label="POST /match"];
+  h4 -> p1 [label="POST /api/match"];
+  h4 -> k1 [label="POST /api/keywords"];
+  h4 -> g3 [label="GET /health"];
+  p5 -> gz; p6 -> gz; k4 -> gz; g1 -> gz; g2 -> gz; g3 -> gz;
+  gz -> out;
+}

@@ -1,0 +1,66 @@
+
+digraph D1 {
+  graph [rankdir=LR, splines=polyline, nodesep=0.35, ranksep=0.6, fontname="Helvetica", fontsize=10, bgcolor="white"];
+  node  [shape=box, style="rounded,filled", fillcolor="#eef3fb", color="#4472c4", fontname="Helvetica", fontsize=10, margin="0.12,0.06"];
+  edge  [color="#5b5b5b", arrowsize=0.7, fontname="Helvetica", fontsize=9];
+
+  subgraph cluster_entries {
+    label="ENTRY POINTS (4 binaries / scripts)"; style="rounded,dashed"; color="#999"; fontname="Helvetica-Bold"; fontsize=11;
+    web   [label="web server\nrust/src/bin/web.rs\nthread-per-connection HTTP/1.1", fillcolor="#dff0d8", color="#3c763d"];
+    cli   [label="sdg_tools CLI  (parse | match)\nrust/src/main.rs", fillcolor="#dff0d8", color="#3c763d"];
+    pycli [label="Python reference CLI\nengine/match_paper.py", fillcolor="#fcf8e3", color="#8a6d3b"];
+    pyweb [label="Legacy Python web server\nweb/app.py  (WSGI)", fillcolor="#fcf8e3", color="#8a6d3b"];
+  }
+
+  subgraph cluster_boot {
+    label="BOOT-ONCE ENGINE  (rust/src/{query,parser,tokenizer,cache}.rs)";
+    style="rounded,dashed"; color="#999"; fontname="Helvetica-Bold"; fontsize=11;
+    parse [label="tokenize() + Parser\nSDG01..17.txt  ->  AST  (211k nodes)\nScopus leniency: dangling OR/AND/W-n,\nunquoted phrases, {..}, *, ?"];
+    compile [label="compile_all() + resolve_blocks()\n21,148 patterns -> blob  (Pattern{off,len})\n41,582 memo slots stamped on leaves"];
+    flatten [label="flatten_block() x 2,975\nAST -> postfix program (Op[8B]) +\nflat LeafDesc list (20B), leaked/'static"];
+    dict [label="collect_sdg_dict() x 17\nunique include keywords, pre-tokenized"];
+    cache [label="sdg_cache.bin  write / mmap read\n(validated by query mtimes)"];
+    parse -> compile -> flatten -> dict -> cache;
+  }
+
+  subgraph cluster_core {
+    label="PER-REQUEST MATCH CORE  (rust/src/matcher.rs, paper.rs)";
+    style="rounded,dashed"; color="#999"; fontname="Helvetica-Bold"; fontsize=11;
+    memo  [label="Memo: per-request\nterm cache (Vec<u8> by slot)\n+ joined field buffers\n+ lazy TextIndex per buffer"];
+    idx   [label="TextIndex pre-filter\nbyte set + bigram matrix (8 KiB)\n+ quad Bloom + first-quad positions"];
+    flat  [label="FlatBlock scan (postfix VM)\n+ MinAdd near-miss analyser\n(arena SoA stacks)"];
+    sug   [label="Suggestions / scoring\nPaperWords set + sorted slice"];
+    memo -> flat; idx -> flat; sug;
+  }
+
+  subgraph cluster_simd {
+    label="SIMD KERNELS  (rust/src/simd.rs)  AVX-512 | AVX2 | SSE4.2 | SSE4.1 | SSSE3 | SSE3 | scalar";
+    style="rounded,dashed"; color="#999"; fontname="Helvetica-Bold"; fontsize=11;
+    k1 [label="lower_ascii()   case folding"];
+    k2 [label="find()          substring search\n1B / 2-3B / 4+B needle classes"];
+    k3 [label="any_ws()        whitespace in gap"];
+    k4 [label="next_special()  tokenizer\nskip_ws() whitespace runs"];
+    k1;k2;k3;k4;
+  }
+
+  subgraph cluster_data {
+    label="STATIC DATA"; style="rounded,dashed"; color="#999"; fontname="Helvetica-Bold"; fontsize=11;
+    qf [label="engine/data/queries/SDG01..17.txt\n(Elsevier Scopus queries)"];
+    sf [label="papers/*.md  (samples)\nweb/static/*  (UI)"];
+    qf; sf;
+  }
+
+  client [label="Browser / curl / scripts", shape=ellipse, style=filled, fillcolor="#fde9d9", color="#c55a11"];
+
+  client -> web [label="HTTP"];
+  web  -> memo [label="POST /match, /api/match\n/api/keywords"];
+  cli  -> memo [label="sdg_tools match paper"];
+  pycli-> parse;
+  pyweb-> memo [style=dotted, label="(uses Python copy)"];
+
+  web -> cache; cli -> cache;
+  cache -> qf [label="mtime check", style=dotted];
+  parse -> qf [dir=back, style=dotted, label="reads"];
+  web -> sf [style=dotted, label="serves"];
+
+}

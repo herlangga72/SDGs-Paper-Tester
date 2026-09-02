@@ -1,0 +1,59 @@
+
+digraph D4 {
+  graph [rankdir=TB, splines=polyline, nodesep=0.25, ranksep=0.5, fontname="Helvetica", fontsize=10, bgcolor="white", pad="0.12"];
+  node  [shape=box, style="rounded,filled", fillcolor="#eef3fb", color="#4472c4", fontname="Helvetica", fontsize=10, margin="0.11,0.04"];
+  edge  [color="#5b5b5b", arrowsize=0.7, fontname="Helvetica", fontsize=9];
+
+  start [label="match_report(paper, top, max_kw)   web.rs:242\none Memo + one MinAddScratch + word set for the whole request", shape=ellipse, style=filled, fillcolor="#fde9d9", color="#c55a11"];
+
+  l1 [label="LOOP 1 - per SDG (17)\nweb.rs:257  for (qi, q) in queries.iter()", fillcolor="#fff2cc", color="#bf9000"];
+  l2 [label="LOOP 2 - per block of SDG (2,975 total)\nweb.rs:267  for (bno, flat) in flats[qi].iter()\nclear reused hits/misses/ex_hits vecs", fillcolor="#fff2cc", color="#bf9000"];
+  scan [label="scan_flat_into(flat, table, memo,\n&mut hits, &mut misses, &mut ex_hits)\n(matcher.rs:1472)   == single pass gives\nverdict + keyword lists together"];
+  push [label="LOOP 2a - per op of postfix program\nmatcher.rs:1489  for op in flat.prog\nmatch op.tag { ... }  (8 tags)  <- interpreter\nstack: BoolStack (32 inline + heap spill,\nonly SDG07 b1 goes deeper)", fillcolor="#fff2cc", color="#bf9000"];
+  push2 [label="op = OP_PUSH (one per leaf occurrence;\n93,354 pushes per full request):\nleaf = flat.leaves[payload]\nv = memo.term_hit(pattern[pid], mask, slot)\nclassify: excluded? ex_hits : hit? hits : misses\n      (each push = one Vec push + raw() slice)\nop = OP_ANDN/OP_ORN: BoolStack.fold_top(k)\nop = OP_NOT/AND/OR: pop/push\nprograms are fixed at boot, so per-op\ndispatch branch repeats 140k x/request"];
+  memo1 [label="term_hit (matcher.rs:1122)\nslot < terms.len()?\n  terms[slot]==1/2 -> cache HIT (return)\n  0 -> compute + store\nper-request cache: 41,582 slots\n93,354 pushes -> ~52k hits / ~41.6k computes\non a full report"];
+  compute [label="compute(pat, mask)  (matcher.rs:1169)\nmask 0 -> default TITLE-ABS-KEY (15)\njoined_for(mask)  -> folded buffer"];
+  join [label="joined_for (1032)  [once per mask/request]\nmask -> dedup buffer ids (<=5)\njoin_cache signature key (u64) shared fold:\n  same id set -> same buffer + ONE TextIndex\ncopy sections with '\\n' separators (if not\nsingle full-text borrow)\nsegs for '?'-glob per-field semantics"];
+  idx [label="entry.idx.is_none() ->\nTextIndex::build(buffer)  [see D4b]"];
+  filt [label="pat.could_match(idx)  filter\n(780): for EVERY literal part:\nidx.could_contain(part)\n1B: byte bit | 2-3B: bigram matrix\n4+B: 2 bloom probes (first+last quad)"];
+  ms [label="pat.matches_indexed(buffer, idx)\n(837)"];
+  mc1 [label="part0 >= 4 B:\nidx.could_contain_all(part0)\n(all quad windows in bloom) else FALSE"];
+  mc2 [label="positions(first-quad) lookup:\nNone -> quad absent: FALSE (no scan)\nSome(<=1024 candidates) -> LOOP 3:\nfor p in positions: starts_at() u64-compare\n  plain term: + word-boundary check\n  wildcard: rest_matches_at (LOOP 4)\nSome(>1024, repetitive) -> skip: streaming"];
+  mc3 [label="LOOP 4 - remaining literal parts\nrest_matches_at / matches:  for k in 1..n_parts:\n  find(part_k) then any_ws(gap)==false\n  else advance one byte and retry\n(SIMD find loop, see D5)"];
+  mfall [label="fallback: pat.matches(buffer)\nplain: find_boundary(683): LOOP:\nfind() until word boundaries both sides\nwildcard-star: first part find + gap rule\n'?'-glob: glob_match O(n*m) backtracking\n(only 3 corpus patterns; memoized)"];
+  store [label="store verdict back in terms[slot] (1/2)"];
+  after [label="back in LOOP 2: if is_match -> matched\nlist (dedupe_kw) else near-miss path"];
+
+  start -> l1 -> l2 -> scan -> push -> push2 -> memo1 -> compute -> join -> idx -> filt -> ms -> mc1 -> mc2 -> mc3;
+  mc2 -> mfall [style=dotted, label="common-quad fallback"];
+  ms -> mfall [style=dotted, label="short parts"];
+  memo1 -> store [style=dotted, label="cold path only"];
+  filt -> store [style=invis];
+  mc1 -> store [style=invis];
+  mc3 -> store [style=dotted, label="false"];
+  mc2 -> store [style=dotted, label="false"];
+  {rank=same; filt ms;}
+
+  subgraph cluster_near {
+    label="after the block scan - NEAR-MISS analysis per non-matched block";
+    style="rounded,dashed"; color="#999"; fontname="Helvetica-Bold"; fontsize=11;
+    n1 [label="min_add_flat_cost(flat,...) (1877)\nLOOP: again over whole prog, SoA (bool,u32)\nstack; NO allocations; memo makes every\nleaf a cache hit -> pure op arithmetic"];
+    n2 [label="cost == INF_U32 ?\n(required-path NOT already true)\n-> eval_ignore_not_block(block) tree walk\n(2333); if positive side alone matched:\nreport excluded_hits as 'disqualified'\nelse block is off-topic, drop"];
+    n3 [label="cost finite:\nmin_add_flat(flat,...) (1966) FULL pass:\narena-backed need-groups (kw Vec<&str>,\ngroups slices, fp-dedup HashMaps)\n-> exact min keywords to add + 'any ONE\nkeyword from each box' candidate groups\nweb: run for EVERY finite block to feed\nsolo/extra suggestion badges (web.rs:301)"];
+    n4 [label="collect per-SDG: matched blocks,\nnear list (cost, hits), excluded set;\nsort near by (cost asc, -hits) (web.rs:322);\ntake top (default 10-30); suggest_keywords\n(dict of SDG, PaperWords set, present)\n-> 10 suggestions per SDG"];
+    n1 -> n2 -> n3 -> n4;
+  }
+  after -> n1;
+  n4 -> done [label="next SDG"];
+  done [shape=ellipse, style=filled, fillcolor="#dff0d8", color="#3c763d", label="return Vec<SdgReport>\nthen HTML render (highlight pass, web.rs:1059)\nor JSON serialization"];
+
+  // D4b - TextIndex build detail
+  subgraph cluster_idx {
+    label="D4b: TextIndex::build(buffer)  matcher.rs:278-413";
+    style="rounded,dashed"; color="#999"; fontname="Helvetica-Bold"; fontsize=11;
+    b1 [label="buffer < 256 KiB -> serial one pass\n>= 256 KiB -> LOOP: spawn 1 thread per\n256 KiB chunk (scoped, no rayon) +\nmerge (OR of dense arrays,\nconcat capped position lists)"];
+    b2 [label="per chunk:\nLOOP windows(2): bigrams matrix  [2 loads]\nLOOP windows(4): quads Bloom, 2 hashes\n   each window (or 64K-bit needed-quad\n   filter probe when pattern quads exist)\nLOOP bytes: byte-present table\nLOOP windows(4) again + hash probe:\nonly needed first-quads -> positions map\n(per quad capped at 1,024 entries)"];
+    b1 -> b2;
+  }
+  idx -> b1;
+}

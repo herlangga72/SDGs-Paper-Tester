@@ -1,0 +1,38 @@
+
+digraph D2 {
+  graph [rankdir=TB, splines=polyline, nodesep=0.3, ranksep=0.5, fontname="Helvetica", fontsize=10, bgcolor="white"];
+  node  [shape=box, style="rounded,filled", fillcolor="#eef3fb", color="#4472c4", fontname="Helvetica", fontsize=10, margin="0.14,0.06"];
+  edge  [color="#5b5b5b", arrowsize=0.7, fontname="Helvetica", fontsize=9];
+  dec   [shape=diamond, style=filled, fillcolor="#fff2cc", color="#bf9000", label="sdg_cache.bin exists\nAND magic 'SDGC'\nAND version == 3\nAND every query mtime matches?"];
+
+  start [label="process start:\nCLI: every invocation (main.rs:34)\nWEB: first request ever (OnceLock APP,\nweb.rs:110 app())  -- CLI also primes once\nvia get_queries() before binding (web.rs:2044)",
+         shape=ellipse, style=filled, fillcolor="#fde9d9", color="#c55a11"];
+
+  warm [label="WARM PATH  (~2-6 ms)", fillcolor="#dff0d8", color="#3c763d"];
+  w1 [label="mmap sdg_cache.bin (memmap2,\nBox::leak -> 'static, zero copies)"];
+  w2 [label="validate header: magic, version, mtimes\n(linear scan, cache.rs read_cached)"];
+  w3 [label="set_blob() -> process string blob;\nview mmap region directly as\n&[Pattern], &[Op], &[LeafDesc]\n(zero-copy, cache.rs)"];
+  w4 [label="rebuild_first_quads(patterns)\n(matcher.rs:2943) fills global first-quad\nset used by TextIndex position pass"];
+  w5 [label="ready: 2,975 FlatBlocks (prog+leaves),\n17 SdgDicts (owned rebuild), AST queries"];
+
+  cold [label="COLD PATH  (~70-80 ms, one time)", fillcolor="#fbe5e6", color="#c0392b"];
+  c1 [label="query::load_queries: read 17 files\nSDG01..17.txt (SDG-number sort)"];
+  c2 [label="tokenizer (SIMD scan_quoted/braced)\n+ recursive-descent Parser\n-> 2,975 top-level blocks,\n211,202 AST nodes (leniency rules)"];
+  c3 [label="compile_all(): dedupe 93,354 leaf\noccurrences -> 21,148 unique patterns;\nbuild one string blob (raw/lower/parts/\nparts-table); leak blob; Pattern[]\n(21,148 x 28 B); update FIRST_QUADS"];
+  c4 [label="resolve_blocks(): stamp each AST leaf\npid + effective field mask + dense slot\n41,582 unique (pid,mask) pairs"];
+  c5 [label="flatten_block() per block:\npostfix program (Op 8 B) +\nLeafDesc list (20 B); leak to 'static"];
+  c6 [label="collect_sdg_dict() x 17:\ninclude keywords (Arc<str>) + excluded\nsets; pretokenize overlap tokens"];
+  c7 [label="write_cache(): serialize blob + patterns\n+ flats + dicts + AST + mtimes\nto sdg_cache.bin"];
+
+  start -> dec;
+  dec -> cold [label="no"];
+  dec -> warm [label="yes"];
+  cold -> c1 -> c2 -> c3 -> c4 -> c5 -> c6 -> c7 -> w5;
+  warm -> w1 -> w2 -> w3 -> w4 -> w5;
+  w5 -> done [label="boot completes"];
+  done [label="RUN (web accept loop / CLI match)\nper-request work now uses\n'static tables only - no parsing, no\nkeyword hashing, no per-boot compile",
+        shape=ellipse, style=filled, fillcolor="#dff0d8", color="#3c763d"];
+
+  note [shape=note, style=filled, fillcolor="#f4f4f4", color="#666",
+        label="Cache validity = query file mtimes only (cache.rs:36).\nTouch SDG*.txt -> automatic rebuild next start.\nAlso: sdg2sqlite.py / parse_sdg.py (Python) is the\nseparate legacy DB pipeline used by web/app.py."];
+}

@@ -116,11 +116,15 @@ pub fn lower_ascii(s: &[u8]) -> Vec<u8> {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw")]
 unsafe fn lower_ascii_avx512(s: &[u8]) -> Vec<u8> {
-    let mut out = s.to_vec();
-    let n = out.len();
+    // Fused copy+fold: the source is read once and the destination written
+    // once. (The old code did out = s.to_vec() and then folded the copy in
+    // place, re-reading every written cache line - on buffers bigger than
+    // L2 that is ~2x the DRAM traffic for no benefit.)
+    let n = s.len();
+    let mut out = vec![0u8; n];
     let mut i = 0;
     while i + 64 <= n {
-        let chunk = _mm512_loadu_si512(out.as_ptr().add(i) as *const __m512i);
+        let chunk = _mm512_loadu_si512(s.as_ptr().add(i) as *const __m512i);
         // Branchless upper-case mask via two compares: 'A' <= c <= 'Z'.
         let ge_a = _mm512_cmpgt_epi8_mask(chunk, _mm512_set1_epi8(b'A' as i8 - 1));
         let le_z = _mm512_cmplt_epi8_mask(chunk, _mm512_set1_epi8(b'Z' as i8 + 1));
@@ -129,8 +133,9 @@ unsafe fn lower_ascii_avx512(s: &[u8]) -> Vec<u8> {
         _mm512_storeu_si512(out.as_mut_ptr().add(i) as *mut __m512i, lc);
         i += 64;
     }
-    for c in out[i..].iter_mut() {
-        *c = c.to_ascii_lowercase();
+    while i < n {
+        out[i] = s[i].to_ascii_lowercase();
+        i += 1;
     }
     out
 }
@@ -138,11 +143,13 @@ unsafe fn lower_ascii_avx512(s: &[u8]) -> Vec<u8> {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn lower_ascii_avx2(s: &[u8]) -> Vec<u8> {
-    let mut out = s.to_vec();
-    let n = out.len();
+    // Fused copy+fold: one source read + one destination write per byte
+    // (see lower_ascii_avx512 for why the old copy-then-fold was wasteful).
+    let n = s.len();
+    let mut out = vec![0u8; n];
     let mut i = 0;
     while i + 32 <= n {
-        let chunk = _mm256_loadu_si256(out.as_ptr().add(i) as *const __m256i);
+        let chunk = _mm256_loadu_si256(s.as_ptr().add(i) as *const __m256i);
         // Branchless upper-case mask via two compares: 'A' <= c <= 'Z'.
         let ge_a = _mm256_cmpgt_epi8(chunk, _mm256_set1_epi8(b'A' as i8 - 1));
         // chunk < 'Z'+1 (0x5B); non-ASCII bytes are signed-negative, so
@@ -153,8 +160,9 @@ unsafe fn lower_ascii_avx2(s: &[u8]) -> Vec<u8> {
         _mm256_storeu_si256(out.as_mut_ptr().add(i) as *mut __m256i, lc);
         i += 32;
     }
-    for c in out[i..].iter_mut() {
-        *c = c.to_ascii_lowercase();
+    while i < n {
+        out[i] = s[i].to_ascii_lowercase();
+        i += 1;
     }
     out
 }
@@ -540,11 +548,13 @@ unsafe fn skip_ws_avx2(text: &[u8], mut i: usize) -> usize {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse3")]
 unsafe fn lower_ascii_sse3(s: &[u8]) -> Vec<u8> {
-    let mut out = s.to_vec();
-    let n = out.len();
+    // Fused copy+fold: one source read + one destination write per byte
+    // (see lower_ascii_avx512 for why the old copy-then-fold was wasteful).
+    let n = s.len();
+    let mut out = vec![0u8; n];
     let mut i = 0;
     while i + 16 <= n {
-        let chunk = _mm_loadu_si128(out.as_ptr().add(i) as *const __m128i);
+        let chunk = _mm_loadu_si128(s.as_ptr().add(i) as *const __m128i);
         // Branchless upper-case mask via two compares: 'A' <= c <= 'Z'.
         // Benchmarked faster than the saturating-subtract range trick
         // (LLVM autovectorizes the naive map into this form too).
@@ -555,8 +565,9 @@ unsafe fn lower_ascii_sse3(s: &[u8]) -> Vec<u8> {
         _mm_storeu_si128(out.as_mut_ptr().add(i) as *mut __m128i, lc);
         i += 16;
     }
-    for c in out[i..].iter_mut() {
-        *c = c.to_ascii_lowercase();
+    while i < n {
+        out[i] = s[i].to_ascii_lowercase();
+        i += 1;
     }
     out
 }

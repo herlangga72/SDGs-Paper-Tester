@@ -6,6 +6,7 @@
 //!   - `web` (src/bin/web.rs): the HTTP server (was web/app.py)
 
 pub mod ast;
+pub mod cpu;
 pub mod cache;
 pub mod matcher;
 pub mod paper;

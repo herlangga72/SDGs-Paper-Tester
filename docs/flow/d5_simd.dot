@@ -1,0 +1,61 @@
+
+digraph D5 {
+  graph [rankdir=TB, splines=polyline, nodesep=0.25, ranksep=0.5, fontname="Helvetica", fontsize=10, bgcolor="white", pad="0.12"];
+  node  [shape=box, style="rounded,filled", fillcolor="#eef3fb", color="#4472c4", fontname="Helvetica", fontsize=10, margin="0.11,0.04"];
+  edge  [color="#5b5b5b", arrowsize=0.7, fontname="Helvetica", fontsize=9];
+
+  top [label="THE 'INSTRUCTION-SET PER KERNEL, RUN TO COMPLETION' PATTERN\n----------------------------------------\nEvery kernel below is written as:\n  1) ONE dispatch decision per process (CPUID once, simd.rs:54)\n  2) vector MAIN LOOP: while i+W <= n  { load W bytes -> ONE op class -> store }\n     (AVX-512 W=64 | AVX2 W=32 | SSE W=16; fully unrolled straight-line body)\n  3) SCALAR TAIL LOOP: only the final i<n-W bytes (rare, < W bytes)\nNo mixed-mode, no per-byte branches inside the vector loop,\nno re-dispatch per call after startup (static OnceLock).", shape=ellipse, style=filled, fillcolor="#fde9d9", color="#c55a11"];
+
+  subgraph cluster_disp {
+    label="startup ladder - one CPUID pass (best_level, simd.rs:59)";
+    style="rounded,dashed"; color="#999"; fontname="Helvetica-Bold"; fontsize=11;
+    a512 [label="AVX-512\navx512f + avx512bw"];
+    a2   [label="AVX2"];
+    s42  [label="SSE4.2\n(pcmpistri)"];
+    s41  [label="SSE4.1"];
+    sss3 [label="SSSE3\n(pshufb)"];
+    s3   [label="SSE3\n(baseline x86_64)"];
+    sc   [label="SCALAR\n(non-x86_64)"];
+    a512 -> a2 -> s42 -> s41 -> sss3 -> s3 -> sc [style=invis];
+  }
+
+  subgraph cluster_lower {
+    label="lower_ascii()  case folding   (simd.rs:99-160)  hot at Paper build";
+    style="rounded,dashed"; color="#999"; fontname="Helvetica-Bold"; fontsize=11;
+    l1 [label="AVX-512:  while i+64<=n:\n  loadu 64B; cmpgt 'A'-1; cmplt 'Z'+1;\n  mask = ge_a & le_z; add 32 (masked); store\nAVX2: same at W=32\nSSE3 floor: same at W=16\n(scalar byte loop only when < W or non-x86)"];
+  }
+
+  subgraph cluster_find {
+    label="find()  substring search  (simd.rs:167-195 + kernels)";
+    style="rounded,dashed"; color="#999"; fontname="Helvetica-Bold"; fontsize=11;
+    f1 [label="needle length CLASSES - each class is its own specialized kernel\n(class chosen once per find call, then one loop to the end)"];
+    f2 [label="class 1 byte:\nwhile i+W<=n: compare-broadcast whole\nvector; mask != 0 -> tzcnt gives first hit\nW=64 (AVX-512) / 16 (SSE3)"];
+    f3 [label="class 2-3 bytes:\nfirst-byte candidates via broadcast compare\n+ scalar memcmp verify of candidate\n(rare branch)  loop over chunk, tail scalar"];
+    f4 [label="class 4+:\nQUAD TRICK: 4 loads at offsets 0..3,\npcmpeq dword vs first-4 needle bytes\n(SSE3 633 / AVX-512 262),\nmerge masks, walk candidate bits ascending,\nmemcmp verify"];
+    f5 [label="SSE4.2 pcmpistri rung (671):\nstride = 16 - m + 1; EQUAL_ORDERED\n-> one instruction finds first in-window\nmatch of needle (m<=8, no NUL);\n~7x faster than AVX2 quad filter on\nshort needles (benchmark comment) - so\nAVX2 hosts ALSO use SSE4.2 here"];
+    f6 [label="SSE4.1 pcmpeqq + ptest rung (633):\nfor needles 9+, 8 loads offsets 0..7,\nfirst-8 bytes per 16B window, ptest skip"];
+    f1 -> f2; f1 -> f3; f1 -> f4; f1 -> f5; f1 -> f6;
+  }
+
+  subgraph cluster_ws {
+    label="any_ws() / skip_ws()  whitespace  (simd.rs:301-356, 819-865)";
+    style="rounded,dashed"; color="#999"; fontname="Helvetica-Bold"; fontsize=11;
+    w1 [label="any_ws: SSE4.2 EQUAL_ANY of {space,\\t,\\n,\\r} NUL-terminated set,\n  idx<16 -> true. SSE3 fallback: 4 cmpeq + or + movemask.\n  Loop per 16B chunk; scalar tail.\nskip_ws: same with NEGATIVE_POLARITY\n  (first byte NOT in set)."];
+  }
+
+  subgraph cluster_ts {
+    label="next_special()  tokenizer quote/brace scanning  (simd.rs:363-815)";
+    style="rounded,dashed"; color="#999"; fontname="Helvetica-Bold"; fontsize=11;
+    t1 [label="SSE4.2: EQUAL_ANY pcmpistri\nSSSE3: pshufb 2-table exact membership\n  (no verify; t0/t1 by high nibble)\nSSE3: per-char cmpeq OR\nloop per 16B chunk + scalar tail"];
+  }
+
+  note [shape=note, style=filled, fillcolor="#f4f4f4", color="#666",
+        label="Why kernels are split by 'type' (your idea, already coded here):\na generic big loop doing compare+scan+fold together would:\n- mix instruction classes -> pipeline/port stalls + per-byte branches\n- re-load the same cache lines per purpose\nSpecialized loops let one instruction class stream over all vectors\n(throughput-limited, branch-predictable), and the SIMD engine runs\n'type 1 until the data ends' before the next type starts.\n\nfind() on AVX2 hosts intentionally SKIPS AVX2 (measured slower)\nand drops to SSE4.2 - the ladder is by measured speed per kernel,\nnot by pure vector width. Same for lower_ascii where SSE3/SSSE3/\nSSE4.x share the 16B rung because folding adds no instruction."];
+
+  top -> l1 [label="kernels"];
+  top -> f1;
+  top -> w1;
+  top -> t1;
+  l1 -> note [style=invis];
+  f1 -> note [style=invis];
+}

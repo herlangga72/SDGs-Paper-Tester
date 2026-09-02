@@ -105,21 +105,53 @@ static APP: OnceLock<(
     &'static [Pattern],
     Vec<Vec<matcher::FlatBlock>>,
     Vec<matcher::SdgDict>,
+    Vec<&'static [matcher::LeafDesc]>,
 )> = OnceLock::new();
+
+/// Per-SDG unique include-leaf list for the Advanced keyword browser: every
+/// distinct (pattern pid, field mask) that appears on the include side of
+/// any block of the SDG, with its resolved memo slot. `Memo::leaf_hit` over
+/// this list answers "which keywords are already in the paper?" in one pass
+/// per (pid, mask) - no per-block boolean VM, no hits/misses/excluded list
+/// materialization, and excluded (NOT) leaves are not evaluated at all.
+fn build_present_tables(flats: &[Vec<matcher::FlatBlock>]) -> Vec<&'static [matcher::LeafDesc]> {
+    flats
+        .iter()
+        .map(|sdg| {
+            let mut seen: HashSet<(u32, u8)> = HashSet::with_capacity(sdg.len().min(4096) * 2);
+            let mut out: Vec<matcher::LeafDesc> = Vec::new();
+            for flat in sdg {
+                for l in flat.leaves {
+                    if l.excluded {
+                        continue;
+                    }
+                    if seen.insert((l.pid, l.mask)) {
+                        out.push(l.clone());
+                    }
+                }
+            }
+            let leak: &'static mut [matcher::LeafDesc] = Box::leak(out.into_boxed_slice());
+            let shrink: &'static [matcher::LeafDesc] = leak;
+            shrink
+        })
+        .collect()
+}
 
 fn app() -> &'static (
     Vec<Query>,
     &'static [Pattern],
     Vec<Vec<matcher::FlatBlock>>,
     Vec<matcher::SdgDict>,
+    Vec<&'static [matcher::LeafDesc]>,
 ) {
     APP.get_or_init(|| {
         let qdir = queries_dir();
         let t = Instant::now();
         // Boot cache: the parsed+resolved query ASTs, pattern table,
-        // flattened blocks and pretokenized SDG dictionaries are persisted
-        // to sdg_cache.bin (validated by query mtimes), so a restart skips
-        // the Scopus-file parse AND the ~21k-keyword recompile.
+        // flattened blocks, pretokenized SDG dictionaries and per-SDG
+        // present tables are persisted to sdg_cache.bin (validated by query
+        // mtimes), so a restart skips the Scopus-file parse AND the
+        // ~21k-keyword recompile.
         let cached = cache::read_cached(&qdir);
         let (queries, table, flats, dicts) = match cached {
             Some(data) => {
@@ -172,12 +204,14 @@ fn app() -> &'static (
                 (queries, table, flats, dicts)
             }
         };
+        let present = build_present_tables(&flats);
         eprintln!(
-            "[web] ready in {:.1} ms ({} patterns)",
+            "[web] ready in {:.1} ms ({} patterns, {} present leaves)",
             t.elapsed().as_secs_f64() * 1000.0,
-            table.len()
+            table.len(),
+            present.iter().map(|p| p.len()).sum::<usize>()
         );
-        (queries, table, flats, dicts)
+        (queries, table, flats, dicts, present)
     })
 }
 
@@ -195,6 +229,10 @@ fn get_flats() -> &'static Vec<Vec<matcher::FlatBlock>> {
 
 fn get_dicts() -> &'static Vec<matcher::SdgDict> {
     &app().3
+}
+
+fn get_present() -> &'static Vec<&'static [matcher::LeafDesc]> {
+    &app().4
 }
 
 // ---------------------------------------------------------------------------
@@ -1801,15 +1839,17 @@ fn api_keywords(headers: &[(String, String)], body: &[u8]) -> Resp {
         Err(msg) => return Resp::json(400, format!("{{\"error\":{}}}", jstr(&msg))),
     };
     let table = get_patterns();
+    // This endpoint only needs to know which keywords of the SDG are ALREADY
+    // in the paper text ("present" chips). Evaluate each distinct include
+    // (pattern, field-mask) exactly once through the memoized leaf_hit over
+    // the boot-time present table (build_present_tables): no per-block
+    // boolean-VM scan, no hits/misses/excluded vector pushes, and excluded
+    // (NOT) leaves are never searched, so fewer real SIMD searches run.
     let mut memo = matcher::Memo::new(&paper, 0);
     let mut present: HashSet<&'static str> = HashSet::new();
-    for flat in &get_flats()[qi] {
-        let mut hits: Vec<(&'static str, u8)> = Vec::new();
-        let mut misses: Vec<(&'static str, u8)> = Vec::new();
-        let mut ex: Vec<&'static str> = Vec::new();
-        matcher::scan_flat_into(flat, table, &mut memo, &mut hits, &mut misses, &mut ex);
-        for (kw, _) in hits {
-            present.insert(kw);
+    for l in get_present()[qi] {
+        if memo.leaf_hit(&table[l.pid as usize], l.mask, l.slot) {
+            present.insert(l.raw());
         }
     }
     let paper_text = String::from_utf8_lossy(paper.text_lower(paper::F_ANY));

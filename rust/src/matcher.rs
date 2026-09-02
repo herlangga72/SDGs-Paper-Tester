@@ -168,11 +168,29 @@ impl Pattern {
 /// build (lots of transient memory movement) and walked probe chains on every
 /// lookup (unpredictable branches). Dense bit arrays are built in a single
 /// sequential pass and answer with two loads at most.
+/// One segment's quad Bloom: `mask` is the segment-local power-of-two
+/// capacity minus one and `bits` the bit array. Sized from the CPU cache
+/// spec so chunk text + Bloom + dense arrays fit the detected cache level
+/// (see `chunk_plan`); random Bloom writes then hit cache instead of DRAM.
+struct QuadSeg {
+    bits: Vec<u64>,
+    mask: u32,
+}
+
 pub struct TextIndex {
     bytes: [bool; 256],
     bigrams: [u64; 1024],
-    quads: Vec<u64>,
-    quad_mask: u32, // power-of-two capacity minus one
+    /// Segment-local quad Bloom tables. Each parallel chunk hashes only its
+    /// own windows into its own power-of-two table sized by the CPU cache
+    /// spec (chunk bytes, `cpu::best()`), so total Bloom memory is ~1 bit
+    /// per text byte with NO per-chunk duplication of a full-size table and
+    /// every worker's writes stay L2/L3 resident (the old layout allocated
+    /// `ceil(n/chunk) x n` bytes of Bloom tables and OR-merged them all).
+    /// A pattern quad is "present" when ANY segment holds both of its Bloom
+    /// bits; every window's start belongs to exactly one chunk, so an
+    /// occurrence whose internal windows straddle a boundary is still found
+    /// (its windows live in the neighbour segment) - no false negatives.
+    quads: Vec<QuadSeg>,
     /// quad -> byte positions, recorded only for pattern first-quads
     /// (`FIRST_QUADS`). A missing entry means the quad is absent from the
     /// text: an exact, false-negative-free gate that lets pattern search
@@ -262,113 +280,156 @@ fn first_quads() -> Arc<HashSet<u32, FastHasher>> {
 }
 
 
-/// Parallel build threshold: below this, one sequential pass is cheaper
-/// than the thread split + merge (measured: 256 KiB slices, merge ~0.5 ms).
-const PAR_CHUNK: usize = 256 * 1024;
+/// CPU-spec-driven chunk plan for the parallel TextIndex build.
+///
+/// The detected cache geometry (cpu.rs, once per boot) decides everything:
+///   - texts whose whole working set fits ~L2/3 are built serially (thread
+///     split + merge would only add overhead),
+///   - larger texts are split so each worker's slice + its segment-local
+///     Bloom + dense arrays stay L2-resident (chunk ~= L2/3),
+///   - the number of chunks never exceeds the detected core count.
+/// Chunk boundaries are rounded to the detected cache line.
+fn chunk_plan(n: usize) -> Vec<(usize, usize)> {
+    let spec = crate::cpu::best();
+    let line = spec.cache_line.max(16);
+    let serial_limit = (spec.l2 / 3).max(32 * 1024); // fits cache: no threads
+    if n <= serial_limit {
+        return vec![(0, n)];
+    }
+    let ideal = (spec.l2 / 3).clamp(line * 64, 1 << 20); // chunk + bloom ~ L2
+    let cores = spec.cores.max(1);
+    let need = n.div_ceil(ideal);
+    let workers = need.min(cores);
+    let chunk = (n.div_ceil(workers)).max(line);
+    let mut out = Vec::with_capacity(workers);
+    let mut base = 0usize;
+    while base < n {
+        let end = (base + chunk).min(n);
+        out.push((base, end));
+        base = end;
+    }
+    out
+}
 
 /// Partial index of one text slice (dense arrays are OR-merged, position
-/// lists are concatenated in ascending slice order).
+/// lists are concatenated in ascending slice order; the quad Bloom needs no
+/// merge - each slice owns its segment).
 struct BuildPart {
     bytes: [bool; 256],
     bigrams: [u64; 1024],
-    quads: Vec<u64>,
+    quads: QuadSeg,
     pos: FastMap<u32, Vec<u32>>,
 }
 
 fn build_serial(text: &[u8], needed: &HashSet<u32, FastHasher>) -> TextIndex {
-    merge_parts(vec![build_chunk(text, needed, 0)], text.len())
+    let n = text.len();
+    merge_parts(vec![build_chunk(text, needed, 0, n)], n)
 }
 
-/// Index the slice `text[base..]` (at most `PAR_CHUNK` + 3 bytes, so the
-/// 2- and 4-byte windows straddling a chunk boundary are still seen; the
-/// boundary quads are duplicated by the next slice, harmless for the bit
-/// arrays, and positions are capped so each window is recorded exactly
-/// once, by the slice that contains it).
-fn build_chunk(text: &[u8], needed: &HashSet<u32, FastHasher>, base: usize) -> BuildPart {
+/// Index the slice `text[base..end]` (reads up to `end + 3` bytes so 2- and
+/// 4-byte windows straddling the chunk boundary are still seen; the bytes
+/// recorded and the windows hashed into THIS segment are exactly those whose
+/// start lies in `[base, end)`, i.e. every window is owned by exactly one
+/// chunk). The Bloom is sized from the windows owned by this chunk, so its
+/// bitset is ~chunk bytes - L2 sized by construction (`chunk_plan`).
+fn build_chunk(
+    text: &[u8],
+    needed: &HashSet<u32, FastHasher>,
+    base: usize,
+    end: usize,
+) -> BuildPart {
     let n = text.len();
-    let end = (base + PAR_CHUNK).min(n);
     let chunk_len = end - base;
     let slice = &text[base..(end + 3).min(n)];
+    let slen = slice.len();
 
     let mut bytes = [false; 256];
     let mut bigrams = [0u64; 1024];
-    let qbits = (n.saturating_sub(3).saturating_mul(8)).next_power_of_two().max(1 << 16);
+    // windows hashed into this segment: starts i with i < chunk_len and
+    // i + 3 < slen  ->  at most chunk_len of them
+    let wc = chunk_len.min(slen.saturating_sub(3));
+    let qbits = (wc.saturating_mul(8)).next_power_of_two().max(1 << 16);
     let quad_mask = (qbits as u32) - 1;
     let mut quads = vec![0u64; (qbits >> 6) as usize];
     let mut pos: FastMap<u32, Vec<u32>> = new_fast_map();
 
-    for w in slice.windows(2) {
-        let a = w[0] as usize;
-        let b = w[1] as usize;
-        bigrams[(a << 2) | (b >> 6)] |= 1u64 << (b & 63);
-    }
-    for w in slice.windows(4) {
-        let q = u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
-        let (h1, h2) = bloom_hashes(q, quad_mask);
-        quads[(h1 >> 6) as usize] |= 1u64 << (h1 & 63);
-        quads[(h2 >> 6) as usize] |= 1u64 << (h2 & 63);
-    }
-    for &b in slice[..chunk_len].iter() {
-        bytes[b as usize] = true;
-    }
-    if !needed.is_empty() {
-        // 64K-bit direct-mapped filter over the needed quads: one load +
-        // shift per window; the exact HashSet probe runs only on hits (a
-        // few per thousand windows). No false negatives.
+    // Optional 64K-bit direct-mapped filter over the needed quads: one load
+    // + shift per window; the exact HashSet probe runs only on hits (a few
+    // per thousand windows). No false negatives.
+    let nf: Option<[u64; 1024]> = if !needed.is_empty() {
         let mut nf = [0u64; 1024];
         for &q in needed {
             let h = ((u64::from(q).wrapping_mul(0x9E37_79B1)) >> 16) & 0xFFFF;
             nf[(h >> 6) as usize] |= 1u64 << (h & 63);
         }
-        for (i, w) in slice.windows(4).enumerate() {
-            if i + 4 > chunk_len {
-                break; // boundary-spanning window: recorded by the next slice
-            }
-            let q = u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
-            let h = ((u64::from(q).wrapping_mul(0x9E37_79B1)) >> 16) & 0xFFFF;
-            if (nf[(h >> 6) as usize] >> (h & 63)) & 1 == 0 {
-                continue;
-            }
-            if needed.contains(&q) {
-                let v = pos.entry(q).or_default();
-                // Bounded per chunk: verification reads at most 1024
-                // candidates; the merge keeps the first 1024 overall.
-                if v.len() < 1024 {
-                    v.push((base + i) as u32);
+        Some(nf)
+    } else {
+        None
+    };
+
+    // ONE streaming pass over the slice instead of four separate ones: at
+    // position i we emit the byte bit (i < chunk_len), the bigram bit
+    // (i, i+1) anywhere in the +3 overlap, the quad Bloom bits for windows
+    // owned by this segment (i < chunk_len && i + 3 < slen), and the
+    // first-quad position (only for owned windows that also fully fit the
+    // chunk: i + 4 <= chunk_len; the straddling tail is the next chunk's).
+    let mut i = 0usize;
+    while i < slen {
+        if i < chunk_len {
+            bytes[slice[i] as usize] = true;
+        }
+        if i + 1 < slen {
+            let a = slice[i] as usize;
+            let b = slice[i + 1] as usize;
+            bigrams[(a << 2) | (b >> 6)] |= 1u64 << (b & 63);
+        }
+        if i < chunk_len && i + 3 < slen {
+            let q = u32::from_le_bytes([slice[i], slice[i + 1], slice[i + 2], slice[i + 3]]);
+            let (h1, h2) = bloom_hashes(q, quad_mask);
+            quads[(h1 >> 6) as usize] |= 1u64 << (h1 & 63);
+            quads[(h2 >> 6) as usize] |= 1u64 << (h2 & 63);
+            if i + 4 <= chunk_len {
+                if let Some(nf) = nf {
+                    let h = ((u64::from(q).wrapping_mul(0x9E37_79B1)) >> 16) & 0xFFFF;
+                    if (nf[(h >> 6) as usize] >> (h & 63)) & 1 != 0 && needed.contains(&q) {
+                        let v = pos.entry(q).or_default();
+                        // Bounded per chunk: verification reads at most 1024
+                        // candidates; the merge keeps the first 1024 overall.
+                        if v.len() < 1024 {
+                            v.push((base + i) as u32);
+                        }
+                    }
                 }
             }
         }
+        i += 1;
     }
-    BuildPart { bytes, bigrams, quads, pos }
+    BuildPart { bytes, bigrams, quads: QuadSeg { bits: quads, mask: quad_mask }, pos }
 }
 
-fn merge_parts(parts: Vec<BuildPart>, n: usize) -> TextIndex {
-    let qbits = (n.saturating_sub(3).saturating_mul(8)).next_power_of_two().max(1 << 16);
-    let quad_mask = (qbits as u32) - 1;
-    let mut out = BuildPart {
-        bytes: [false; 256],
-        bigrams: [0u64; 1024],
-        quads: vec![0u64; (qbits >> 6) as usize],
-        pos: new_fast_map(),
-    };
+fn merge_parts(parts: Vec<BuildPart>, _n: usize) -> TextIndex {
+    let mut out_bytes = [false; 256];
+    let mut out_bigrams = [0u64; 1024];
+    let mut out_quads: Vec<QuadSeg> = Vec::with_capacity(parts.len());
+    let mut out_pos: FastMap<u32, Vec<u32>> = new_fast_map();
     for p in parts {
         for i in 0..256 {
-            out.bytes[i] |= p.bytes[i];
+            out_bytes[i] |= p.bytes[i];
         }
         for i in 0..1024 {
-            out.bigrams[i] |= p.bigrams[i];
+            out_bigrams[i] |= p.bigrams[i];
         }
-        for (i, &v) in p.quads.iter().enumerate() {
-            out.quads[i] |= v;
-        }
+        // segment order == chunk order: push, do not OR (each chunk owns a
+        // disjoint window range, so no cross-segment duplicates exist)
+        out_quads.push(p.quads);
         for (q, v) in p.pos {
-            let dst = out.pos.entry(q).or_default();
+            let dst = out_pos.entry(q).or_default();
             // Keep the first 1024 candidates overall (ascending order).
             let room = 1024usize.saturating_sub(dst.len());
             dst.extend(v.into_iter().take(room));
         }
     }
-    TextIndex { bytes: out.bytes, bigrams: out.bigrams, quads: out.quads, quad_mask, pos: out.pos }
+    TextIndex { bytes: out_bytes, bigrams: out_bigrams, quads: out_quads, pos: out_pos }
 }
 
 impl TextIndex {
@@ -380,7 +441,8 @@ impl TextIndex {
     /// (the pattern first-quads). Pass an empty set when only the presence
     /// filters are wanted (benchmarks, tests).
     ///
-    /// Texts above `PAR_CHUNK` are built as independent 256 KiB slices on
+    /// Texts larger than ~L2/3 are split into cache-shaped chunks (see
+    /// `chunk_plan`: chunk ~= L2/3, worker count <= detected cores) built on
     /// scoped threads (no rayon dependency) and merged: the positions pass
     /// (one filter probe per 4-byte window, plus a push per recorded
     /// occurrence) dominates the build at MB scale, and it parallelizes
@@ -392,17 +454,17 @@ impl TextIndex {
             prof::INDEX_BUILDS.fetch_add(1, Ordering::Relaxed);
             prof::INDEX_BYTES.fetch_add(text.len() as u64, Ordering::Relaxed);
         }
-        if text.len() < PAR_CHUNK {
+        let plan = chunk_plan(text.len());
+        if plan.len() == 1 {
             return build_serial(text, needed);
         }
-        let chunks = text.len().div_ceil(PAR_CHUNK);
-        let mut parts: Vec<Option<BuildPart>> = (0..chunks).map(|_| None).collect();
+        let mut parts: Vec<Option<BuildPart>> = (0..plan.len()).map(|_| None).collect();
         std::thread::scope(|s| {
-            let mut handles = Vec::with_capacity(chunks);
+            let mut handles = Vec::with_capacity(plan.len());
             for (ci, slot) in parts.iter_mut().enumerate() {
-                let base = ci * PAR_CHUNK;
+                let (base, end) = plan[ci];
                 handles.push(s.spawn(move || {
-                    *slot = Some(build_chunk(text, needed, base));
+                    *slot = Some(build_chunk(text, needed, base, end));
                 }));
             }
             for h in handles {
@@ -427,6 +489,18 @@ impl TextIndex {
     /// (not just the first) rejects e.g. a part whose first 4 bytes appear
     /// but whose full word does not, which is the common false-positive
     /// driving wasted SIMD scans. A false return is still a hard no.
+    /// One Bloom probe over the segment tables. Exact presence bit test:
+    /// `q` is definitely absent only when no segment holds both of its bits.
+    #[inline]
+    fn quad_present(&self, q: u32) -> bool {
+        self.quads.iter().any(|seg| {
+            let (h1, h2) = bloom_hashes(q, seg.mask);
+            let bits = &seg.bits;
+            ((bits[(h1 >> 6) as usize] >> (h1 & 63)) & 1) != 0
+                && ((bits[(h2 >> 6) as usize] >> (h2 & 63)) & 1) != 0
+        })
+    }
+
     pub fn could_contain(&self, part: &[u8]) -> bool {
         #[cfg(feature = "prof")]
         {
@@ -451,18 +525,17 @@ impl TextIndex {
                 // rate is ~0.06%, so two quads cut SIMD runs from ~4500 to
                 // ~400 per request (measured on the SDG corpus, 2026-08)
                 // for just 4 hash ops per part vs ~26 for all quads.
+                // Segment-local tables: the first and last quad may live in
+                // different segments when the part would straddle a chunk
+                // boundary - probing each quad independently keeps this an
+                // exact "absent" gate with no false negatives.
                 let first = u32::from_le_bytes([part[0], part[1], part[2], part[3]]);
-                let (h1, h2) = bloom_hashes(first, self.quad_mask);
-                if ((self.quads[(h1 >> 6) as usize] >> (h1 & 63)) & 1) == 0
-                    || ((self.quads[(h2 >> 6) as usize] >> (h2 & 63)) & 1) == 0
-                {
+                if !self.quad_present(first) {
                     return false;
                 }
                 let n = part.len();
                 let last = u32::from_le_bytes([part[n - 4], part[n - 3], part[n - 2], part[n - 1]]);
-                let (h1, h2) = bloom_hashes(last, self.quad_mask);
-                ((self.quads[(h1 >> 6) as usize] >> (h1 & 63)) & 1) != 0
-                    && ((self.quads[(h2 >> 6) as usize] >> (h2 & 63)) & 1) != 0
+                self.quad_present(last)
             }
         }
     }
@@ -476,10 +549,7 @@ impl TextIndex {
         let mut w = 0;
         while w + 4 <= part.len() {
             let q = u32::from_le_bytes([part[w], part[w + 1], part[w + 2], part[w + 3]]);
-            let (h1, h2) = bloom_hashes(q, self.quad_mask);
-            if ((self.quads[(h1 >> 6) as usize] >> (h1 & 63)) & 1) == 0
-                || ((self.quads[(h2 >> 6) as usize] >> (h2 & 63)) & 1) == 0
-            {
+            if !self.quad_present(q) {
                 return false;
             }
             w += 1;
@@ -1160,6 +1230,18 @@ impl<'a> Memo<'a> {
         }
         self.terms[slot] = if v { 2 } else { 1 };
         v
+    }
+
+    /// Evaluate one pre-resolved leaf occurrence (`pid`/`mask`/`slot` come
+    /// straight from a `LeafDesc` record) with the usual per-request
+    /// memoization. This is the report-light evaluation used by the Advanced
+    /// keyword browser (`/api/keywords`), which only needs the *present*
+    /// keywords of one SDG - not the per-block hits/misses/excluded lists.
+    /// Skipping the boolean VM and the classification pushes is significantly
+    /// cheaper than `scan_flat_into` when only presence matters.
+    #[inline]
+    pub fn leaf_hit(&mut self, pat: &Pattern, mask: u8, slot: u32) -> bool {
+        self.term_hit(pat, mask, slot as usize)
     }
 
     /// Actual search for `pat` under `mask` (uncached), against the mask's
@@ -2469,18 +2551,66 @@ pub struct PaperWords<'a> {
     sorted: Vec<&'a str>,
 }
 
+/// Is the UTF-8 char starting at byte `i` alphanumeric? ASCII takes a
+/// branchless table lookup; non-ASCII decodes one char (exact parity with
+/// `char::is_alphanumeric`). Callers guarantee `i < text.len()`.
+#[inline]
+fn alnum_at(b: &[u8], i: usize) -> bool {
+    let c = b[i];
+    if c < 0x80 {
+        c.is_ascii_alphanumeric()
+    } else {
+        // SAFETY: `i` is a char boundary inside a valid UTF-8 buffer (the
+        // scanner only steps by full char widths from a &str boundary).
+        unsafe { std::str::from_utf8_unchecked(&b[i..]) }
+            .chars()
+            .next()
+            .unwrap()
+            .is_alphanumeric()
+    }
+}
+
+/// Byte width of the UTF-8 char starting at `i` (ASCII = 1).
+#[inline]
+fn char_len_at(b: &[u8], i: usize) -> usize {
+    let c = b[i];
+    if c < 0x80 {
+        1
+    } else if c >> 5 == 0b110 {
+        2
+    } else if c >> 4 == 0b1110 {
+        3
+    } else {
+        4
+    }
+}
+
 pub fn text_words(text: &str) -> PaperWords<'_> {
-    let mut set: HashSet<&str> = text
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|w| !w.is_empty())
-        .collect();
+    let b = text.as_bytes();
+    let n = b.len();
+
+    // One pass: insert every alphanumeric run into a growing set. A run ==
+    // one word token, identical to the reference
+    // `split(|c: char| !c.is_alphanumeric())` splitter: ASCII bytes take the
+    // branchless table path, non-ASCII chars are decoded so the token set is
+    // byte-for-byte the same. The set grows naturally: preallocating for the
+    // token *count* is wrong for repetitive text (300k tokens but ~700
+    // unique words -> a multi-MB zeroed table for nothing).
+    let mut set: HashSet<&str> = HashSet::new();
+    let mut i = 0usize;
+    while i < n {
+        if alnum_at(b, i) {
+            let start = i;
+            while i < n && alnum_at(b, i) {
+                i += char_len_at(b, i);
+            }
+            set.insert(&text[start..i]);
+        } else {
+            i += char_len_at(b, i);
+        }
+    }
     let mut sorted: Vec<&str> = set.iter().copied().collect();
     sorted.sort_unstable();
-    let mut set2 = HashSet::with_capacity(set.len());
-    for w in sorted.iter().copied() {
-        set2.insert(w);
-    }
-    std::mem::swap(&mut set, &mut set2);
     PaperWords { set, sorted }
 }
 
@@ -3577,4 +3707,54 @@ abstract: |
             "health-access term must surface for SDG10, got {names:?}"
         );
     }
+    #[test]
+    fn text_words_matches_char_splitter() {
+        // Reference: the exact tokenization text_words used to implement
+        // (and must keep matching): char-wise !is_alphanumeric split.
+        fn reference(text: &str) -> Vec<String> {
+            // The old text_words deduped tokens through a HashSet before
+            // sorting - keep that contract (split can emit the same word
+            // twice, e.g. snake_case kebab-case).
+            let mut set: std::collections::HashSet<&str> = text
+                .split(|c: char| !c.is_alphanumeric())
+                .filter(|w| !w.is_empty())
+                .collect();
+            let mut v: Vec<String> = set.drain().map(|w| w.to_string()).collect();
+            v.sort_unstable();
+            v
+        }
+        let cases = [
+            "",
+            "   ",
+            "just a plain ascii sentence, with 2024 numbers & _underscores_.",
+            "café naïve résumé …",
+            "中文文本 + देवनागरी",
+            "emoji 🚀 rocket 🌍 and #hashtag!",
+            "a1 b2 c3 -d- _e_ f.g,h;i:j",
+            "école Ångström",
+            "hygiene (wash) - avoid* /divers/",
+            "camelCase PascalCase ALLCAPS snake_case kebab-case",
+            "ÅåÄäÖö",
+        ];
+        for text in cases {
+            let pw = text_words(text);
+            let mut got: Vec<String> = pw.set.iter().map(|s| s.to_string()).collect();
+            got.sort_unstable();
+            assert_eq!(got, reference(text), "set mismatch for {text:?}");
+            assert_eq!(
+                pw.sorted.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                reference(text),
+                "sorted mismatch for {text:?}"
+            );
+        }
+        // deterministic long mixed sample (ASCII + accents + CJK)
+        let long: String = (0..200)
+            .map(|i| format!("word{i} café 中文{i}!! end."))
+            .collect();
+        let pw = text_words(&long);
+        let mut got: Vec<String> = pw.set.iter().map(|s| s.to_string()).collect();
+        got.sort_unstable();
+        assert_eq!(got, reference(&long));
+    }
+
 }
