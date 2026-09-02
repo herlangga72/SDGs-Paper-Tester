@@ -116,20 +116,29 @@ The legacy Python server still works if you prefer it:
 - **Gzip responses**: HTML/JSON are compressed when the client sends
   `Accept-Encoding: gzip`.
 - **Usage stats**: every request is written to `logs/access.jsonl` (JSONL,
-  no IPs/user agents, rotates at ~4 MB) and counted in memory; cumulative
-  totals persist to `engine/data/site_stats.json` and reload on restart. The
-  footer shows **"N visits · U unique visitors · M papers matched"** and
-  `GET /api/stats` returns the raw counters plus `users_total` / `users_today`
-  / `users_7d` / `users_30d`. Unique users are tracked with an anonymous,
-  HttpOnly, SameSite `uid` cookie (no IPs, no personal data); only full page
-  loads mint cookies. Counts exclude `/health` checks; free-tier hosts that
-  rebuild the container on deploy (Render) reset the counters.
+  no IPs, rotates at ~4 MB) and counted in memory; cumulative totals persist
+  to `engine/data/site_stats.json` and reload on restart. The footer shows
+  **"N visits · U unique visitors · M papers matched"** and `GET /api/stats`
+  returns the raw counters plus `users_total` / `users_today` / `users_7d` /
+  `users_30d`. Unique users are tracked with an anonymous, HttpOnly, SameSite
+  `uid` cookie (no IPs, no personal data); only full page loads mint cookies.
+  Counts exclude `/health` checks; free-tier hosts that rebuild the container
+  on deploy (Render) reset the counters.
+- **Dataset exports**: `GET /api/logs?format=csv|jsonl` downloads the URL
+  access log (`ts, method, path incl. query, status, ms, bytes, ua`), and
+  `GET /api/matches?format=csv|jsonl` downloads **what users do on /match**:
+  every submitted payload (`title, authors, year, journal, doi, keywords`,
+  abstract/text lengths, upload flag, `uid` to join with the visitor set) plus
+  the engine result (`via`, `sdgs_matched`, `ms`). Metadata + lengths by
+  default; set `MATCH_LOG_FULL=1` to also record the full abstract/text
+  (pasted paper text is often unpublished work). No IPs are ever stored.
 - **Sentry error reporting (default on)**: the DSN is hard-coded in both
-  servers (public client key by design); boot events, 5xx responses, panics
-  and unhandled handler exceptions are forwarded to your Sentry project over
-  the envelope API — a tiny hand-rolled client, so no SDK dependency.
-  Override with `SENTRY_DSN`, or disable with `SENTRY_DSN=0` / `off`. Release
-  tags come from `RENDER_GIT_COMMIT`.
+  servers (public client key by design); boot events, 5xx responses, panics,
+  unhandled handler exceptions and — as `info` events — each `/match` payload
+  summary (`logger` `web.match` / `web.keywords`) are forwarded to your
+  Sentry project over the envelope API — a tiny hand-rolled client, so no SDK
+  dependency. Override with `SENTRY_DSN`, or disable with `SENTRY_DSN=0` /
+  `off`. Release tags come from `RENDER_GIT_COMMIT`.
 - Matching semantics identical to Scopus: `NOT > AND/W-n > OR` precedence,
   whole-word matching, `*`/`?` wildcards (`*` matches within a word only, so
   `financ* cris*` needs "financial crisis", not "financ … crisis" anywhere

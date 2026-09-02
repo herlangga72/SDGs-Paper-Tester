@@ -32,11 +32,21 @@ Responses are gzip-compressed when the client sends `Accept-Encoding: gzip`.
 `pages`, `match_html`, `api_match`, `errors`, ...) plus unique users
 (`users_total`, `users_today`, `users_7d`, `users_30d`) from an anonymous
 `uid` cookie, and the footer shows them on the page. Every request is also
-appended to `logs/access.jsonl` (JSONL, no IPs or user agents; ~4 MB
-rotation). Counters persist to `engine/data/site_stats.json` and
-`engine/data/visitors.json` and reload at boot, so they survive restarts of
-the same instance. Render free-tier containers are rebuilt on every deploy,
-which resets the counters — treat them as a rough "since last deploy" figure.
+appended to `logs/access.jsonl` (JSONL, no IPs; ~4 MB rotation). Counters
+persist to `engine/data/site_stats.json` and `engine/data/visitors.json` and
+reload at boot, so they survive restarts of the same instance. Render
+free-tier containers are rebuilt on every deploy, which resets the counters —
+treat them as a rough "since last deploy" figure.
+
+**Datasets:** `GET /api/logs?format=csv|jsonl` exports the URL access log
+(ts, method, path with query, status, ms, bytes, user agent) and
+`GET /api/matches?format=csv|jsonl` exports every `/match` payload — what
+people submit (title/authors/year/journal/doi/keywords, lengths, upload,
+`uid`) plus the engine result (`sdgs_matched`, `via`, `ms`) from
+`logs/matches.jsonl`. Set `MATCH_LOG_FULL=1` to also store the full
+abstract/text. No IPs are stored; a summary of each match also lands in
+Sentry as an `info` event (`web.match` / `web.keywords`). Pull the files
+before redeploying, since Render's disk is ephemeral.
 
 **Error reporting (default on):** the DSN is hard-coded in both servers (a
 public client key by design), so boot events, 5xx responses, panics and

@@ -140,12 +140,14 @@ def _append_access_line(line: str) -> None:
         pass
 
 
-def _record_request(method: str, path: str, status: int, ms: float) -> None:
-    """Classify + count one request; /health and /api/stats are excluded."""
+def _record_request(method: str, target: str, status: int, ms: float,
+                    ua: str = "", size: int | None = None) -> None:
+    """Classify + count one request; health checks and the stats/logs export
+    endpoints are excluded so they cannot inflate the numbers or the dataset."""
     if not _STATS_LOADED:
         _load_stats()
-    path = path.split("?", 1)[0]
-    if path in ("/health", "/api/stats"):
+    path = target.split("?", 1)[0]
+    if path in ("/health", "/api/stats", "/api/logs", "/api/matches"):
         return
     with _STATS_LOCK:
         _STATS["total"] += 1
@@ -166,9 +168,11 @@ def _record_request(method: str, path: str, status: int, ms: float) -> None:
             if status < 400:
                 _STATS["api_keywords"] += 1
         total = _STATS["total"]
+        # Dataset line: full URL incl. query string + UA. No IPs are stored.
         line = json.dumps({"ts": int(time.time() * 1000), "method": method,
-                           "path": path, "status": status,
-                           "ms": round(ms, 1)}, ensure_ascii=True)
+                           "path": target[:512], "status": status,
+                           "ms": round(ms, 1), "bytes": size, "ua": ua[:256]},
+                          ensure_ascii=True)
     _append_access_line(line)
     if total % 25 == 0:
         _save_stats()
@@ -286,6 +290,52 @@ def _user_stats() -> dict:
                 d30 += 1
         total = len(_VISITORS)
     return {"users_total": total, "users_today": d1, "users_7d": d7, "users_30d": d30}
+
+
+# --------------------------------------------------------------------------
+# Match payload logging (dataset) — Python mirror of web.rs
+#
+# One JSON row per /match or /api/keywords request in logs/matches.jsonl:
+# metadata + lengths by default; the full abstract/text only when
+# MATCH_LOG_FULL=1 (pasted paper text is often unpublished work). A summary
+# is also mirrored to Sentry as an info event. No IPs are stored.
+# --------------------------------------------------------------------------
+
+_MATCHES_FILE = ROOT / "logs" / "matches.jsonl"
+_MATCHES_LOCK = threading.Lock()
+
+
+def _match_log_full() -> bool:
+    return os.environ.get("MATCH_LOG_FULL", "").strip().lower() in ("1", "true", "yes")
+
+
+def append_match_row(row: dict) -> None:
+    try:
+        _MATCHES_FILE.parent.mkdir(parents=True, exist_ok=True)
+        if _MATCHES_FILE.exists() and _MATCHES_FILE.stat().st_size > 4 << 20:
+            _MATCHES_FILE.replace(_MATCHES_FILE.with_name("matches.jsonl.1"))
+        with _MATCHES_FILE.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row, ensure_ascii=True) + "\n")
+    except Exception:  # noqa: BLE001 — logging must never break a request
+        pass
+
+
+def _match_row(uid: str | None, fields: dict, files: dict, **extra) -> dict:
+    """Base dataset row built from the submitted form fields (no full text)."""
+    row = {"ts": int(time.time() * 1000), "uid": uid,
+           "title": fields.get("title", ""), "authors": fields.get("authors", ""),
+           "year": fields.get("year", ""), "journal": fields.get("journal", ""),
+           "doi": fields.get("doi", ""), "keywords": fields.get("keywords", ""),
+           "abstract_len": len(fields.get("abstract", "")),
+           "text_len": len(fields.get("paper", "")) + sum(len(b) for b in files.values()),
+           "uploaded": bool(files)}
+    row.update(extra)
+    if _match_log_full():
+        if fields.get("abstract"):
+            row["abstract"] = fields["abstract"]
+        if fields.get("paper"):
+            row["text"] = fields["paper"]
+    return row
 
 
 # --------------------------------------------------------------------------
@@ -970,6 +1020,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _send(self, code: int, body: bytes, ctype: str = "text/html; charset=utf-8",
               extra_headers: dict | None = None):
+        self._last_sent = len(body)  # for the access-log dataset (bytes column)
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
@@ -981,6 +1032,48 @@ class Handler(BaseHTTPRequestHandler):
 
     def _send_json(self, code: int, obj) -> None:
         self._send(code, json.dumps(obj).encode("utf-8"), "application/json; charset=utf-8")
+
+    def _send_log_dataset(self, kind: str) -> None:
+        """GET /api/logs|/api/matches?format=csv|jsonl&limit=N — dataset export
+        of the access log or the /match payload log (no IPs are stored)."""
+        qs = parse_qs(urlparse(self.path).query)
+        fmt = (qs.get("format", ["csv"])[0]).lower()
+        limit = min(int(qs.get("limit", ["10000"])[0] or 10000), 1_000_000)
+        path = _ACCESS_LOG if kind == "access" else _MATCHES_FILE
+        if not path.exists():
+            self._send(404, b"no logs yet", "text/plain")
+            return
+        lines = path.read_text(encoding="utf-8").splitlines()[-limit:]
+        if fmt == "jsonl":
+            body = ("\n".join(lines) + ("\n" if lines else "")).encode("utf-8")
+            self._send(200, body, "application/x-ndjson; charset=utf-8",
+                       extra_headers={"Content-Disposition":
+                                      f'attachment; filename="{kind}.jsonl"'})
+            return
+        cols = (["ts", "method", "path", "status", "ms", "bytes", "ua"]
+                if kind == "access" else
+                ["ts", "via", "uid", "title", "authors", "year", "journal", "doi",
+                 "keywords", "abstract_len", "text_len", "uploaded", "top", "max_kw",
+                 "sdg", "limit", "present", "total", "sdgs_matched", "ms", "error"])
+
+        def cell(value):
+            if value is None:
+                return ""
+            if isinstance(value, list):
+                return "|".join(str(x) for x in value)
+            return str(value)
+
+        quote = lambda s: '"%s"' % s.replace('"', '""')  # noqa: E731 — csv quoting
+        out = ",".join(cols) + "\n"
+        for ln in lines:
+            try:
+                obj = json.loads(ln)
+                out += ",".join(quote(cell(obj.get(c))) for c in cols) + "\n"
+            except Exception:  # noqa: BLE001 — skip corrupt lines
+                continue
+        self._send(200, out.encode("utf-8"), "text/csv; charset=utf-8",
+                   extra_headers={"Content-Disposition":
+                                  f'attachment; filename="{kind}.csv"'})
 
     def _read_form(self) -> tuple[dict[str, str], dict[str, bytes]]:
         """Parse x-www-form-urlencoded or multipart/form-data. Returns
@@ -1066,6 +1159,10 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, b"ok", "text/plain")
         elif url.path == "/api/stats":
             self._send_json(200, stats_payload())
+        elif url.path == "/api/logs":
+            self._send_log_dataset("access")
+        elif url.path == "/api/matches":
+            self._send_log_dataset("matches")
         else:
             self._send(404, b"not found", "text/plain")
 
@@ -1096,6 +1193,20 @@ class Handler(BaseHTTPRequestHandler):
                 inc, exc = sdg_dict(sdg, blocks)
                 limit = min(max(int(fields.get("limit", "300") or 300), 1), 2000)
                 scored = score_keywords(paper.lowered(""), inc, exc, present, limit)
+                # Dataset row + Sentry mirror for the Advanced keyword lookup.
+                try:
+                    uid = _cookie_uid(self.headers)
+                    n_present = len([k for k in scored if k["present"]])
+                    row = _match_row(uid, fields, files, via="api_keywords", sdg=sdg,
+                                     limit=limit, present=n_present, total=len(inc))
+                    append_match_row(row)
+                    sentry_report("info", "web.keywords",
+                                  f"keyword lookup SDG {sdg}",
+                                  extra={"sdg": sdg, "present": n_present,
+                                         "total": len(inc), "limit": limit,
+                                         "title": fields.get("title", "")})
+                except Exception:  # noqa: BLE001 — logging must never break a request
+                    pass
                 self._send_json(200, {
                     "sdg": sdg,
                     "sdg_name": sdg_name(sdg),
@@ -1117,6 +1228,28 @@ class Handler(BaseHTTPRequestHandler):
             t0 = time.perf_counter()
             report = match_paper(paper, top, max_kw)
             ms = (time.perf_counter() - t0) * 1000.0
+            # Dataset row + Sentry mirror: what the user submitted and what the
+            # engine said back (metadata + lengths; full text only if
+            # MATCH_LOG_FULL=1).
+            try:
+                uid = _cookie_uid(self.headers)
+                matched_sdgs = [r["sdg"] for r in report if r.get("matched")]
+                row = _match_row(uid, fields, files, via="match", top=top,
+                                 max_kw=max_kw, ms=round(ms, 2),
+                                 sdgs_matched=matched_sdgs)
+                append_match_row(row)
+                sentry_report("info", "web.match", row["title"] or "paper match",
+                              extra={"uid": uid, "title": row["title"],
+                                     "authors": row["authors"], "year": row["year"],
+                                     "journal": row["journal"], "doi": row["doi"],
+                                     "keywords": row["keywords"],
+                                     "abstract_len": row["abstract_len"],
+                                     "text_len": row["text_len"],
+                                     "uploaded": row["uploaded"], "top": top,
+                                     "max_kw": max_kw, "sdgs_matched": matched_sdgs,
+                                     "ms": round(ms, 2)})
+            except Exception:  # noqa: BLE001 — logging must never break a request
+                pass
             html = render_results(report, paper, meta, ms)
             self._send(200, html.encode(),
                        extra_headers={"X-Processing-Time": f"{ms:.1f} ms"})
@@ -1159,7 +1292,10 @@ class Handler(BaseHTTPRequestHandler):
             target = bits[1] if len(bits) > 1 else "-"
             status = next((int(tok) for tok in parts[-1].split() if tok.isdigit()), 0)
             ms = (time.perf_counter() - getattr(self, "_t0", time.perf_counter())) * 1000.0
-            _record_request(method, target, status, ms)
+            headers = getattr(self, "headers", None)
+            ua = headers.get("User-Agent", "") if headers else ""
+            _record_request(method, target, status, ms, ua,
+                            getattr(self, "_last_sent", None))
         except Exception:  # noqa: BLE001 — logging must never break a request
             pass
 

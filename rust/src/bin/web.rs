@@ -174,8 +174,11 @@ fn save_stats() {
 }
 
 /// Append one JSON line per real request. Rotates the file once it exceeds
-/// ~4 MB (previous file kept as access.jsonl.1, then overwritten).
-fn access_log_append(method: &str, target: &str, code: u16, ms: f64) {
+/// ~4 MB (previous file kept as access.jsonl.1, then overwritten). The line
+/// is the raw material for the /api/logs dataset export: timestamp, method,
+/// full URL path incl. query string, status, ms, response bytes and the
+/// User-Agent string. No IPs are ever logged.
+fn access_log_append(method: &str, target: &str, code: u16, ms: f64, bytes: usize, ua: &str) {
     let p = access_log_path();
     if let Some(dir) = p.parent() {
         let _ = fs::create_dir_all(dir);
@@ -185,26 +188,29 @@ fn access_log_append(method: &str, target: &str, code: u16, ms: f64) {
             let _ = fs::rename(&p, p.with_file_name("access.jsonl.1"));
         }
     }
-    // Cap pathological targets; jstr() quotes+escapes for JSON.
+    // Cap pathological targets/UAs; jstr() quotes+escapes for JSON.
     let target: String = target.chars().take(512).collect();
+    let ua: String = ua.chars().take(256).collect();
     let line = format!(
-        "{{\"ts\":{},\"method\":{},\"path\":{},\"status\":{},\"ms\":{:.1}}}\n",
+        "{{\"ts\":{},\"method\":{},\"path\":{},\"status\":{},\"ms\":{:.1},\"bytes\":{},\"ua\":{}}}\n",
         epoch_ms(),
         jstr(method),
         jstr(&target),
         code,
-        ms
+        ms,
+        bytes,
+        jstr(&ua)
     );
     if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&p) {
         let _ = f.write_all(line.as_bytes());
     }
 }
 
-/// Classify + count one request. Health checks and the stats endpoint itself
-/// are excluded so they cannot inflate the numbers.
-fn observe_request(method: &str, target: &str, code: u16, ms: f64) {
+/// Classify + count one request. Health checks and the stats/logs endpoints
+/// themselves are excluded so they cannot inflate the numbers or the dataset.
+fn observe_request(method: &str, target: &str, code: u16, ms: f64, bytes: usize, ua: &str) {
     let path = target.split('?').next().unwrap_or(target);
-    if path == "/health" || path == "/api/stats" {
+    if path == "/health" || path == "/api/stats" || path == "/api/logs" || path == "/api/matches" {
         return;
     }
     S_TOTAL.fetch_add(1, Ordering::Relaxed);
@@ -224,10 +230,167 @@ fn observe_request(method: &str, target: &str, code: u16, ms: f64) {
             S_API_KEYWORDS.fetch_add(1, Ordering::Relaxed);
         }
     }
-    access_log_append(method, path, code, ms);
+    // The dataset keeps the full URL (with query); counters use the bare path.
+    access_log_append(method, target, code, ms, bytes, ua);
     if S_TOTAL.load(Ordering::Relaxed) % 25 == 0 {
         save_stats();
     }
+}
+
+/// Minimal RFC-4180-style CSV field quoting.
+fn csv_field(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        if c == '"' {
+            out.push_str("\"\"");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// GET /api/logs?format=csv|jsonl&limit=N — download the URL access log as a
+/// dataset (ts, method, path, status, ms, bytes, ua). No IPs are stored.
+fn api_logs(qs: &str) -> Resp {
+    let params = parse_urlencoded(qs.as_bytes());
+    let fmt = params.get("format").cloned().unwrap_or_else(|| "csv".into());
+    let limit: usize = params
+        .get("limit")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10_000)
+        .clamp(1, 1_000_000);
+    let p = access_log_path();
+    let Ok(s) = fs::read_to_string(&p) else {
+        return Resp::text(404, "no logs yet");
+    };
+    let all: Vec<&str> = s.lines().collect();
+    let lines = &all[all.len().saturating_sub(limit)..];
+    if fmt == "jsonl" {
+        let mut b = lines.join("\n").into_bytes();
+        if !b.is_empty() {
+            b.push(b'\n');
+        }
+        return Resp::bytes(200, b, "application/x-ndjson; charset=utf-8")
+            .with_header("Content-Disposition", "attachment; filename=\"access.jsonl\"");
+    }
+    let mut out = String::from("ts,method,path,status,ms,bytes,ua\n");
+    for l in lines {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(l) {
+            let f = |k: &str| -> String {
+                match v.get(k) {
+                    Some(serde_json::Value::Null) | None => String::new(),
+                    Some(serde_json::Value::String(s)) => s.clone(),
+                    Some(x) => x.to_string(),
+                }
+            };
+            out.push_str(&csv_field(&f("ts")));
+            out.push(',');
+            out.push_str(&csv_field(&f("method")));
+            out.push(',');
+            out.push_str(&csv_field(&f("path")));
+            out.push(',');
+            out.push_str(&csv_field(&f("status")));
+            out.push(',');
+            out.push_str(&csv_field(&f("ms")));
+            out.push(',');
+            out.push_str(&csv_field(&f("bytes")));
+            out.push(',');
+            out.push_str(&csv_field(&f("ua")));
+            out.push('\n');
+        }
+    }
+    Resp::bytes(200, out.into_bytes(), "text/csv; charset=utf-8")
+        .with_header("Content-Disposition", "attachment; filename=\"access.csv\"")
+}
+
+// ---------------------------------------------------------------------------
+// Match payload logging (dataset: what people submit to /match and what the
+// engine says back). Appended to logs/matches.jsonl — metadata + lengths by
+// default; the full abstract/text are only included when MATCH_LOG_FULL=1,
+// because pasted paper text is often unpublished work. No IPs are stored.
+// ---------------------------------------------------------------------------
+
+fn matches_path() -> PathBuf {
+    repo_root().join("logs").join("matches.jsonl")
+}
+
+fn append_match_line(v: &serde_json::Value) {
+    let p = matches_path();
+    if let Some(dir) = p.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    if let Ok(md) = fs::metadata(&p) {
+        if md.len() > 4 << 20 {
+            let _ = fs::rename(&p, p.with_file_name("matches.jsonl.1"));
+        }
+    }
+    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&p) {
+        let _ = writeln!(f, "{v}");
+    }
+}
+
+fn match_log_full() -> bool {
+    std::env::var("MATCH_LOG_FULL")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"))
+        .unwrap_or(false)
+}
+
+/// GET /api/matches?format=csv|jsonl&limit=N — download the /match payload
+/// dataset (columns below; array cells are pipe-joined in CSV).
+fn api_matches(qs: &str) -> Resp {
+    let params = parse_urlencoded(qs.as_bytes());
+    let fmt = params.get("format").cloned().unwrap_or_else(|| "csv".into());
+    let limit: usize = params
+        .get("limit")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10_000)
+        .clamp(1, 1_000_000);
+    let cols = [
+        "ts", "via", "uid", "title", "authors", "year", "journal", "doi", "keywords",
+        "abstract_len", "text_len", "uploaded", "top", "max_kw", "sdg", "limit", "present",
+        "total", "sdgs_matched", "ms", "error",
+    ];
+    let p = matches_path();
+    let Ok(s) = fs::read_to_string(&p) else {
+        return Resp::text(404, "no match logs yet");
+    };
+    let all: Vec<&str> = s.lines().collect();
+    let lines = &all[all.len().saturating_sub(limit)..];
+    if fmt == "jsonl" {
+        let mut b = lines.join("\n").into_bytes();
+        if !b.is_empty() {
+            b.push(b'\n');
+        }
+        return Resp::bytes(200, b, "application/x-ndjson; charset=utf-8")
+            .with_header("Content-Disposition", "attachment; filename=\"matches.jsonl\"");
+    }
+    let mut out = String::from("ts,via,uid,title,authors,year,journal,doi,keywords,abstract_len,text_len,uploaded,top,max_kw,sdg,limit,present,total,sdgs_matched,ms,error\n");
+    for l in lines {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(l) {
+            for (i, col) in cols.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                let cell = match v.get(*col) {
+                    Some(serde_json::Value::Null) | None => String::new(),
+                    Some(serde_json::Value::String(s)) => s.clone(),
+                    Some(serde_json::Value::Array(a)) => a
+                        .iter()
+                        .map(|x| x.as_str().unwrap_or("").to_string())
+                        .collect::<Vec<_>>()
+                        .join("|"),
+                    Some(x) => x.to_string(),
+                };
+                out.push_str(&csv_field(&cell));
+            }
+            out.push('\n');
+        }
+    }
+    Resp::bytes(200, out.into_bytes(), "text/csv; charset=utf-8")
+        .with_header("Content-Disposition", "attachment; filename=\"matches.csv\"")
 }
 
 /// GET /api/stats — cumulative usage counters + uptime, as JSON.
@@ -2157,6 +2320,8 @@ fn route_get(path: &str, qs: &str) -> Resp {
         }
         "/health" => Resp::text(200, "ok"),
         "/api/stats" => stats_json(),
+        "/api/logs" => api_logs(qs),
+        "/api/matches" => api_matches(qs),
         "/samples" => Resp::json(200, samples_json()),
         "/sample" => {
             let params = parse_urlencoded(qs.as_bytes());
@@ -2242,7 +2407,7 @@ fn paper_from_request(
     }
 }
 
-fn run_match(headers: &[(String, String)], body: &[u8]) -> Result<MatchOutcome, String> {
+fn run_match(headers: &[(String, String)], body: &[u8], via: &str) -> Result<MatchOutcome, String> {
     let t0 = Instant::now();
     let ctype = headers
         .iter()
@@ -2258,17 +2423,96 @@ fn run_match(headers: &[(String, String)], body: &[u8]) -> Result<MatchOutcome, 
         (parse_urlencoded(body), HashMap::new())
     };
 
-    let (paper, meta) = paper_from_request(&mut fields, &files)?;
+    // Snapshot the payload for the dataset BEFORE paper_from_request consumes
+    // the raw text field. Metadata + lengths are logged by default; the full
+    // abstract/text only when MATCH_LOG_FULL=1 (pasted text is often
+    // unpublished). The same summary is mirrored to Sentry as an info event.
+    let uid = cookie_uid(headers);
+    let title = fields.get("title").cloned().unwrap_or_default();
+    let authors = fields.get("authors").cloned().unwrap_or_default();
+    let year = fields.get("year").cloned().unwrap_or_default();
+    let journal = fields.get("journal").cloned().unwrap_or_default();
+    let doi = fields.get("doi").cloned().unwrap_or_default();
+    let keywords = fields.get("keywords").cloned().unwrap_or_default();
+    let abstract_text = fields.get("abstract").cloned();
+    let abstract_len = abstract_text.as_ref().map_or(0, |s| s.chars().count());
+    let raw_text = fields.get("paper").cloned();
+    let uploaded = !files.is_empty();
+    let body_len = raw_text.as_ref().map_or(0, |s| s.len())
+        + files.values().map(|b| b.len()).sum::<usize>();
+
+    let (paper, meta) = match paper_from_request(&mut fields, &files) {
+        Ok(x) => x,
+        Err(e) => {
+            // Dataset row for the failed attempt (what they tried).
+            let mut o = serde_json::json!({
+                "ts": epoch_ms(), "via": via, "uid": uid,
+                "title": title, "authors": authors, "year": year, "journal": journal,
+                "doi": doi, "keywords": keywords, "abstract_len": abstract_len,
+                "text_len": body_len, "uploaded": uploaded, "error": e.as_str(),
+            });
+            if match_log_full() {
+                if let Some(a) = abstract_text.clone() {
+                    o["abstract"] = a.into();
+                }
+                if let Some(t) = raw_text.clone() {
+                    o["text"] = t.into();
+                }
+            }
+            append_match_line(&o);
+            return Err(e);
+        }
+    };
 
     let top = clamp_int(fields.get("top").map(String::as_str), 30, 1, 30);
     let max_kw = clamp_int(fields.get("maxkw").map(String::as_str), 10, 1, 50);
     let report = match_report(&paper, top, max_kw);
     let ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+    let matched: Vec<String> = report
+        .iter()
+        .filter(|r| !r.matched.is_empty())
+        .map(|r| r.sdg.clone())
+        .collect();
+    let mut o = serde_json::json!({
+        "ts": epoch_ms(), "via": via, "uid": uid,
+        "title": title, "authors": authors, "year": year, "journal": journal,
+        "doi": doi, "keywords": keywords, "abstract_len": abstract_len,
+        "text_len": body_len, "uploaded": uploaded,
+        "top": top, "max_kw": max_kw, "ms": (ms * 100.0).round() / 100.0,
+        "sdgs_matched": matched,
+    });
+    if match_log_full() {
+        if let Some(a) = abstract_text {
+            o["abstract"] = a.into();
+        }
+        if let Some(t) = raw_text {
+            o["text"] = t.into();
+        }
+    }
+    append_match_line(&o);
+    // Mirror a summary to Sentry (info level; full text never leaves the box).
+    let label = if title.is_empty() { "paper match".to_string() } else { title.clone() };
+    sentry_report(
+        "info",
+        "web.match",
+        &label,
+        None,
+        None,
+        &[("via", via)],
+        serde_json::json!({
+            "uid": uid, "title": title, "authors": authors, "year": year,
+            "journal": journal, "doi": doi, "keywords": keywords,
+            "abstract_len": abstract_len, "text_len": body_len,
+            "uploaded": uploaded, "top": top, "max_kw": max_kw,
+            "sdgs_matched": matched, "ms": (ms * 100.0).round() / 100.0,
+        }),
+    );
     Ok(MatchOutcome { paper, meta, report, ms })
 }
 
 fn route_match(headers: &[(String, String)], body: &[u8]) -> Resp {
-    match run_match(headers, body) {
+    match run_match(headers, body, "match") {
         Err(msg) => Resp::html(200, error_box(&msg)),
         Ok(m) => Resp::html(200, render_results(&m.report, &m.paper, &m.meta, m.ms))
             .with_header("X-Processing-Time", &format!("{:.1} ms", m.ms)),
@@ -2277,7 +2521,7 @@ fn route_match(headers: &[(String, String)], body: &[u8]) -> Resp {
 
 /// POST /api/match — same input as /match, JSON report out (for scripts/CLI).
 fn api_match(headers: &[(String, String)], body: &[u8]) -> Resp {
-    match run_match(headers, body) {
+    match run_match(headers, body, "api_match") {
         Err(msg) => Resp::json(400, format!("{{\"error\":{}}}", jstr(&msg))),
         Ok(m) => {
             let out = serde_json::json!({
@@ -2335,6 +2579,7 @@ fn api_match(headers: &[(String, String)], body: &[u8]) -> Resp {
 /// paper's text (Advanced tab). Same form fields as /api/match plus `sdg`
 /// and optional `limit`. Deterministic token-overlap ranking, no LLM.
 fn api_keywords(headers: &[(String, String)], body: &[u8]) -> Resp {
+    let t0 = Instant::now();
     let ctype = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("content-type"));
     let (fields, files) = match ctype.and_then(|(_, v)| boundary_of(v)) {
         Some(b) => parse_multipart(body, &b),
@@ -2384,13 +2629,50 @@ fn api_keywords(headers: &[(String, String)], body: &[u8]) -> Resp {
         })
         .collect();
     let out = serde_json::json!({
-        "sdg": sdg,
+        "sdg": sdg.clone(),
         "sdg_name": sdg_name(&sdg),
         "total": total,
         "present": n_present,
         "keywords": kws,
         "limit": limit,
     });
+    let kw_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let mut row = serde_json::json!({
+        "ts": epoch_ms(), "via": "api_keywords", "uid": cookie_uid(headers),
+        "title": fields.get("title").cloned().unwrap_or_default(),
+        "authors": fields.get("authors").cloned().unwrap_or_default(),
+        "year": fields.get("year").cloned().unwrap_or_default(),
+        "journal": fields.get("journal").cloned().unwrap_or_default(),
+        "doi": fields.get("doi").cloned().unwrap_or_default(),
+        "keywords": fields.get("keywords").cloned().unwrap_or_default(),
+        "abstract_len": fields.get("abstract").map_or(0, |s| s.chars().count()),
+        "text_len": files.values().map(|b| b.len()).sum::<usize>(),
+        "uploaded": !files.is_empty(),
+        "sdg": sdg.clone(),
+        "limit": limit,
+        "present": n_present,
+        "total": total,
+        "ms": (kw_ms * 100.0).round() / 100.0,
+    });
+    if match_log_full() {
+        if let Some(a) = fields.get("abstract") {
+            row["abstract"] = a.clone().into();
+        }
+    }
+    append_match_line(&row);
+    sentry_report(
+        "info",
+        "web.keywords",
+        &format!("keyword lookup SDG {sdg}"),
+        None,
+        None,
+        &[],
+        serde_json::json!({
+            "sdg": sdg, "present": n_present, "total": total, "limit": limit,
+            "ms": (kw_ms * 100.0).round() / 100.0,
+            "title": fields.get("title").cloned().unwrap_or_default(),
+        }),
+    );
     Resp::json(200, out.to_string())
 }
 
@@ -2527,7 +2809,12 @@ fn handle_conn(stream: &mut TcpStream) {
     let _ = stream.write_all(&out);
     let ms = t_req.elapsed().as_secs_f64() * 1000.0;
     eprintln!("[web] {method} {target} -> {} ({ms:.1} ms)", resp.code);
-    observe_request(&method, &target, resp.code, ms);
+    let ua = headers
+        .iter()
+        .find(|(k, _)| k == "user-agent")
+        .map(|(_, v)| v.clone())
+        .unwrap_or_default();
+    observe_request(&method, &target, resp.code, ms, resp.body.len(), &ua);
 }
 
 // ---------------------------------------------------------------------------
