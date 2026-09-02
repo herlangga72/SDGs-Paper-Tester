@@ -391,6 +391,21 @@ def _sentry_disabled() -> bool:
     return time.time() < _SENTRY_DISABLED_UNTIL
 
 
+def _sentry_event_allowed(logger: str, level: str) -> bool:
+    """What may stream to Sentry (an error tracker, not a log store).
+    Default "errors": genuine errors/fatal panics only, so info events never
+    show up as fake issues or burn the error quota. "matches" adds the /match
+    payload events; "full" adds page/sample/doi URL events on top."""
+    if level in ("error", "fatal", "warning"):
+        return True
+    mode = os.environ.get("SENTRY_STREAM", "").strip().lower()
+    if mode == "full":
+        return True
+    if mode == "matches":
+        return logger in ("web.match", "web.keywords", "web.boot")
+    return False
+
+
 def _sentry_send_batch(dsn: str, url: str, events: list[dict]) -> bool:
     """POST one envelope containing several events; True on HTTP 200."""
     now = datetime.datetime.now(datetime.timezone.utc)
@@ -481,7 +496,7 @@ def sentry_report(level: str, logger: str, message: str,
                   exc: BaseException | None = None,
                   tags: dict | None = None, extra: dict | None = None) -> bool:
     """Best-effort report (enqueued, flushed in batches). Silent when unset."""
-    if not _SENTRY_DSN:
+    if not _SENTRY_DSN or not _sentry_event_allowed(logger, level):
         return False
     now = datetime.datetime.now(datetime.timezone.utc)
     ev = {"event_id": uuid.uuid4().hex,

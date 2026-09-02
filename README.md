@@ -132,18 +132,19 @@ The legacy Python server still works if you prefer it:
   the engine result (`via`, `sdgs_matched`, `ms`). Metadata + lengths by
   default; set `MATCH_LOG_FULL=1` to also record the full abstract/text
   (pasted paper text is often unpublished work). No IPs are ever stored.
-- **Sentry streaming (default on, quota-safe)**: the DSN is hard-coded in
-  both servers (public client key by design). Boot events, 5xx responses,
-  panics, unhandled handler exceptions and every `/match` payload (`logger`
-  `web.match` / `web.keywords`) always stream. Meaningful URL events
-  (`logger` `web.access`) also stream — page loads, sample/DOI lookups, match
-  submissions — but never static CSS/JS, the `/samples` auto-fetch, health
-  checks or the stats/logs endpoints. Events are batched into one envelope
-  per ~25 lines (or every 8 s) and capped per UTC day (`SENTRY_CAP`, default
-  1500) so a busy day pauses instead of exhausting the monthly quota
-  (`SENTRY_STREAM=off` disables the URL mirror). Local JSONL files stay the
-  ground truth. Override the project with `SENTRY_DSN`; release tags come
-  from `RENDER_GIT_COMMIT`. Info events appear under All Events / Discover.
+- **Sentry (default: errors only)**: the DSN is hard-coded in both servers
+  (public client key by design), so genuine errors — 5xx responses, panics,
+  unhandled handler/WSGI exceptions — always stream to your Sentry project
+  over the envelope API (no SDK). Info events are NOT sent by default: Sentry
+  is an error tracker, and info events would show up as fake issues and burn
+  the error quota. Opt in with `SENTRY_STREAM=matches` (adds `/match` payload
+  events `web.match` / `web.keywords`) or `SENTRY_STREAM=full` (also adds
+  page/sample/doi URL events `web.access`, never CSS/JS). Events are batched
+  (~25 per envelope or every 8 s) and capped per UTC day (`SENTRY_CAP`,
+  default 1500). Local JSONL files (`logs/access.jsonl`, `logs/matches.jsonl`)
+  stay the ground truth and always record everything. Override the project
+  with `SENTRY_DSN`, disable with `SENTRY_DSN=0` / `off`. Release tags come
+  from `RENDER_GIT_COMMIT`.
 - Matching semantics identical to Scopus: `NOT > AND/W-n > OR` precedence,
   whole-word matching, `*`/`?` wildcards (`*` matches within a word only, so
   `financ* cris*` needs "financial crisis", not "financ … crisis" anywhere

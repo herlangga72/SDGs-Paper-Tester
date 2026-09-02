@@ -685,6 +685,26 @@ fn sentry_daily_cap() -> u64 {
         .unwrap_or(1500)
 }
 
+/// What may stream to Sentry (an error tracker, not a log store). Default
+/// "errors": only genuine errors/fatal panics, so info events never show up
+/// as issues or burn the error quota. "matches" adds the /match payload
+/// events; "full" adds page/sample/doi URL events on top.
+fn sentry_event_allowed(logger: &str, level: &str) -> bool {
+    if matches!(level, "error" | "fatal" | "warning") {
+        return true;
+    }
+    match std::env::var("SENTRY_STREAM")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "full" => true,
+        "matches" => matches!(logger, "web.match" | "web.keywords" | "web.boot"),
+        _ => false, // errors only: info events never become fake issues
+    }
+}
+
 /// Count one event against the per-UTC-day cap; returns false when paused.
 fn sentry_count_event() -> bool {
     let cap = sentry_daily_cap();
@@ -807,6 +827,9 @@ fn sentry_report(
     tags: &[(&str, &str)],
     extra: serde_json::Value,
 ) {
+    if !sentry_event_allowed(logger, level) {
+        return;
+    }
     let dur = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
     let mut ev = serde_json::json!({
         "event_id": sentry_event_id(),
