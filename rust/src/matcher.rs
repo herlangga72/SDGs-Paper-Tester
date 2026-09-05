@@ -1020,12 +1020,23 @@ fn field_mask_from_strings(fields: &[String]) -> u8 {
 /// Buffers are also resolved once per request: the effective text of each
 /// field (its section, or the full text when the section is missing) is
 /// deduplicated by identity into a dense id space (<= 5 ids), and each
-/// distinct field mask is FOLDED into a single joined buffer (fields
-/// concatenated with '\n' separators) on first use. Every term is then
-/// searched once per mask against one buffer instead of up to four. The
-/// join separator is not a word character and is whitespace, so phrase,
-/// wildcard-`*` and boundary checks behave exactly as per-field searches;
-/// `?`-glob patterns run per segment so they can never match across fields.
+/// buffer keeps ONE shared, lazily built `TextIndex`.
+///
+/// A mask is a boolean OR gate over the buffers it selects. A term can never
+/// match across the '\n' separators of a folded join (phrases and `*`-parts
+/// need contiguous or non-space bytes), so "present under mask" == "present
+/// in any selected buffer". The expensive primitive - searching one keyword
+/// against one buffer - is computed once per `(pid, buffer)` pair and cached
+/// as a tri-state byte (`buf_hits`); every mask that references that pair
+/// then reads the verdict and ORs it, with no repeated search. Folded
+/// per-mask copies/indexes are gone entirely: masks with overlapping
+/// selections (TITLE-ABS, TITLE-ABS-KEY, full text) previously copied and
+/// indexed the same ~850 KB prefix once per mask (2.51 MB indexed per
+/// request for an 855 KB paper); shared per-buffer indexes index each byte
+/// range once. '?'-glob patterns keep the old segment rules (run per
+/// selected buffer, or per section range when the sole selection is a
+/// full-covers-sections full text) and are not buffer-decomposable, so they
+/// bypass the gate.
 pub struct Memo<'a> {
     terms: Vec<u8>,
     bufs: [&'a [u8]; 5],
@@ -1033,26 +1044,15 @@ pub struct Memo<'a> {
     full_id: u8,
     full_covers_sections: bool,
     full_segs: [(usize, usize); 4],
-    joined: Vec<JoinedEntry<'a>>,
-    /// O(1) mask -> joined-buffer index (i32 for a -1 "unset" sentinel).
-    mask_cache: [i32; 256],
-    /// Buffer-id-list signature -> joined entry, so every mask that selects
-    /// the same buffers shares ONE buffer and ONE TextIndex build (masks
-    /// that all fall back to the full text used to rebuild the full text
-    /// copy + index per mask: measured 2.3x slower on a 1.8 MB paper).
-    join_cache: FastMap<u64, usize>,
+    /// Shared, lazily built presence index per deduplicated buffer id.
+    buf_idx: Vec<Option<Box<TextIndex>>>,
+    /// Tri-state (0 = unset, 1 = false, 2 = true) verdict per (pid, buffer)
+    /// pair, row-major over pid with `BUFS` cells per row.
+    buf_hits: Vec<u8>,
 }
 
-/// A mask's folded buffer plus its per-field segments (for `?` globs) and a
-/// lazily built `TextIndex` pre-filter.
-struct JoinedEntry<'a> {
-    /// Borrowed when the entry is exactly the full text (no copy); owned
-    /// when it is a real multi-buffer fold.
-    buf: Cow<'a, [u8]>,
-    idx: Option<TextIndex>,
-    nsegs: u8,
-    segs: [(usize, usize); 5],
-}
+/// Max deduplicated buffers per request (full text + 4 fields).
+const MAX_BUFS: usize = 5;
 
 /// Append `t` to `bufs` if no identical (pointer+length) buffer is present;
 /// returns the deduplicated id of `t`.
@@ -1085,20 +1085,18 @@ impl<'a> Memo<'a> {
             full_id,
             full_covers_sections: paper.full_covers_sections,
             full_segs: paper.full_section_ranges(),
-            joined: Vec::new(),
-            mask_cache: [-1; 256],
-            join_cache: new_fast_map(),
+            buf_idx: std::iter::repeat_with(|| None).take(nb).collect(),
+            buf_hits: Vec::new(),
         }
     }
 
-    /// Get (building on first use) the folded buffer for `mask`. Returns its
-    /// index in `self.joined`.
-    fn joined_for(&mut self, mask: u8) -> usize {
-        let cached = self.mask_cache[mask as usize];
-        if cached >= 0 {
-            return cached as usize;
-        }
-        // Decode the mask into deduplicated buffer ids.
+    /// Decode `mask` into the deduplicated buffer ids it selects, in field
+    /// order (ids ascending, then the full text when the ANY bit is set).
+    /// A term is present under the mask iff it is present in any of these
+    /// buffers (OR gate) - it can never match across the '\n' fold
+    /// separators.
+    #[inline]
+    fn select(&self, mask: u8) -> ([u8; 5], usize) {
         let mut ids = [0u8; 5];
         let mut n = 0usize;
         for f in 0..4u8 {
@@ -1117,73 +1115,96 @@ impl<'a> Memo<'a> {
                 n += 1;
             }
         }
-        // Share one joined buffer across every mask selecting the same ids
-        // (e.g. all masks falling back to the full text): one copy + one
-        // TextIndex build per distinct selection instead of per mask.
-        let mut key = n as u64;
-        for &id in &ids[..n] {
-            key = (key << 8) | u64::from(id);
-        }
-        if let Some(&j) = self.join_cache.get(&key) {
-            self.mask_cache[mask as usize] = j as i32;
-            return j;
-        }
-        let mut cap = 0usize;
-        for &id in &ids[..n] {
-            cap += self.bufs[id as usize].len();
-        }
-        let (buf, segs, nsegs);
-        if n == 1 && ids[0] == self.full_id {
-            // Exactly the full text: borrow it, zero copy. Its per-section
-            // ranges (when full covers the sections) keep '?'-glob
-            // semantics; otherwise it is one segment.
-            let full = self.bufs[self.full_id as usize];
-            if self.full_covers_sections {
-                let mut sg = [(0usize, 0usize); 5];
-                let mut ns = 0usize;
-                for (s, e) in self.full_segs.iter() {
-                    if s != e {
-                        sg[ns] = (*s, *e);
-                        ns += 1;
-                    }
-                }
-                buf = Cow::Borrowed(full);
-                segs = sg;
-                nsegs = ns;
-            } else {
-                buf = Cow::Borrowed(full);
-                segs = [(0, full.len()), (0, 0), (0, 0), (0, 0), (0, 0)];
-                nsegs = 1;
-            }
-        } else {
-            let mut v = Vec::with_capacity(cap + n);
-            let mut sg = [(0usize, 0usize); 5];
-            let mut ns = 0usize;
-            for &id in &ids[..n] {
-                let b = self.bufs[id as usize];
-                if ns > 0 {
-                    v.push(b'\n');
-                }
-                let start = v.len();
-                v.extend_from_slice(b);
-                sg[ns] = (start, v.len());
-                ns += 1;
-            }
-            buf = Cow::Owned(v);
-            segs = sg;
-            nsegs = ns;
-        }
-        self.joined.push(JoinedEntry { buf, idx: None, nsegs: nsegs as u8, segs });
-        let idx = self.joined.len() - 1;
-        self.mask_cache[mask as usize] = idx as i32;
-        self.join_cache.insert(key, idx);
-        idx
+        (ids, n)
     }
 
-    /// Evaluate `pat` under field `mask`, memoized at dense `slot`. The mask
-    /// and slot are both precomputed and stamped on the leaf by
-    /// `resolve_blocks`, so the caller passes them straight through.
-    fn term_hit(&mut self, pat: &Pattern, mask: u8, slot: usize) -> bool {
+    /// Search one `(pid, buffer)` pair (uncached) and record its tri-state
+    /// verdict so every mask that selects this buffer reads a boolean
+    /// instead of re-running the filter + SIMD search.
+    fn buffer_verdict(&mut self, pid: usize, bid: u8, pat: &Pattern) -> bool {
+        let cell = pid * MAX_BUFS + bid as usize;
+        if self.buf_hits.len() <= cell {
+            // Grow row-major to cover this pid (resize keeps tri-state 0
+            // = unset for untouched cells).
+            self.buf_hits.resize(cell + 1, 0);
+        }
+        match self.buf_hits[cell] {
+            1 => return false,
+            2 => return true,
+            _ => {}
+        }
+        let v = self.search_buffer(bid, pat);
+        self.buf_hits[cell] = if v { 2 } else { 1 };
+        v
+    }
+
+    /// Pre-filter + search of `pat` against one deduplicated buffer using
+    /// its shared `TextIndex` (built once per buffer per request).
+    fn search_buffer(&mut self, bid: u8, pat: &Pattern) -> bool {
+        let b = self.bufs[bid as usize];
+        if b.is_empty() {
+            return false;
+        }
+        let id = bid as usize;
+        if self.buf_idx[id].is_none() {
+            self.buf_idx[id] = Some(Box::new(TextIndex::build(b)));
+        }
+        let idx = self.buf_idx[id].as_deref().unwrap();
+        // Filter first: if a literal part is absent from this buffer, the
+        // SIMD search is guaranteed to fail here.
+        #[cfg(feature = "prof")]
+        let filter = !prof::skip_filter() && pat.could_match(idx);
+        #[cfg(not(feature = "prof"))]
+        let filter = pat.could_match(idx);
+        #[cfg(feature = "prof")]
+        if filter && (prof::skip_find() || pat.matches_indexed(b, idx)) {
+            return true;
+        }
+        #[cfg(not(feature = "prof"))]
+        if filter && pat.matches_indexed(b, idx) {
+            return true;
+        }
+        false
+    }
+
+    /// `?`-glob (no literal parts) over a mask's selection, preserving the
+    /// pre-gate segment rules: run per selected buffer; when the sole
+    /// selection is a full-covers-sections full text, run per section range
+    /// (or over the whole buffer when fewer than two ranges are recorded,
+    /// matching the old folded-buffer behavior for empty/whitespace papers).
+    fn compute_glob(&self, pat: &Pattern, ids: &[u8]) -> bool {
+        let raw = pat.lower_raw();
+        if ids.len() == 1 && ids[0] == self.full_id && self.full_covers_sections {
+            let full = self.bufs[self.full_id as usize];
+            let mut ns = 0usize;
+            for (s, e) in self.full_segs.iter() {
+                if s != e {
+                    ns += 1;
+                }
+            }
+            if ns > 1 {
+                for (s, e) in self.full_segs.iter() {
+                    if s != e && glob_match(raw, &full[*s..*e]) {
+                        return true;
+                    }
+                }
+                return false;
+            }
+            return glob_match(raw, full);
+        }
+        for &id in ids {
+            if glob_match(raw, self.bufs[id as usize]) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Evaluate `pat` (pattern-table index `pid`) under field `mask`,
+    /// memoized at dense `slot`. The mask and slot are both precomputed and
+    /// stamped on the leaf by `resolve_blocks`, so the caller passes them
+    /// straight through.
+    fn term_hit(&mut self, pat: &Pattern, pid: usize, mask: u8, slot: usize) -> bool {
         #[cfg(feature = "prof")]
         {
             use std::sync::atomic::Ordering;
@@ -1218,7 +1239,7 @@ impl<'a> Memo<'a> {
             use std::sync::atomic::Ordering;
             prof::TERM_COMPUTES.fetch_add(1, Ordering::Relaxed);
         }
-        let v = self.compute(pat, mask);
+        let v = self.compute(pat, pid, mask);
         if slot >= self.terms.len() {
             self.terms.resize(slot + 1, 0);
         }
@@ -1234,50 +1255,28 @@ impl<'a> Memo<'a> {
     /// Skipping the boolean VM and the classification pushes is significantly
     /// cheaper than `scan_flat_into` when only presence matters.
     #[inline]
-    pub fn leaf_hit(&mut self, pat: &Pattern, mask: u8, slot: u32) -> bool {
-        self.term_hit(pat, mask, slot as usize)
+    pub fn leaf_hit(&mut self, pat: &Pattern, pid: u32, mask: u8, slot: u32) -> bool {
+        self.term_hit(pat, pid as usize, mask, slot as usize)
     }
 
-    /// Actual search for `pat` under `mask` (uncached), against the mask's
-    /// single folded buffer. `?`-glob patterns (no literal parts) run per
-    /// segment so a `?` can never consume the join separator; everything
-    /// else uses the TextIndex pre-filter then one SIMD search.
-    fn compute(&mut self, pat: &Pattern, mask: u8) -> bool {
+    /// Actual search for `pat` under `mask` (uncached). Literal patterns are
+    /// answered as a boolean OR over the mask's selected buffers, where each
+    /// `(pid, buffer)` verdict is computed once and cached. `?`-glob
+    /// patterns (no literal parts) bypass the gate because their segment
+    /// semantics are context-dependent; they run per selected buffer (per
+    /// section range when the sole selection is a full-covers-sections full
+    /// text).
+    fn compute(&mut self, pat: &Pattern, pid: usize, mask: u8) -> bool {
         // A zero mask means "no field scoping" -> the default TITLE-ABS-KEY.
         let mask = if mask == 0 { field_mask(&ALL_FIELDS) } else { mask };
-        let jidx = self.joined_for(mask);
+        let (ids, n) = self.select(mask);
         if pat.n_parts() == 0 {
-            // '?' glob: run per segment so patterns cannot span fields.
-            let j = &self.joined[jidx];
-            if j.nsegs > 1 {
-                for s in &j.segs[..j.nsegs as usize] {
-                    if glob_match(pat.lower_raw(), &j.buf[s.0..s.1]) {
-                        return true;
-                    }
-                }
-                return false;
+            return self.compute_glob(pat, &ids[..n]);
+        }
+        for k in 0..n {
+            if self.buffer_verdict(pid, ids[k], pat) {
+                return true;
             }
-            return glob_match(pat.lower_raw(), &j.buf);
-        }
-        let entry = &mut self.joined[jidx];
-        if entry.idx.is_none() {
-            entry.idx = Some(TextIndex::build(&entry.buf));
-        }
-        let idx = entry.idx.as_ref().unwrap();
-        // Filter first: if a literal part of the pattern is absent from the
-        // buffer, the SIMD search is guaranteed to fail.
-        #[cfg(feature = "prof")]
-        let filter = !prof::skip_filter() && pat.could_match(idx);
-        #[cfg(not(feature = "prof"))]
-        let filter = pat.could_match(idx);
-        // SIMD search runs only when the pre-filter passes (short-circuit).
-        #[cfg(feature = "prof")]
-        if filter && (prof::skip_find() || pat.matches_indexed(&entry.buf, idx)) {
-            return true;
-        }
-        #[cfg(not(feature = "prof"))]
-        if filter && pat.matches_indexed(&entry.buf, idx) {
-            return true;
         }
         false
     }
@@ -1299,9 +1298,9 @@ pub fn eval(node: &Node, fields: Option<&[u8]>, paper: &Paper, table: &[Pattern]
 
 fn eval_memo(node: &Node, mask: u8, table: &[Pattern], memo: &mut Memo) -> bool {
     match node {
-        Node::Leaf { mask, slot, .. } => {
+        Node::Leaf { pid, mask, slot, .. } => {
             let p = pat(table, node);
-            memo.term_hit(p, *mask, *slot as usize)
+            memo.term_hit(p, *pid as usize, *mask, *slot as usize)
         }
         Node::Field { fields: fs, child } => eval_memo(child, field_mask_from_strings(fs), table, memo),
         Node::Not { child } => !eval_memo(child, mask, table, memo),
@@ -1560,7 +1559,7 @@ pub fn scan_flat_into<'a, 'b>(
                 // Pattern is loaded once for the search and reused for the
                 // report string: LeafDesc no longer carries raw blob offsets.
                 let pat = &table[l.pid as usize];
-                let v = memo.term_hit(pat, l.mask, l.slot as usize);
+                let v = memo.term_hit(pat, l.pid as usize, l.mask, l.slot as usize);
                 if report {
                     #[cfg(feature = "prof")]
                     {
@@ -1683,9 +1682,9 @@ fn leaf_kw_hit(node: &Node, _mask: u8, table: &[Pattern], memo: &mut Memo) -> Op
         _ => return None,
     };
     match leaf {
-        Node::Leaf { slot, .. } => {
+        Node::Leaf { pid, slot, .. } => {
             let p = pat(table, leaf);
-            let v = memo.term_hit(p, lm, *slot as usize);
+            let v = memo.term_hit(p, *pid as usize, lm, *slot as usize);
             Some((p.raw(), v))
         }
         _ => unreachable!(),
@@ -1709,9 +1708,9 @@ fn group_fp(g: &[&'static str]) -> u64 {
 
 fn min_add(node: &Node, mask: u8, table: &[Pattern], memo: &mut Memo) -> MinAdd {
     match node {
-        Node::Leaf { mask: lm, slot, .. } => {
+        Node::Leaf { pid, mask: lm, slot, .. } => {
             let p = pat(table, node);
-            if memo.term_hit(p, *lm, *slot as usize) {
+            if memo.term_hit(p, *pid as usize, *lm, *slot as usize) {
                 MinAdd { value: true, cost: 0, need: Vec::new() }
             } else {
                 MinAdd { value: false, cost: 1, need: vec![vec![p.raw()]] }
@@ -1955,7 +1954,7 @@ pub fn min_add_flat_cost(
         match op.tag {
             OP_PUSH => {
                 let l = &flat.leaves[op.payload as usize];
-                let v = memo.term_hit(&table[l.pid as usize], l.mask, l.slot as usize);
+                let v = memo.term_hit(&table[l.pid as usize], l.pid as usize, l.mask, l.slot as usize);
                 scr.pairs.push((v, if v { 0 } else { 1 }));
             }
             OP_TRUE => scr.pairs.push((true, 0)),
@@ -2048,7 +2047,7 @@ pub fn min_add_flat(
         match op.tag {
             OP_PUSH => {
                 let l = &flat.leaves[op.payload as usize];
-                let v = memo.term_hit(&table[l.pid as usize], l.mask, l.slot as usize);
+                let v = memo.term_hit(&table[l.pid as usize], l.pid as usize, l.mask, l.slot as usize);
                 if v {
                     scr.eval.push(EvalEntry { value: true, cost: 0, ..Default::default() });
                 } else {
@@ -2339,8 +2338,8 @@ pub fn min_add_block<'a>(
 /// for the blocks that make the displayed list (see `min_add_block`).
 fn min_add_vc(node: &Node, mask: u8, table: &[Pattern], memo: &mut Memo) -> (bool, usize) {
     match node {
-        Node::Leaf { mask: lm, slot, .. } => {
-            let v = memo.term_hit(pat(table, node), *lm, *slot as usize);
+        Node::Leaf { pid, mask: lm, slot, .. } => {
+            let v = memo.term_hit(pat(table, node), *pid as usize, *lm, *slot as usize);
             (v, if v { 0 } else { 1 })
         }
         Node::Field { fields, child } => {
@@ -2407,8 +2406,8 @@ pub fn eval_ignore_not_block<'a>(
 ) -> bool {
     fn go(node: &Node, mask: u8, table: &[Pattern], memo: &mut Memo) -> bool {
         match node {
-            Node::Leaf { mask: lm, slot, .. } => {
-                memo.term_hit(pat(table, node), *lm, *slot as usize)
+            Node::Leaf { pid, mask: lm, slot, .. } => {
+                memo.term_hit(pat(table, node), *pid as usize, *lm, *slot as usize)
             }
             Node::Field { fields, child } => go(child, field_mask_from_strings(fields), table, memo),
             Node::Not { .. } => true, // clause removed: identity
@@ -2761,9 +2760,9 @@ fn rec_fields(
     ex_hits: &mut Vec<&'static str>,
 ) -> bool {
     match node {
-        Node::Leaf { mask, slot, .. } => {
+        Node::Leaf { pid, mask, slot, .. } => {
             let p = pat(table, node);
-            let found = memo.term_hit(p, *mask, *slot as usize);
+            let found = memo.term_hit(p, *pid as usize, *mask, *slot as usize);
             #[cfg(feature = "prof")]
             let report = !prof::skip_report();
             #[cfg(not(feature = "prof"))]
@@ -2856,9 +2855,9 @@ fn rec(
     out: &mut BlockScan,
 ) -> bool {
     match node {
-        Node::Leaf { mask, slot, .. } => {
+        Node::Leaf { pid, mask, slot, .. } => {
             let p = pat(table, node);
-            let found = memo.term_hit(p, *mask, *slot as usize);
+            let found = memo.term_hit(p, *pid as usize, *mask, *slot as usize);
             if excluded {
                 if found {
                     out.excluded_hits.push(p.raw());
@@ -3739,6 +3738,188 @@ abstract: |
         let mut got: Vec<String> = pw.set.iter().map(|s| s.to_string()).collect();
         got.sort_unstable();
         assert_eq!(got, reference(&long));
+    }
+
+    /// Independent re-implementation of the OLD folded-buffer semantics (one
+    /// '\n'-joined buffer per mask + one TextIndex), used to prove the
+    /// boolean-gate Memo returns identical verdicts.
+    fn old_fold(paper: &Paper, mask: u8) -> (Vec<u8>, Vec<(usize, usize)>) {
+        fn dedup_id<'x>(bufs: &mut Vec<&'x [u8]>, t: &'x [u8]) -> usize {
+            for (k, b) in bufs.iter().enumerate() {
+                if b.as_ptr() == t.as_ptr() && b.len() == t.len() {
+                    return k;
+                }
+            }
+            bufs.push(t);
+            bufs.len() - 1
+        }
+        let mut bufs: Vec<&[u8]> = Vec::new();
+        let full = paper.text_lower(F_ANY);
+        let full_id = dedup_id(&mut bufs, full);
+        let mut field_ids = [0usize; 4];
+        for f in 0..4u8 {
+            field_ids[f as usize] = dedup_id(&mut bufs, paper.text_lower(f));
+        }
+        let mut ids: Vec<usize> = Vec::new();
+        for f in 0..4u8 {
+            if mask & (1 << f) != 0 {
+                let id = field_ids[f as usize];
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+        }
+        if mask & (1 << (F_ANY & 7)) != 0 {
+            let id = full_id;
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        if ids.len() == 1 && ids[0] == full_id && paper.full_covers_sections {
+            let mut segs = Vec::new();
+            for (s, e) in paper.full_section_ranges().iter() {
+                if s != e {
+                    segs.push((*s, *e));
+                }
+            }
+            return (full.to_vec(), segs);
+        }
+        let mut out = Vec::new();
+        let mut segs = Vec::new();
+        for (i, &id) in ids.iter().enumerate() {
+            let b = bufs[id];
+            if i > 0 {
+                out.push(b'\n');
+            }
+            let start = out.len();
+            out.extend_from_slice(b);
+            segs.push((start, out.len()));
+        }
+        (out, segs)
+    }
+
+    fn old_compute(pat: &Pattern, mask: u8, paper: &Paper) -> bool {
+        let mask = if mask == 0 { field_mask(&ALL_FIELDS) } else { mask };
+        let (text, segs) = old_fold(paper, mask);
+        if pat.n_parts() == 0 {
+            if segs.len() > 1 {
+                for (s, e) in &segs {
+                    if glob_match(pat.lower_raw(), &text[*s..*e]) {
+                        return true;
+                    }
+                }
+                return false;
+            }
+            return glob_match(pat.lower_raw(), &text);
+        }
+        if text.is_empty() {
+            return false;
+        }
+        let idx = TextIndex::build(&text);
+        if !pat.could_match(&idx) {
+            return false;
+        }
+        pat.matches_indexed(&text, &idx)
+    }
+
+    /// The boolean-gate Memo (per-(pid, buffer) verdicts OR-ed per mask)
+    /// must equal the old per-mask folded-buffer semantics for every field
+    /// mask x pattern shape x paper.
+    #[test]
+    fn per_buffer_matches_old_join_semantics() {
+        let _lock = reset_test_blob();
+        let pats: Vec<Pattern> = [
+            "water",
+            "health care",
+            "aa",
+            "foreign aid",
+            "climate* change*",
+            "poverty*-reducing*",
+            "developing* countr*",
+            "conditional ?-convergence",
+            "small?sc*",
+            "accoya? wood",
+            "sustainab*",
+            "*",
+            "zebra photosynthesis*",
+        ]
+        .iter()
+        .map(|k| compile_pattern(k))
+        .collect();
+        rebuild_first_quads(&pats);
+
+        let toks = [
+            "small", "scale", "smallxscales", "smallscale", "accoya", "accoyax", "wood",
+            "conditional", "convergence", "developing", "countries", "tax", "evasion",
+            "poverty", "reducing", "water", "cattle", "treatment", "climate", "change",
+            "coral", "reef", "foreign", "aid", "gender", "energy", "renewable", "ocean",
+            "sustainable", "health", "care", "food", "security", "a", "b", "x", "ab",
+            "São", "Tomé", "??", "---", "a-b",
+        ];
+        let mut rng = Rng(0x5EED_CAFE_0F_0F_0F);
+        let mut papers: Vec<Paper> = vec![
+            Paper::from_text(""),
+            Paper::from_text("   \n\t  "),
+            Paper::from_text("---\ntitle: \"water health care\"\n---"),
+            Paper::from_text("---\ntitle: \"climate change\"\nabstract: |\n  conditional convergence reduces poverty. \nkeywords: [coral reef]\n---\n"),
+            Paper::from_text("just a body about foreign aid and sustainable development in developing countries"),
+        ];
+        for _ in 0..12 {
+            let mut title = String::new();
+            let mut abs_section = String::new();
+            let mut keywords = String::new();
+            let mut body = String::new();
+            for (buf, n) in [(&mut title, 1usize), (&mut abs_section, 8), (&mut keywords, 3)] {
+                for k in 0..n {
+                    if k > 0 {
+                        buf.push(if rng.below(4) == 0 { ' ' } else { '\n' });
+                    }
+                    buf.push_str(toks[rng.below(toks.len())]);
+                }
+            }
+            for k in 0..25 {
+                if k > 0 {
+                    body.push(if rng.below(4) == 0 { ' ' } else { '\n' });
+                }
+                body.push_str(toks[rng.below(toks.len())]);
+            }
+            let with_body = rng.below(3) == 0;
+            let mut text = format!("---\ntitle: \"{title}\"\nabstract: |\n  {abs_section}\nkeywords: [{keywords}]\n---\n");
+            if with_body {
+                text.push_str(&body);
+            }
+            papers.push(Paper::from_text(&text));
+        }
+
+        let mut masks: Vec<u8> = (1u8..=15).collect();
+        for m in 1u8..=15 {
+            masks.push(m | (1 << (F_ANY & 7)));
+        }
+        masks.push(1 << (F_ANY & 7));
+
+        let mut checked = 0usize;
+        let mut true_hits = 0usize;
+        for (pi, paper) in papers.iter().enumerate() {
+            let mut memo = Memo::new(paper, 0);
+            let mut slot = 0u32;
+            for &mask in &masks {
+                for (j, pat) in pats.iter().enumerate() {
+                    let want = old_compute(pat, mask, paper);
+                    let got = memo.leaf_hit(pat, j as u32, mask, slot);
+                    assert_eq!(
+                        got, want,
+                        "verdict mismatch paper {pi} mask {mask:#04x} pattern {j} ({:?})",
+                        pat.raw()
+                    );
+                    slot += 1;
+                    checked += 1;
+                    true_hits += usize::from(got);
+                }
+            }
+        }
+        assert!(true_hits > 0, "expected at least one hit across {checked} checks");
+        assert!(true_hits < checked, "expected at least one miss across {checked} checks");
+        eprintln!("per_buffer_join_equivalence: {checked} checks, {true_hits} hits");
     }
 
 }

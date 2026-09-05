@@ -2768,7 +2768,7 @@ fn api_keywords(headers: &[(String, String)], body: &[u8]) -> Resp {
     let mut memo = matcher::Memo::new(&paper, 0);
     let mut present: HashSet<&'static str> = HashSet::new();
     for l in get_present()[qi] {
-        if memo.leaf_hit(&table[l.pid as usize], l.mask, l.slot) {
+        if memo.leaf_hit(&table[l.pid as usize], l.pid, l.mask, l.slot) {
             present.insert(table[l.pid as usize].raw());
         }
     }

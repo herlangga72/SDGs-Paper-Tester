@@ -82,7 +82,7 @@ fn present_new(
     let mut memo = matcher::Memo::new(paper, 0);
     let mut out: HashSet<&'static str> = HashSet::new();
     for l in present {
-        if memo.leaf_hit(&table[l.pid as usize], l.mask, l.slot) {
+        if memo.leaf_hit(&table[l.pid as usize], l.pid, l.mask, l.slot) {
             out.insert(table[l.pid as usize].raw());
         }
     }

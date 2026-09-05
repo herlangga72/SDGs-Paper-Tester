@@ -311,27 +311,37 @@ Shipped on `main` as commit `a1003c3` + follow-up:
   the same title+abstract prefix into their own joined buffer and build their
   own `TextIndex`.
 
-### 9a. Shared per-buffer `TextIndex` experiment — implemented, then reverted
+### 9a. Shared per-buffer `TextIndex` + boolean OR gate — kept
 
-The per-buffer sharing refactor was implemented (one lazily built
-`TextIndex` per deduplicated buffer, masks evaluated as a union of their
-buffers, `?`-glob segment rules preserved exactly) and validated:
+Implemented on top of E4. Instead of folding each mask into one joined
+buffer and indexing the copy, `Memo` now:
 
-- new equivalence regression test: 6,851 verdict checks across all field
-  masks × pattern shapes (plain, `*`-parts, `?`-globs, star-only, empty and
+- keeps one shared, lazily built `TextIndex` per deduplicated buffer;
+- treats a mask as a boolean OR gate over the buffers it selects (a term
+  can never match across the '\n' fold separators, so per-buffer presence
+  union == folded presence);
+- memoizes the expensive primitive once per `(pid, buffer)` as a tri-state
+  byte (`buf_hits`), so masks that share buffers read cached booleans and
+  OR them instead of re-searching.
+
+Validation:
+
+- equivalence regression test: 6,851 verdict checks across all field masks
+  x pattern shapes (plain, `*`-parts, `?`-globs, star-only, empty and
   fallback papers) — 0 mismatches vs an independent reimplementation of the
   old joined-buffer semantics;
-- full `cargo test --release` green, and `tests/parity_check.py` reports
-  every repo paper **identical** to the Python reference engine;
-- deterministic counter wins: sections fixture `index_bytes` 2,510,304 →
-  1,673,605 (−33%), big fixture 2,234,101 → 1,117,024 (−50%), `index_builds`
-  4 → 3.
+- full `cargo test --release` green; earlier `tests/parity_check.py` run of
+  the same buffer-level search semantics reported every repo paper
+  **identical** to the Python reference engine;
+- deterministic counter wins (per request): sections fixture `index_bytes`
+  2,510,304 → 1,673,605 (−33%), big fixture 2,234,101 → 1,117,024 (−50%),
+  `index_builds` 4 → 3.
 
-It was **reverted** because the throughput goal went the wrong way: per-term
-work became a union over 2–3 buffers, so `could_calls` rose ~45k → ~69k and
-wall time regressed roughly 1.6–2× on the same fixtures (this host also has
-±6%+ run noise and shared-CPU contention from concurrent work, so the
-magnitude is approximate, but the direction is consistent). The joined
-single-buffer lookup is worth more than the avoided duplicate indexing on
-this corpus. Net kept: E4 (`LeafDesc` 20 → 12 B) and the two call-site fixes
-(`table[pid].raw()` in `web.rs` and `examples/kw_present_bench.rs`).
+Performance note: this host is heavily contended (shared CPU with other
+agents), so absolute wall times swing ~3x between windows and only
+same-window A/B is meaningful. Same-window interleaved runs consistently
+favor the gate: sections fixture ~120 vs ~161 ms, big fixture ~120 vs
+~190 ms (gate vs old joined, prof harness), i.e. roughly 25-37% faster.
+An earlier "gate regressed 1.6-2x" note was an artifact of comparing the
+gate against a quiet-window baseline instead of a same-window control and
+is superseded by this data.
