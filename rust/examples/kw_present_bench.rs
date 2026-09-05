@@ -147,7 +147,8 @@ fn main() {
         let (old, _) = present_old(flats_st[qi], table, &paper);
         for _ in 0..10 {
             let t1 = Instant::now();
-            let s = matcher::score_keywords(&words, d, &old, 300);
+            let o: HashSet<&str, matcher::FastHasher> = old.iter().copied().collect();
+            let s = matcher::score_keywords(&words, d, &o, 300);
             score_ms += t1.elapsed().as_secs_f64() * 1000.0 / 10.0;
             assert!(!s.is_empty() || d.is_empty());
         }

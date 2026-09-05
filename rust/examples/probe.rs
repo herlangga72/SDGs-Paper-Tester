@@ -94,7 +94,8 @@ fn main() {
                 let ma = matcher::min_add_flat(&flats[qi][bi], &table, &mut memo, &mut mscr);
                 let _ = ma;
             }
-            let present_ref: HashSet<&str> = present.iter().map(String::as_str).collect();
+            let present_ref: HashSet<&str, matcher::FastHasher> =
+                present.iter().map(String::as_str).collect();
             n_sug += matcher::suggest_keywords(&words, &dicts[qi], &present_ref, 10).len();
         }
         let td = t3.elapsed().as_secs_f64() * 1000.0;

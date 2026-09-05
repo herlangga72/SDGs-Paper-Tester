@@ -1114,8 +1114,63 @@ struct SdgReport {
 /// Full report: one entry per SDG. The pattern cache is global (precompiled
 /// once at boot), and each block is scanned in a single traversal that also
 /// yields the boolean verdict.
+
+/// Boot-time inverted index: pattern id -> include-block indices, per SDG.
+/// A keyword's "qualifies alone / needs N more" badge is derived ONLY from
+/// non-matching blocks that contain it as an include leaf, so match_report
+/// runs the full (need-group) min-add just for the blocks a suggested
+/// keyword actually appears in - not all ~2960 corpus blocks.
+fn sdg_pid_blocks() -> &'static Vec<HashMap<u32, Vec<u32>, matcher::FastHasher>> {
+    use std::sync::OnceLock;
+    static IX: OnceLock<Vec<HashMap<u32, Vec<u32>, matcher::FastHasher>>> = OnceLock::new();
+    IX.get_or_init(|| {
+        let flats = get_flats();
+        flats
+            .iter()
+            .map(|sdg| {
+                let mut m: HashMap<u32, Vec<u32>, matcher::FastHasher> =
+                    HashMap::with_hasher(matcher::FastHasher::default());
+                for (bno, flat) in sdg.iter().enumerate() {
+                    for l in flat.leaves {
+                        if l.excluded {
+                            continue;
+                        }
+                        // Leaves are walked in ascending block order, so a
+                        // pid's pushes are non-decreasing: the last entry
+                        // suffices to drop same-block duplicates.
+                        let v = m.entry(l.pid).or_default();
+                        if v.last() != Some(&(bno as u32)) {
+                            v.push(bno as u32);
+                        }
+                    }
+                }
+                m
+            })
+            .collect()
+    })
+}
+
+/// Boot-time keyword (pattern raw text) -> pid map, for resolving a suggested
+/// keyword to its inverted index.
+fn kw_pid() -> &'static HashMap<&'static str, u32, matcher::FastHasher> {
+    use std::sync::OnceLock;
+    static IX: OnceLock<HashMap<&'static str, u32, matcher::FastHasher>> = OnceLock::new();
+    IX.get_or_init(|| {
+        let mut m: HashMap<&'static str, u32, matcher::FastHasher> =
+            HashMap::with_hasher(matcher::FastHasher::default());
+        for (i, p) in get_patterns().iter().enumerate() {
+            m.insert(p.raw(), i as u32);
+        }
+        m
+    })
+}
+
 fn match_report(paper: &Paper, top: usize, max_kw: usize) -> Vec<SdgReport> {
     let table = get_patterns();
+    let queries = get_queries();
+    let flats = get_flats();
+    let sdg_pid = sdg_pid_blocks();
+    let kw_pid = kw_pid();
     // One memo per request: keywords repeated across SDG blocks (~4.4x in
     // the corpus) are evaluated once instead of once per occurrence.
     let mut memo = matcher::Memo::new(paper, 0);
@@ -1129,17 +1184,22 @@ fn match_report(paper: &Paper, top: usize, max_kw: usize) -> Vec<SdgReport> {
     let mut misses: Vec<(&'static str, u8)> = Vec::new();
     let mut ex_hits: Vec<&'static str> = Vec::new();
     let mut mscr = matcher::MinAddScratch::default();
-    for (qi, q) in get_queries().iter().enumerate() {
+    for (qi, q) in queries.iter().enumerate() {
         let mut matched = Vec::new();
-        // (block_no, keywords already hit, min keywords to add, need groups,
-        //  already-hit keyword entries)
-        let mut near: Vec<(usize, usize, usize, Vec<Vec<&'static str>>, Vec<(&'static str, u8)>)> = Vec::new();
+        // (block_no, keywords already hit, min keywords to add,
+        //  already-hit keyword entries); need groups are materialized later
+        // ONLY for the blocks that are displayed or hold a suggested keyword.
+        let mut near: Vec<(usize, usize, u32, Vec<(&'static str, u8)>)> = Vec::new();
         let mut ex: Vec<&'static str> = Vec::new();
-        let mut present: HashSet<&'static str> = HashSet::new();
+        let mut present: HashSet<&'static str, matcher::FastHasher> =
+            HashSet::with_hasher(matcher::FastHasher::default());
         // Keywords that qualify the SDG on their own / still need N more.
         let mut solo: HashSet<&'static str> = HashSet::new();
         let mut extra: HashMap<&'static str, usize> = HashMap::new();
-        for (bno, flat) in get_flats()[qi].iter().enumerate() {
+        // Per-block finite min-add cost (INF sentinel = disqualified), used
+        // to select candidate blocks cheaply.
+        let mut costs: Vec<u32> = vec![matcher::INF_COST as u32; flats[qi].len()];
+        for (bno, flat) in flats[qi].iter().enumerate() {
             hits.clear();
             misses.clear();
             ex_hits.clear();
@@ -1154,59 +1214,103 @@ fn match_report(paper: &Paper, top: usize, max_kw: usize) -> Vec<SdgReport> {
             let hits = dedupe_kw(std::mem::take(&mut hits));
             if is_match {
                 matched.push((bno, hits));
-            } else {
-                // Cost-only near-miss analysis (zero allocation): exact
-                // minimum keywords to add. INF_COST means a required-path
-                // NOT is already true - the block is disqualified by an
-                // excluded term, so it is NOT a near miss. The candidate
-                // keyword groups are materialized below only for the blocks
-                // that make the displayed list.
-                let (_, cost) = matcher::min_add_flat_cost(flat, table, &mut memo, &mut mscr);
-                if cost == matcher::INF_COST as u32 {
-                    // Only report excluded terms when the positive side alone
-                    // would have matched - i.e. the NOT genuinely blocked a
-                    // near-qualifying block (off-topic blocks are dropped).
-                    if matcher::eval_ignore_not_block(&get_queries()[qi].blocks[bno], table, &mut memo) {
-                        ex.extend(ex_hits.iter().cloned());
-                    }
-                } else {
-                    // Materialize the missing-tag groups for every finite-cost
-                    // block: they feed both the AND-clause visualization and
-                    // the per-chip "qualifies alone / needs N more" badges.
-                    let ma = matcher::min_add_flat(flat, table, &mut memo, &mut mscr);
-                    let cost_us = cost as usize;
-                    if cost_us == 1 && ma.need.len() == 1 {
-                        solo.extend(ma.need[0].iter().copied());
-                    } else {
-                        let need_more = cost_us.saturating_sub(1);
-                        for g in &ma.need {
-                            for k in g {
-                                let cur = extra.get(k).copied();
-                                if cur.is_none() || need_more < cur.unwrap() {
-                                    extra.insert(*k, need_more);
-                                }
-                            }
-                        }
-                    }
-                    near.push((bno, hits.len(), cost_us, ma.need, hits));
+                continue;
+            }
+            // Cost-only near-miss analysis (zero allocation): exact minimum
+            // keywords to add. INF_COST means a required-path NOT is already
+            // true - the block is disqualified by an excluded term, so it is
+            // NOT a near miss.
+            let (_, cost) = matcher::min_add_flat_cost(flat, table, &mut memo, &mut mscr);
+            if cost == matcher::INF_COST as u32 {
+                // Only report excluded terms when the positive side alone
+                // would have matched - i.e. the NOT genuinely blocked a
+                // near-qualifying block (off-topic blocks are dropped).
+                if matcher::eval_ignore_not_block(&queries[qi].blocks[bno], table, &mut memo) {
+                    ex.extend(ex_hits.iter().cloned());
                 }
+            } else {
+                costs[bno] = cost;
+                near.push((bno, hits.len(), cost, hits));
             }
         }
         // Rerank: fewest keywords to add first; ties go to the block that
         // already hit more keywords.
         near.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| b.1.cmp(&a.1)));
         let near_total = near.len();
-        let near_blocks: Vec<NearBlock> = near
-            .into_iter()
-            .take(top)
-            .map(|(bno, n_hit, cost, need, hits)| NearBlock { bno, n_hit, cost, need, hits })
-            .collect();
-        let mut exu = ex.clone();
-        exu.sort_unstable();
-        exu.dedup();
         // Best-fit keywords to add: rank the SDG's include keywords by
         // word-token overlap with the paper text (pure math, no LLM).
         let suggestions = matcher::suggest_keywords(&words, &get_dicts()[qi], &present, 10);
+        // Resolve the suggested keywords to pids / blob strings once.
+        let mut sug_pids: Vec<u32> = Vec::new();
+        let mut sug_raw: Vec<&'static str> = Vec::new();
+        for s in &suggestions {
+            if let Some(&pid) = kw_pid.get(&*s.keyword) {
+                sug_pids.push(pid);
+                sug_raw.push(table[pid as usize].raw());
+            }
+        }
+        let sug_set: HashSet<&'static str, matcher::FastHasher> =
+            sug_raw.iter().copied().collect();
+        // A full min-add materializes the missing-keyword groups. Its only
+        // per-request consumers are (a) the displayed near-miss boxes and
+        // (b) the "qualifies alone / needs N more" badges, which can only be
+        // fed by blocks that actually contain a suggested keyword. Every
+        // other block needed only its cost, already computed above.
+        let mut add_effects = |ma: &matcher::MinAdd, cost: u32| {
+            let cost_us = cost as usize;
+            if cost_us == 1 && ma.need.len() == 1 {
+                for k in &ma.need[0] {
+                    if sug_set.contains(k) {
+                        solo.insert(*k);
+                    }
+                }
+            } else {
+                let need_more = cost_us.saturating_sub(1);
+                for g in &ma.need {
+                    for k in g {
+                        if sug_set.contains(k) {
+                            let cur = extra.get(k).copied();
+                            if cur.is_none() || need_more < cur.unwrap() {
+                                extra.insert(*k, need_more);
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        let mut computed: HashSet<u32> = HashSet::new();
+        let mut near_blocks: Vec<NearBlock> = Vec::new();
+        for (bno, n_hit, cost, near_hits) in near.into_iter().take(top) {
+            let flat = &flats[qi][bno];
+            let ma = matcher::min_add_flat(flat, table, &mut memo, &mut mscr);
+            add_effects(&ma, cost);
+            computed.insert(bno as u32);
+            near_blocks.push(NearBlock {
+                bno,
+                n_hit,
+                cost: cost as usize,
+                need: ma.need,
+                hits: near_hits,
+            });
+        }
+        // Badge candidates: every block holding a suggested keyword as an
+        // include leaf (the only blocks that can put it in a need group).
+        for pid in sug_pids {
+            if let Some(blocks) = sdg_pid[qi].get(&pid) {
+                for &bno in blocks {
+                    let bno = bno as usize;
+                    if costs[bno] == matcher::INF_COST as u32 || computed.contains(&(bno as u32)) {
+                        continue;
+                    }
+                    let ma = matcher::min_add_flat(&flats[qi][bno], table, &mut memo, &mut mscr);
+                    add_effects(&ma, costs[bno]);
+                    computed.insert(bno as u32);
+                }
+            }
+        }
+        let mut exu = ex.clone();
+        exu.sort_unstable();
+        exu.dedup();
         out.push(SdgReport {
             sdg: q.sdg.clone(),
             matched,
@@ -2766,7 +2870,8 @@ fn api_keywords(headers: &[(String, String)], body: &[u8]) -> Resp {
     // boolean-VM scan, no hits/misses/excluded vector pushes, and excluded
     // (NOT) leaves are never searched, so fewer real SIMD searches run.
     let mut memo = matcher::Memo::new(&paper, 0);
-    let mut present: HashSet<&'static str> = HashSet::new();
+    let mut present: HashSet<&'static str, matcher::FastHasher> =
+        HashSet::with_hasher(matcher::FastHasher::default());
     for l in get_present()[qi] {
         if memo.leaf_hit(&table[l.pid as usize], l.pid, l.mask, l.slot) {
             present.insert(table[l.pid as usize].raw());
@@ -3258,5 +3363,177 @@ mod keyword_parse_tests {
     #[test]
     fn meta_tag_not_found_returns_none() {
         assert_eq!(meta_tag_content("<meta name=\"description\" content=\"x\">", "citation_keywords"), None);
+    }
+}
+
+#[cfg(test)]
+mod match_report_lazy_tests {
+    use super::*;
+
+    // The pre-lazy reference: full need-group min-add on EVERY finite-cost
+    // block (old match_report). Used as the oracle for the deferred version.
+fn match_report_old_reference(paper: &Paper, top: usize, max_kw: usize) -> Vec<SdgReport> {
+    let table = get_patterns();
+    // One memo per request: keywords repeated across SDG blocks (~4.4x in
+    // the corpus) are evaluated once instead of once per occurrence.
+    let mut memo = matcher::Memo::new(paper, 0);
+    let mut out = Vec::new();
+    // Paper word set, built once and reused for every SDG's suggestion
+    // scoring (allocation-free after this point).
+    let paper_text = String::from_utf8_lossy(paper.text_lower(paper::F_ANY));
+    let words = matcher::text_words(&paper_text);
+    // Scratch vectors reused across blocks (clear keeps their capacity).
+    let mut hits: Vec<(&'static str, u8)> = Vec::new();
+    let mut misses: Vec<(&'static str, u8)> = Vec::new();
+    let mut ex_hits: Vec<&'static str> = Vec::new();
+    let mut mscr = matcher::MinAddScratch::default();
+    for (qi, q) in get_queries().iter().enumerate() {
+        let mut matched = Vec::new();
+        // (block_no, keywords already hit, min keywords to add, need groups,
+        //  already-hit keyword entries)
+        let mut near: Vec<(usize, usize, usize, Vec<Vec<&'static str>>, Vec<(&'static str, u8)>)> = Vec::new();
+        let mut ex: Vec<&'static str> = Vec::new();
+        let mut present: HashSet<&'static str, matcher::FastHasher> =
+            HashSet::with_hasher(matcher::FastHasher::default());
+        // Keywords that qualify the SDG on their own / still need N more.
+        let mut solo: HashSet<&'static str> = HashSet::new();
+        let mut extra: HashMap<&'static str, usize> = HashMap::new();
+        for (bno, flat) in get_flats()[qi].iter().enumerate() {
+            hits.clear();
+            misses.clear();
+            ex_hits.clear();
+            let is_match = matcher::scan_flat_into(flat, table, &mut memo, &mut hits, &mut misses, &mut ex_hits);
+            // Every include-leaf hit counts as "present" for the keyword
+            // suggestions (even when its block did not match overall).
+            for (kw, _) in hits.iter() {
+                present.insert(*kw);
+            }
+            // The Scopus query files repeat terms across AND sub-groups, so
+            // dedupe by (keyword identity, field mask) before rendering.
+            let hits = dedupe_kw(std::mem::take(&mut hits));
+            if is_match {
+                matched.push((bno, hits));
+            } else {
+                // Cost-only near-miss analysis (zero allocation): exact
+                // minimum keywords to add. INF_COST means a required-path
+                // NOT is already true - the block is disqualified by an
+                // excluded term, so it is NOT a near miss. The candidate
+                // keyword groups are materialized below only for the blocks
+                // that make the displayed list.
+                let (_, cost) = matcher::min_add_flat_cost(flat, table, &mut memo, &mut mscr);
+                if cost == matcher::INF_COST as u32 {
+                    // Only report excluded terms when the positive side alone
+                    // would have matched - i.e. the NOT genuinely blocked a
+                    // near-qualifying block (off-topic blocks are dropped).
+                    if matcher::eval_ignore_not_block(&get_queries()[qi].blocks[bno], table, &mut memo) {
+                        ex.extend(ex_hits.iter().cloned());
+                    }
+                } else {
+                    // Materialize the missing-tag groups for every finite-cost
+                    // block: they feed both the AND-clause visualization and
+                    // the per-chip "qualifies alone / needs N more" badges.
+                    let ma = matcher::min_add_flat(flat, table, &mut memo, &mut mscr);
+                    let cost_us = cost as usize;
+                    if cost_us == 1 && ma.need.len() == 1 {
+                        solo.extend(ma.need[0].iter().copied());
+                    } else {
+                        let need_more = cost_us.saturating_sub(1);
+                        for g in &ma.need {
+                            for k in g {
+                                let cur = extra.get(k).copied();
+                                if cur.is_none() || need_more < cur.unwrap() {
+                                    extra.insert(*k, need_more);
+                                }
+                            }
+                        }
+                    }
+                    near.push((bno, hits.len(), cost_us, ma.need, hits));
+                }
+            }
+        }
+        // Rerank: fewest keywords to add first; ties go to the block that
+        // already hit more keywords.
+        near.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| b.1.cmp(&a.1)));
+        let near_total = near.len();
+        let near_blocks: Vec<NearBlock> = near
+            .into_iter()
+            .take(top)
+            .map(|(bno, n_hit, cost, need, hits)| NearBlock { bno, n_hit, cost, need, hits })
+            .collect();
+        let mut exu = ex.clone();
+        exu.sort_unstable();
+        exu.dedup();
+        // Best-fit keywords to add: rank the SDG's include keywords by
+        // word-token overlap with the paper text (pure math, no LLM).
+        let suggestions = matcher::suggest_keywords(&words, &get_dicts()[qi], &present, 10);
+        out.push(SdgReport {
+            sdg: q.sdg.clone(),
+            matched,
+            near: near_blocks,
+            near_total,
+            excluded: exu,
+            max_kw,
+            suggestions,
+            solo,
+            extra,
+        });
+    }
+    out
+}
+
+    fn papers() -> Vec<Paper> {
+        let mut out = Vec::new();
+        for name in ["real_health_2021.md", "besley_persson_2014.md", "real_wastewater_2021.md"] {
+            let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(format!("../papers/{name}"));
+            let raw = std::fs::read_to_string(&p).unwrap();
+            out.push(Paper::from_owned(raw));
+        }
+        out
+    }
+
+    fn suggestions_of(r: &SdgReport) -> Vec<&str> {
+        r.suggestions.iter().map(|s| s.keyword.as_ref()).collect()
+    }
+
+    #[test]
+    fn lazy_report_matches_full_reference() {
+        for (ti, paper) in papers().iter().enumerate() {
+            for top in [3usize, 30] {
+                let a = match_report(paper, top, 10);
+                let b = match_report_old_reference(paper, top, 10);
+                assert_eq!(a.len(), b.len(), "sdg count paper {ti} top {top}");
+                for (qi, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+                    assert_eq!(x.sdg, y.sdg, "paper {ti} top {top} q{qi}");
+                    assert_eq!(x.matched, y.matched, "matched paper {ti} top {top} q{qi}");
+                    assert_eq!(x.near_total, y.near_total, "near_total paper {ti} top {top} q{qi}");
+                    assert_eq!(
+                        x.near.iter().map(|n| (n.bno, n.n_hit, n.cost, &n.need, &n.hits)).collect::<Vec<_>>(),
+                        y.near.iter().map(|n| (n.bno, n.n_hit, n.cost, &n.need, &n.hits)).collect::<Vec<_>>(),
+                        "near paper {ti} top {top} q{qi}"
+                    );
+                    assert_eq!(x.excluded, y.excluded, "excluded paper {ti} top {top} q{qi}");
+                    assert_eq!(
+                        x.suggestions.iter().map(|s| (s.keyword.as_ref(), s.score.to_bits(), s.excluded_in_sdg)).collect::<Vec<_>>(),
+                        y.suggestions.iter().map(|s| (s.keyword.as_ref(), s.score.to_bits(), s.excluded_in_sdg)).collect::<Vec<_>>(),
+                        "suggestions paper {ti} top {top} q{qi}"
+                    );
+                    // solo/extra are only consumed for the suggested keywords;
+                    // the deferred path stores nothing else, so compare those.
+                    for kw in suggestions_of(y) {
+                        assert_eq!(
+                            x.solo.contains(kw),
+                            y.solo.contains(kw),
+                            "solo {kw} paper {ti} top {top} q{qi}"
+                        );
+                        assert_eq!(
+                            x.extra.get(kw),
+                            y.extra.get(kw),
+                            "extra {kw} paper {ti} top {top} q{qi}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

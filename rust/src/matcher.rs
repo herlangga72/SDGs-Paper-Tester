@@ -3,7 +3,6 @@
 use crate::ast::Node;
 use crate::paper::{Paper, ALL_FIELDS, F_ANY};
 use crate::simd::find;
-use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
@@ -1906,10 +1905,12 @@ pub struct MinAddScratch {
     kw: Vec<&'static str>,
     /// Group arena: slices into `kw`.
     groups: Vec<GroupSlice>,
-    /// Pointer fingerprints of keywords in the current union.
-    kw_seen: HashSet<u64>,
-    /// Pointer fingerprints of groups already in the current AND need.
-    group_seen: HashMap<u64, u32>,
+    /// Pointer fingerprints of keywords in the current union (fast-hashed:
+    /// a union pass does one insert per keyword and runs per OR group).
+    kw_seen: HashSet<u64, FastHasher>,
+    /// Pointer fingerprints of groups already in the current AND need
+    /// (fast-hashed for the same reason as `kw_seen`).
+    group_seen: HashMap<u64, u32, FastHasher>,
     /// Reusable operand buffer for n-ary group ops (avoids per-op allocs).
     kids: Vec<EvalEntry>,
 }
@@ -1921,8 +1922,8 @@ impl Default for MinAddScratch {
             eval: Vec::with_capacity(64),
             kw: Vec::new(),
             groups: Vec::new(),
-            kw_seen: HashSet::new(),
-            group_seen: HashMap::new(),
+            kw_seen: HashSet::with_hasher(FastHasher::default()),
+            group_seen: HashMap::with_hasher(FastHasher::default()),
             kids: Vec::with_capacity(16),
         }
     }
@@ -2456,7 +2457,10 @@ pub struct SdgDict {
     pub keywords: Vec<(Arc<str>, Vec<(u32, u32)>)>,
     /// Arena holding every token's UTF-8 bytes for this SDG, concatenated.
     pub tokens: Vec<u8>,
-    pub excluded: HashSet<String>,
+    /// Excluded (NOT-side) keywords of this SDG, in a fast-hashed set (the
+    /// per-request scoring loop does one `contains` per keyword; SipHash on
+    /// the raw keyword Strings was ~half the suggestion stage's cost).
+    pub excluded: HashSet<String, FastHasher>,
 }
 
 /// Append `t` to `arena` (deduplicated through `seen`) and return its
@@ -2561,15 +2565,17 @@ pub fn collect_sdg_dict(blocks: &[Node]) -> SdgDict {
             (Arc::from(kw), refs)
         })
         .collect();
-    SdgDict { keywords, tokens, excluded: exc }
+    SdgDict { keywords, tokens, excluded: exc.into_iter().collect() }
 }
 
-/// Paper word index: a set for exact lookups plus a sorted slice for
-/// prefix (wildcard) lookups via binary search. Built ONCE per request and
-/// shared by every SDG's scoring; memory layout matches the access pattern
-/// (dense, sorted, cache-friendly) at the cost of a little extra RAM.
+/// Paper word index: a fast-hashed set for exact lookups plus a sorted
+/// slice for prefix (wildcard) lookups via binary search. Built ONCE per
+/// request and shared by every SDG's scoring. Keys are derived (lowercased)
+/// paper tokens - never adversarial input - so the multiplicative FastHasher
+/// is safe and an order of magnitude cheaper than SipHash (the previous
+/// default), which dominated the ~44k lookups of the suggestion stage.
 pub struct PaperWords<'a> {
-    set: HashSet<&'a str>,
+    set: HashSet<&'a str, FastHasher>,
     sorted: Vec<&'a str>,
 }
 
@@ -2618,7 +2624,7 @@ pub fn text_words(text: &str) -> PaperWords<'_> {
     // byte-for-byte the same. The set grows naturally: preallocating for the
     // token *count* is wrong for repetitive text (300k tokens but ~700
     // unique words -> a multi-MB zeroed table for nothing).
-    let mut set: HashSet<&str> = HashSet::new();
+    let mut set: HashSet<&str, FastHasher> = HashSet::with_hasher(FastHasher::default());
     let mut i = 0usize;
     while i < n {
         if alnum_at(b, i) {
@@ -2666,7 +2672,7 @@ fn token_matches(tok: &str, words: &PaperWords) -> bool {
 pub fn score_keywords(
     words: &PaperWords,
     dict: &SdgDict,
-    present: &HashSet<&str>,
+    present: &HashSet<&str, FastHasher>,
     limit: usize,
 ) -> Vec<ScoredKw> {
     let mut out: Vec<ScoredKw> = Vec::with_capacity(dict.keywords.len().min(limit + 64));
@@ -2727,7 +2733,7 @@ impl Eq for Cand {}
 pub fn suggest_keywords(
     words: &PaperWords,
     dict: &SdgDict,
-    present: &HashSet<&str>,
+    present: &HashSet<&str, FastHasher>,
     limit: usize,
 ) -> Vec<Suggestion> {
     use std::collections::BinaryHeap;
@@ -3087,7 +3093,7 @@ impl SdgDict {
         }
         let tokens = read_bytes(r)?;
         let ne = read_u32(r)? as usize;
-        let mut excluded = HashSet::with_capacity(ne.min(1 << 20));
+        let mut excluded = HashSet::with_capacity_and_hasher(ne.min(1 << 20), FastHasher::default());
         for _ in 0..ne {
             let e = String::from_utf8(read_bytes(r)?)
                 .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "cache: bad exclude"))?;
@@ -3705,19 +3711,19 @@ abstract: |
                     })
                     .collect(),
                 tokens,
-                excluded: HashSet::new(),
+                excluded: HashSet::with_hasher(FastHasher::default()),
             }
         };
         let dict = mk(&["health care access", "educational inequality", "digital government", "zebra farming"]);
         let words = text_words("the school health system improves access to care for students in indonesia");
-        let present: HashSet<&str> = HashSet::new();
+        let present: HashSet<&str, FastHasher> = HashSet::with_hasher(FastHasher::default());
         let sug = suggest_keywords(&words, &dict, &present, 10);
         assert_eq!(sug[0].keyword.as_ref(), "health care access", "best token overlap first");
         assert!(sug[0].score > 0.5);
         assert!(sug.iter().all(|s| s.keyword.as_ref() != "zebra farming"), "no overlap -> skipped");
 
         // Keywords already present in the paper are never suggested.
-        let present2: HashSet<&str> = ["health care access"].into_iter().collect();
+        let present2: HashSet<&str, FastHasher> = ["health care access"].into_iter().collect();
         let sug2 = suggest_keywords(&words, &dict, &present2, 10);
         assert!(sug2.iter().all(|s| s.keyword.as_ref() != "health care access"));
 
@@ -3735,7 +3741,8 @@ abstract: |
             the utilization of the SistaUKS system by 33 junior high school teachers in Boyolali \
             Regency using the System Usability Scale.";
         let words = text_words(abstract_text);
-        let top = suggest_keywords(&words, &dict10, &HashSet::new(), 10);
+        let empty: HashSet<&str, FastHasher> = HashSet::with_hasher(FastHasher::default());
+        let top = suggest_keywords(&words, &dict10, &empty, 10);
         let names: Vec<&str> = top.iter().map(|s| s.keyword.as_ref()).collect();
         assert!(
             names.contains(&"health care access") || names.contains(&"access to health care"),
@@ -3773,8 +3780,7 @@ abstract: |
         ];
         for text in cases {
             let pw = text_words(text);
-            let mut got: Vec<String> = pw.set.iter().map(|s| s.to_string()).collect();
-            got.sort_unstable();
+            let got = pw.sorted.iter().map(|s| s.to_string()).collect::<Vec<_>>();
             assert_eq!(got, reference(text), "set mismatch for {text:?}");
             assert_eq!(
                 pw.sorted.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
@@ -3787,8 +3793,7 @@ abstract: |
             .map(|i| format!("word{i} café 中文{i}!! end."))
             .collect();
         let pw = text_words(&long);
-        let mut got: Vec<String> = pw.set.iter().map(|s| s.to_string()).collect();
-        got.sort_unstable();
+        let got = pw.sorted.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         assert_eq!(got, reference(&long));
     }
 
