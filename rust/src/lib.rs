@@ -5,6 +5,7 @@
 //!   - `sdg_tools` (src/main.rs): CLI for parse / match
 //!   - `web` (src/bin/web.rs): the HTTP server (was web/app.py)
 
+pub mod ac;
 pub mod ast;
 pub mod cpu;
 pub mod cache;

@@ -1477,93 +1477,42 @@ fn hl_term_spans(lower: &[u8], kw: &str) -> Vec<(usize, usize)> {
     spans
 }
 
-/// Spans of every plain term, collected with ONE shared pass over the text.
+/// Spans of every plain term, collected with ONE Aho-Corasick scan.
 ///
 /// The previous highlighter ran a full SIMD scan of the whole buffer per
 /// matched keyword (`hl_term_spans` -> `find_all_boundary`), so a paper with
-/// N matched keywords cost N full-text scans. Here every plain keyword
-/// (>= 4 bytes, no wildcards) contributes its first-4-byte quad to one
-/// `needed` set; a single streaming pass over the lowercased text records
-/// the byte position of every quad in `needed`. Each keyword then verifies
-/// only its own candidate starts (a handful of boundary + prefix checks per
-/// occurrence) instead of re-scanning the buffer. No false negatives: an
-/// occurrence of a keyword always starts at an occurrence of its first quad.
-///
-/// Terms that cannot use the gate (shorter than 4 bytes, wildcard patterns,
-/// or quads so common the position lists would be pathological) fall back to
-/// the per-term scanner, which is exactly the old behavior for them.
+/// N matched keywords cost N full-text scans. Here all plain keywords are
+/// compiled into one Aho-Corasick trie and the text is read exactly once,
+/// reporting every occurrence of every keyword as it goes. Word-boundary
+/// rules are applied per occurrence, matching the old `find_all_boundary`
+/// semantics exactly. Wildcard ('*'/'?') terms keep the old line-local glob
+/// scanner - their spans are not simple substring matches.
 fn hl_spans_multi(lower: &[u8], terms: &[impl AsRef<str>]) -> Vec<(usize, usize)> {
-    // A quad list longer than this is pathological (e.g. "aaaa..." text) and
-    // verifying it position-by-position costs more than one SIMD scan.
-    const POS_CAP: usize = 1 << 16;
     let mut spans: Vec<(usize, usize)> = Vec::new();
-    let mut ge4: Vec<Vec<u8>> = Vec::new(); // lowercased plain terms, len >= 4
+    let mut plain: Vec<Vec<u8>> = Vec::new(); // lowercased, no wildcards
     let mut rest: Vec<&str> = Vec::new();
     for t in terms {
         let lk = t.as_ref().to_ascii_lowercase();
-        if !lk.contains('*') && !lk.contains('?') && lk.len() >= 4 {
-            ge4.push(lk.into_bytes());
+        if !lk.contains('*') && !lk.contains('?') {
+            if !lk.is_empty() {
+                plain.push(lk.into_bytes());
+            }
         } else {
             rest.push(t.as_ref());
         }
     }
-    if !ge4.is_empty() {
-        let mut needed: HashSet<u32, matcher::FastHasher> =
-            HashSet::with_hasher(matcher::FastHasher::default());
-        for b in &ge4 {
-            needed.insert(u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
-        }
-        // ONE pass: record positions only for quads that start a keyword.
-        let mut pos: HashMap<u32, Vec<u32>, matcher::FastHasher> =
-            HashMap::with_hasher(matcher::FastHasher::default());
-        let mut dense: HashSet<u32, matcher::FastHasher> =
-            HashSet::with_hasher(matcher::FastHasher::default());
-        if lower.len() >= 4 {
-            let last = lower.len() - 3;
-            let mut i = 0usize;
-            while i < last {
-                let q = u32::from_le_bytes([lower[i], lower[i + 1], lower[i + 2], lower[i + 3]]);
-                if needed.contains(&q) {
-                    if dense.contains(&q) {
-                        continue;
-                    }
-                    let v = pos.entry(q).or_default();
-                    if v.len() < POS_CAP {
-                        v.push(i as u32);
-                    } else {
-                        // Stop recording this quad; the keyword falls back.
-                        dense.insert(q);
-                        v.clear();
-                    }
-                }
-                i += 1;
+    if !plain.is_empty() {
+        let ac = sdg_tools::ac::Aho::new(&plain);
+        ac.scan(lower, |_, s, e| {
+            let before = s == 0 || !is_word(lower[s - 1]);
+            if !before {
+                return;
             }
-        }
-        for b in &ge4 {
-            let q = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
-            if dense.contains(&q) {
-                // Too many candidates: one SIMD scan is cheaper (old path).
-                spans.extend(hl_term_spans(lower, std::str::from_utf8(b).unwrap()));
-                continue;
+            let after = e == lower.len() || !is_word(lower[e]);
+            if after {
+                spans.push((s, e));
             }
-            let Some(ps) = pos.get(&q) else { continue };
-            let n = b.len();
-            for &p in ps {
-                let p = p as usize;
-                let before = p == 0 || !is_word(lower[p - 1]);
-                if !before {
-                    continue;
-                }
-                let e = p + n;
-                if e > lower.len() {
-                    continue;
-                }
-                let after = e == lower.len() || !is_word(lower[e]);
-                if after && &lower[p..e] == b.as_slice() {
-                    spans.push((p, e));
-                }
-            }
-        }
+        });
     }
     for t in rest {
         spans.extend(hl_term_spans(lower, t));
@@ -3774,24 +3723,53 @@ mod highlight_multi_tests {
     #[ignore = "benchmark; run with --ignored --nocapture"]
     fn bench_multi_vs_old() {
         use std::time::Instant;
-        // ~120 KB of prose with the matched keywords sprinkled throughout.
-        let sent = "The coral reef and developing countries both need climate change \
-                    adaptation and foreign aid for sustainable health care and water access. ";
+        // ~400 KB of prose with many distinct matched keywords throughout
+        // (the realistic large-upload shape that used to cost one full-text
+        // SIMD scan per keyword).
+        let words = [
+            "coral", "reef", "developing", "countries", "climate", "change",
+            "adaptation", "foreign", "aid", "sustainable", "health", "care",
+            "water", "access", "poverty", "reduction", "gender", "inequality",
+            "education", "energy", "renewable", "ocean", "acidification", "growth",
+            "income", "rights", "tax", "evasion", "food", "security", "governance",
+            "institution", "urban", "waste", "plastic", "biodiversity", "forest",
+            "agriculture", "nutrition", "maternal", "child", "mortality", "malaria",
+            "tuberculosis", "sanitation", "hygiene", "electricity", "greenhouse",
+            "emissions", "resilience", "disaster", "consumption", "production",
+            "ecosystem", "degradation", "justice", "legal", "citizenship", "migration",
+            "remittance", "peace", "conflict", "partnership", "finance", "technology",
+            "vaccine", "immunization", "diarrhea", "wastewater", "treatment",
+            "irrigation", "drought", "flood", "cyclone", "debt", "relief", "tariff",
+            "market", "microfinance", "savings", "insurance", "pension", "transport",
+            "road", "safety", "telehealth", "solar", "offshore", "wave", "tidal",
+        ];
         let mut text = String::new();
-        while text.len() < 120 << 10 {
-            text.push_str(sent);
+        let mut rng = 0xABCD_EF01_2345_6789u64;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        while text.len() < 400 << 10 {
+            text.push_str(words[(next() % words.len() as u64) as usize]);
+            text.push(' ');
+            if next() % 12 == 0 {
+                text.push('\n');
+            }
         }
         let lower = text.to_ascii_lowercase();
-        let terms: Vec<&str> = vec![
-            "coral reef", "developing countries", "climate change", "adaptation",
-            "foreign aid", "sustainable", "health care", "water access", "reef",
-            "countries", "change", "aid", "health", "water", "coral", "sustainab*",
-        ];
+        let mut terms: Vec<&str> = words.to_vec();
+        terms.extend([
+            "developing countries", "climate change", "health care", "water access",
+            "poverty reduction", "renewable energy", "food security", "wastewater treatment",
+            "road safety", "coral reef", "sustainab*", "developing* countr*",
+        ]);
         for _ in 0..5 {
             std::hint::black_box(highlight_old(lower.as_bytes(), &text, &terms));
             std::hint::black_box(highlight(lower.as_bytes(), &text, &terms));
         }
-        let iters = 20u32;
+        let iters = 10u32;
         let t0 = Instant::now();
         for _ in 0..iters {
             std::hint::black_box(highlight_old(lower.as_bytes(), &text, &terms));
@@ -3803,7 +3781,7 @@ mod highlight_multi_tests {
         }
         let new = t0.elapsed().as_secs_f64() / iters as f64 * 1e3;
         println!(
-            "highlight {} bytes, {} terms: old {old:.3} ms  multi {new:.3} ms  ({:.1}x)",
+            "highlight {} bytes, {} terms: old {old:.3} ms  ac {new:.3} ms  ({:.1}x)",
             text.len(),
             terms.len(),
             old / new.max(1e-9)
