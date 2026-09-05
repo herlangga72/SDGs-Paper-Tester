@@ -2769,7 +2769,7 @@ fn api_keywords(headers: &[(String, String)], body: &[u8]) -> Resp {
     let mut present: HashSet<&'static str> = HashSet::new();
     for l in get_present()[qi] {
         if memo.leaf_hit(&table[l.pid as usize], l.mask, l.slot) {
-            present.insert(l.raw());
+            present.insert(table[l.pid as usize].raw());
         }
     }
     let paper_text = String::from_utf8_lossy(paper.text_lower(paper::F_ANY));

@@ -309,7 +309,29 @@ Shipped on `main` as commit `a1003c3` + follow-up:
   sections paper indexes 2.51 MB per request. Masks `TITLE-ABS` (0x03),
   `TITLE-ABS-KEY` (0x07) and the full-text/ANY selection each copy ~850 KB of
   the same title+abstract prefix into their own joined buffer and build their
-  own `TextIndex`. The follow-up worth doing (needs a quieter measurement host
-  or `perf`): share one `TextIndex` per unique underlying buffer and evaluate
-  a mask as a union of its buffers, which would cut `index_bytes` ~65%. This
-  is a Memo/`JoinedEntry` refactor, not a Box change.
+  own `TextIndex`.
+
+### 9a. Shared per-buffer `TextIndex` experiment — implemented, then reverted
+
+The per-buffer sharing refactor was implemented (one lazily built
+`TextIndex` per deduplicated buffer, masks evaluated as a union of their
+buffers, `?`-glob segment rules preserved exactly) and validated:
+
+- new equivalence regression test: 6,851 verdict checks across all field
+  masks × pattern shapes (plain, `*`-parts, `?`-globs, star-only, empty and
+  fallback papers) — 0 mismatches vs an independent reimplementation of the
+  old joined-buffer semantics;
+- full `cargo test --release` green, and `tests/parity_check.py` reports
+  every repo paper **identical** to the Python reference engine;
+- deterministic counter wins: sections fixture `index_bytes` 2,510,304 →
+  1,673,605 (−33%), big fixture 2,234,101 → 1,117,024 (−50%), `index_builds`
+  4 → 3.
+
+It was **reverted** because the throughput goal went the wrong way: per-term
+work became a union over 2–3 buffers, so `could_calls` rose ~45k → ~69k and
+wall time regressed roughly 1.6–2× on the same fixtures (this host also has
+±6%+ run noise and shared-CPU contention from concurrent work, so the
+magnitude is approximate, but the direction is consistent). The joined
+single-buffer lookup is worth more than the avoided duplicate indexing on
+this corpus. Net kept: E4 (`LeafDesc` 20 → 12 B) and the two call-site fixes
+(`table[pid].raw()` in `web.rs` and `examples/kw_present_bench.rs`).

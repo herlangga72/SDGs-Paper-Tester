@@ -83,7 +83,7 @@ fn present_new(
     let mut out: HashSet<&'static str> = HashSet::new();
     for l in present {
         if memo.leaf_hit(&table[l.pid as usize], l.mask, l.slot) {
-            out.insert(l.raw());
+            out.insert(table[l.pid as usize].raw());
         }
     }
     (out, t0.elapsed().as_nanos() as u64)
