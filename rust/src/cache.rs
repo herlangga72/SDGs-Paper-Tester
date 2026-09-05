@@ -5,7 +5,7 @@
 //!   u32 blob_len | blob bytes (padded to 4)          <- the string blob
 //!   u32 n_patterns | Pattern records (28 B each)     <- viewed as &[Pattern]
 //!   u32 n_sdg | per SDG: u32 n_blocks | per block:
-//!       u32 n_prog | Op records (8 B) | u32 n_leaf | LeafDesc records (20 B)
+//!       u32 n_prog | Op records (8 B) | u32 n_leaf | LeafDesc records (12 B)
 //!   dicts: u32 n_dicts | SdgDict::serialize records (owned rebuild)
 //!   queries: u32 n_queries | per query: u32 sdg_len + sdg, u32 n_blocks, nodes
 
@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 const MAGIC: &[u8; 4] = b"SDGC";
-const VERSION: u32 = 3;
+const VERSION: u32 = 4;
 
 pub struct CacheData {
     /// Parsed + resolved query ASTs (pid/mask/slot already stamped).
@@ -268,9 +268,12 @@ pub fn read_cached(dir: &Path) -> Option<CacheData> {
             r.set_position((prog_start + np2 * 8) as u64);
             let nl = read_u32(&mut r)? as usize;
             let leaf_start = r.position() as usize;
+            // LeafDesc records: pid u32, slot u32, mask u8, excluded u8,
+            // 2 pad bytes = 12 B. Alignment is 4 (u32 fields) and the
+            // section starts 4-aligned, so the slice view is valid.
             let leaves: &'static [LeafDesc] =
                 unsafe { std::slice::from_raw_parts(base.as_ptr().add(leaf_start) as *const LeafDesc, nl) };
-            r.set_position((leaf_start + nl * 20) as u64);
+            r.set_position((leaf_start + nl * 12) as u64);
             group.push(FlatBlock { prog, leaves });
         }
         flats.push(group);

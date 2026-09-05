@@ -272,9 +272,10 @@ the mmap cache format without a version bump.
 ## 8. Risks
 
 - **Cache format coupling**: `Pattern`/`Op`/`LeafDesc` are laid out by hand in
-  `cache.rs` with hard-coded record sizes (28/8/20). Any E4 change must bump
-  `VERSION` (currently 3) and delete/reject stale `sdg_cache.bin` files,
-  which the mtime validation already handles for source changes.
+  `cache.rs` with hard-coded record sizes (28/8/12 after E4; was 20 for
+  `LeafDesc`). Any layout change must bump `VERSION` (currently 4) and
+  delete/reject stale `sdg_cache.bin` files, which the mtime validation
+  already handles for source changes.
 - **E1 allocations**: `String::into_boxed_str()` can reallocate when
   capacity > len; parser boot time may rise a little. Measure `parse`/cache
   write time before accepting.
@@ -282,3 +283,33 @@ the mmap cache format without a version bump.
   `/match` faster on large papers", E4/E5 are the levers, not Box. E1–E3 will
   likely show ≤ 1% on `hotbench`, and this plan is designed to prove that
   with data instead of asserting it.
+
+---
+
+## 9. Outcome (2026-09-05)
+
+Shipped on `main` as commit `a1003c3` + follow-up:
+
+- **E4 shipped** (`LeafDesc` 20 → 12 B, cache `VERSION` 4). Report strings are
+  now read from `table[pid].raw()` (the `Pattern` is already in cache from the
+  `term_hit` load) instead of a second `(raw_off, raw_len)` copy in every leaf
+  record. All 47 tests pass; CLI cache write + mmap read round trip is
+  byte-identical.
+- **E5-borrow-full implemented, then reverted.** Prof counters proved it never
+  fires on this corpus: every leaf is field-wrapped (`TITLE`, `TITLE-ABS`,
+  `TITLE-ABS-KEY`, `AUTHKEY`, one `SUBJAREA`), so no leaf evaluates under the
+  default `0x0F` mask and the fold-to-full-text dedupe is dead code.
+- **A/B measurement reality**: this Zen+ host varies ±6% between identical
+  runs (thermal/frequency), so sub-5% changes are not resolvable with
+  `hotbench` medians. Interleaved E4-vs-baseline rounds landed within that
+  noise (round deltas −1.9, −1.3, +3.3 ms). E4 is kept for its deterministic
+  effect (smaller cache file, fewer bytes read per leaf) not for a claimed
+  wall-clock win.
+- **The remaining, real duplication** (from prof, deterministic): a 855 KB
+  sections paper indexes 2.51 MB per request. Masks `TITLE-ABS` (0x03),
+  `TITLE-ABS-KEY` (0x07) and the full-text/ANY selection each copy ~850 KB of
+  the same title+abstract prefix into their own joined buffer and build their
+  own `TextIndex`. The follow-up worth doing (needs a quieter measurement host
+  or `perf`): share one `TextIndex` per unique underlying buffer and evaluate
+  a mask as a union of its buffers, which would cut `index_bytes` ~65%. This
+  is a Memo/`JoinedEntry` refactor, not a Box change.

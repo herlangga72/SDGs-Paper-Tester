@@ -139,12 +139,6 @@ impl Pattern {
     pub fn no_wildcard(&self) -> bool {
         self.no_wildcard
     }
-
-    /// Blob offsets of the keyword text (for LeafDesc records).
-    #[inline]
-    pub fn raw_off_len(&self) -> (u32, u32) {
-        (self.raw_off, self.raw_len)
-    }
 }
 
 /// Per-text presence index: every 4-byte window (quad), every 2-byte window
@@ -1377,27 +1371,20 @@ impl Op {
     }
 }
 
-/// One keyword occurrence inside a flattened block.
+/// One keyword occurrence inside a flattened block. `pid`/`slot`/`mask`/
+/// `excluded` drive evaluation and reporting; the keyword text is fetched
+/// from the process string blob via `table[pid].raw()`. Every `OP_PUSH`
+/// already loads `table[pid]` for `term_hit`, so carrying a second
+/// (raw_off, raw_len) copy here was 8 redundant bytes per leaf: dropping it
+/// shrinks the record 20 -> 12 B and cuts per-leaf memory traffic in the
+/// scan loop (93k pushes/request). Fixed-size for direct mmap viewing.
 #[derive(Clone, Debug)]
-/// One keyword occurrence inside a flattened block. `raw_off`/`raw_len`
-/// index the process string blob, so a cached (mmap'd) block needs no
-/// keyword copies. Fixed-size for direct mmap viewing.
 #[repr(C)]
 pub struct LeafDesc {
     pub pid: u32,
     pub slot: u32,
     pub mask: u8,
     pub excluded: bool,
-    pub raw_off: u32,
-    pub raw_len: u32,
-}
-
-impl LeafDesc {
-    #[inline]
-    pub fn raw(&self) -> &'static str {
-        let b = blob();
-        unsafe { std::str::from_utf8_unchecked(&b[self.raw_off as usize..(self.raw_off + self.raw_len) as usize]) }
-    }
 }
 
 /// A block compiled to a postfix program + flat leaf list. Built once at
@@ -1413,8 +1400,8 @@ pub struct FlatBlock {
 /// Flatten one block (call AFTER `resolve_blocks`). Leaf order and exclusion
 /// parity match the AST traversal exactly, so `scan_flat` produces the same
 /// hits/misses/excluded lists (including duplicates) as the tree walk.
-pub fn flatten_block(block: &Node, table: &[Pattern]) -> FlatBlock {
-    fn emit(node: &Node, excluded: bool, table: &[Pattern], prog: &mut Vec<Op>, leaves: &mut Vec<LeafDesc>) {
+pub fn flatten_block(block: &Node, _table: &[Pattern]) -> FlatBlock {
+    fn emit(node: &Node, excluded: bool, prog: &mut Vec<Op>, leaves: &mut Vec<LeafDesc>) {
         match node {
             Node::Leaf { pid, mask, slot, .. } => {
                 let i = leaves.len() as u32;
@@ -1423,14 +1410,12 @@ pub fn flatten_block(block: &Node, table: &[Pattern]) -> FlatBlock {
                     slot: *slot,
                     mask: *mask,
                     excluded,
-                    raw_off: table[*pid as usize].raw_off_len().0,
-                    raw_len: table[*pid as usize].raw_off_len().1,
                 });
                 prog.push(Op::push(i));
             }
-            Node::Field { child, .. } => emit(child, excluded, table, prog, leaves),
+            Node::Field { child, .. } => emit(child, excluded, prog, leaves),
             Node::Not { child } => {
-                emit(child, !excluded, table, prog, leaves);
+                emit(child, !excluded, prog, leaves);
                 prog.push(Op { tag: OP_NOT, payload: 0 });
             }
             Node::Group { op, children } => {
@@ -1439,11 +1424,11 @@ pub fn flatten_block(block: &Node, table: &[Pattern]) -> FlatBlock {
                 // the min-add union/concat is O(total keywords) per group.
                 match children.len() {
                     0 => prog.push(if op == "OR" { Op { tag: OP_FALSE, payload: 0 } } else { Op { tag: OP_TRUE, payload: 0 } }),
-                    1 => emit(&children[0], excluded, table, prog, leaves),
+                    1 => emit(&children[0], excluded, prog, leaves),
                     _ => {
                         let n = children.len() as u32;
                         for c in children {
-                            emit(c, excluded, table, prog, leaves);
+                            emit(c, excluded, prog, leaves);
                         }
                         prog.push(if op == "OR" { Op::or_n(n) } else { Op::and_n(n) });
                     }
@@ -1453,7 +1438,7 @@ pub fn flatten_block(block: &Node, table: &[Pattern]) -> FlatBlock {
     }
     let mut prog: Vec<Op> = Vec::new();
     let mut leaves: Vec<LeafDesc> = Vec::new();
-    emit(block, false, table, &mut prog, &mut leaves);
+    emit(block, false, &mut prog, &mut leaves);
     // 'static slices: leaked once at boot (or zero-copy views of the mmap'd
     // boot cache) - the user-facing trade is RAM for startup speed.
     FlatBlock {
@@ -1572,7 +1557,10 @@ pub fn scan_flat_into<'a, 'b>(
         match op.tag {
             OP_PUSH => {
                 let l = &flat.leaves[op.payload as usize];
-                let v = memo.term_hit(&table[l.pid as usize], l.mask, l.slot as usize);
+                // Pattern is loaded once for the search and reused for the
+                // report string: LeafDesc no longer carries raw blob offsets.
+                let pat = &table[l.pid as usize];
+                let v = memo.term_hit(pat, l.mask, l.slot as usize);
                 if report {
                     #[cfg(feature = "prof")]
                     {
@@ -1581,12 +1569,12 @@ pub fn scan_flat_into<'a, 'b>(
                     }
                     if l.excluded {
                         if v {
-                            ex_hits.push(l.raw());
+                            ex_hits.push(pat.raw());
                         }
                     } else if v {
-                        hits.push((l.raw(), l.mask));
+                        hits.push((pat.raw(), l.mask));
                     } else {
-                        misses.push((l.raw(), l.mask));
+                        misses.push((pat.raw(), l.mask));
                     }
                 }
                 stack.push(v);
@@ -2065,7 +2053,7 @@ pub fn min_add_flat(
                     scr.eval.push(EvalEntry { value: true, cost: 0, ..Default::default() });
                 } else {
                     let k = scr.kw.len() as u32;
-                    scr.kw.push(l.raw());
+                    scr.kw.push(table[l.pid as usize].raw());
                     let g = scr.groups.len() as u32;
                     scr.groups.push(GroupSlice { start: k, len: 1 });
                     scr.eval.push(EvalEntry { value: false, cost: 1, g_start: g, g_len: 1, k_start: k, k_len: 1 });
@@ -2982,7 +2970,7 @@ impl Op {
 }
 
 impl FlatBlock {
-    /// Fixed-record write: op records (8 bytes) + leaf records (20 bytes).
+    /// Fixed-record write: op records (8 bytes) + leaf records (12 bytes).
     pub fn serialize<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
         write_u32(w, self.prog.len() as u32)?;
         for op in self.prog {
@@ -2992,9 +2980,7 @@ impl FlatBlock {
         for l in self.leaves {
             write_u32(w, l.pid)?;
             write_u32(w, l.slot)?;
-            w.write_all(&[l.mask, l.excluded as u8, 0, 0])?; // 20-byte records
-            write_u32(w, l.raw_off)?;
-            write_u32(w, l.raw_len)?;
+            w.write_all(&[l.mask, l.excluded as u8, 0, 0])?; // 12-byte records
         }
         Ok(())
     }
@@ -3010,11 +2996,9 @@ impl FlatBlock {
         for _ in 0..nl {
             let pid = read_u32(r)?;
             let slot = read_u32(r)?;
-            let mut m = [0u8; 2];
+            let mut m = [0u8; 4]; // mask, excluded, 2 pad bytes (12-byte records)
             r.read_exact(&mut m)?;
-            let raw_off = read_u32(r)?;
-            let raw_len = read_u32(r)?;
-            leaves.push(LeafDesc { pid, slot, mask: m[0], excluded: m[1] != 0, raw_off, raw_len });
+            leaves.push(LeafDesc { pid, slot, mask: m[0], excluded: m[1] != 0 });
         }
         Ok(FlatBlock {
             prog: Box::leak(prog.into_boxed_slice()),
