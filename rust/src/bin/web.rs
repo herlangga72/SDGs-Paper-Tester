@@ -1477,11 +1477,102 @@ fn hl_term_spans(lower: &[u8], kw: &str) -> Vec<(usize, usize)> {
     spans
 }
 
-fn highlight(lower: &[u8], orig: &str, terms: &[impl AsRef<str>]) -> String {
+/// Spans of every plain term, collected with ONE shared pass over the text.
+///
+/// The previous highlighter ran a full SIMD scan of the whole buffer per
+/// matched keyword (`hl_term_spans` -> `find_all_boundary`), so a paper with
+/// N matched keywords cost N full-text scans. Here every plain keyword
+/// (>= 4 bytes, no wildcards) contributes its first-4-byte quad to one
+/// `needed` set; a single streaming pass over the lowercased text records
+/// the byte position of every quad in `needed`. Each keyword then verifies
+/// only its own candidate starts (a handful of boundary + prefix checks per
+/// occurrence) instead of re-scanning the buffer. No false negatives: an
+/// occurrence of a keyword always starts at an occurrence of its first quad.
+///
+/// Terms that cannot use the gate (shorter than 4 bytes, wildcard patterns,
+/// or quads so common the position lists would be pathological) fall back to
+/// the per-term scanner, which is exactly the old behavior for them.
+fn hl_spans_multi(lower: &[u8], terms: &[impl AsRef<str>]) -> Vec<(usize, usize)> {
+    // A quad list longer than this is pathological (e.g. "aaaa..." text) and
+    // verifying it position-by-position costs more than one SIMD scan.
+    const POS_CAP: usize = 1 << 16;
     let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut ge4: Vec<Vec<u8>> = Vec::new(); // lowercased plain terms, len >= 4
+    let mut rest: Vec<&str> = Vec::new();
     for t in terms {
-        spans.extend(hl_term_spans(lower, t.as_ref()));
+        let lk = t.as_ref().to_ascii_lowercase();
+        if !lk.contains('*') && !lk.contains('?') && lk.len() >= 4 {
+            ge4.push(lk.into_bytes());
+        } else {
+            rest.push(t.as_ref());
+        }
     }
+    if !ge4.is_empty() {
+        let mut needed: HashSet<u32, matcher::FastHasher> =
+            HashSet::with_hasher(matcher::FastHasher::default());
+        for b in &ge4 {
+            needed.insert(u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+        }
+        // ONE pass: record positions only for quads that start a keyword.
+        let mut pos: HashMap<u32, Vec<u32>, matcher::FastHasher> =
+            HashMap::with_hasher(matcher::FastHasher::default());
+        let mut dense: HashSet<u32, matcher::FastHasher> =
+            HashSet::with_hasher(matcher::FastHasher::default());
+        if lower.len() >= 4 {
+            let last = lower.len() - 3;
+            let mut i = 0usize;
+            while i < last {
+                let q = u32::from_le_bytes([lower[i], lower[i + 1], lower[i + 2], lower[i + 3]]);
+                if needed.contains(&q) {
+                    if dense.contains(&q) {
+                        continue;
+                    }
+                    let v = pos.entry(q).or_default();
+                    if v.len() < POS_CAP {
+                        v.push(i as u32);
+                    } else {
+                        // Stop recording this quad; the keyword falls back.
+                        dense.insert(q);
+                        v.clear();
+                    }
+                }
+                i += 1;
+            }
+        }
+        for b in &ge4 {
+            let q = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+            if dense.contains(&q) {
+                // Too many candidates: one SIMD scan is cheaper (old path).
+                spans.extend(hl_term_spans(lower, std::str::from_utf8(b).unwrap()));
+                continue;
+            }
+            let Some(ps) = pos.get(&q) else { continue };
+            let n = b.len();
+            for &p in ps {
+                let p = p as usize;
+                let before = p == 0 || !is_word(lower[p - 1]);
+                if !before {
+                    continue;
+                }
+                let e = p + n;
+                if e > lower.len() {
+                    continue;
+                }
+                let after = e == lower.len() || !is_word(lower[e]);
+                if after && &lower[p..e] == b.as_slice() {
+                    spans.push((p, e));
+                }
+            }
+        }
+    }
+    for t in rest {
+        spans.extend(hl_term_spans(lower, t));
+    }
+    spans
+}
+
+fn highlight(lower: &[u8], orig: &str, terms: &[impl AsRef<str>]) -> String {
+    let mut spans = hl_spans_multi(lower, terms);
     if spans.is_empty() {
         return esc(orig);
     }
@@ -3535,5 +3626,187 @@ fn match_report_old_reference(paper: &Paper, top: usize, max_kw: usize) -> Vec<S
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod highlight_multi_tests {
+    use super::*;
+
+    // Old behavior: collect spans per term (one full scan each), then the
+    // same sort/merge/escape pipeline as highlight(). Used as the oracle for
+    // the shared one-pass version.
+    fn highlight_old(lower: &[u8], orig: &str, terms: &[impl AsRef<str>]) -> String {
+        let mut spans: Vec<(usize, usize)> = Vec::new();
+        for t in terms {
+            spans.extend(hl_term_spans(lower, t.as_ref()));
+        }
+        if spans.is_empty() {
+            return esc(orig);
+        }
+        spans.sort_unstable();
+        let mut merged: Vec<(usize, usize)> = Vec::new();
+        for (s, e) in spans {
+            if let Some(last) = merged.last_mut() {
+                if s <= last.1 {
+                    last.1 = last.1.max(e);
+                    continue;
+                }
+            }
+            merged.push((s, e));
+        }
+        let len = orig.len();
+        let worst = merged.iter().map(|(s, e)| e - s).max().unwrap_or(0);
+        if worst as f64 > len as f64 * 0.8 {
+            return esc(orig);
+        }
+        let mut out = String::new();
+        let mut pos = 0usize;
+        for (s, e) in merged {
+            out.push_str(&esc(&orig[pos..s]));
+            out.push_str("<mark>");
+            out.push_str(&esc(&orig[s..e]));
+            out.push_str("</mark>");
+            pos = e;
+        }
+        out.push_str(&esc(&orig[pos..]));
+        out
+    }
+
+    #[test]
+    fn multi_matches_old() {
+        // Plain terms, shared prefixes, overlapping keywords, wildcards, the
+        // degenerate catch-all, unicode, and edge-anchored occurrences.
+        let cases: Vec<(&str, Vec<&str>)> = vec![
+            (
+                "The coral reef and a coral reef system. Coral! Reef fish and coralreefs.",
+                vec!["coral reef", "reef", "Coral", "reefs", "fish"],
+            ),
+            (
+                "water water water and WATER and watership and waters.",
+                vec!["water", "water", "watership", "a"],
+            ),
+            (
+                "developing countries need developing country policies.",
+                vec!["developing* countr*", "developing", "countries"],
+            ),
+            (
+                "aaa aaa aa aaaa aaa",
+                vec!["aa", "aaa", "aaaa"],
+            ),
+            (
+                "xforeign aid foreign aid foreign-aid  foreign aid.",
+                vec!["foreign aid", "aid", "x"],
+            ),
+            (
+                "São Tomé and Curaçao report small-scale and smallscale farming.",
+                vec!["small*sc*", "Tomé", "scale"],
+            ),
+            (
+                "one two three four five six seven eight nine ten ",
+                vec!["*"],
+            ),
+            (
+                "prefix overlaps: ab abcd abcde zz",
+                vec!["ab", "abc", "abcd", "abcd", "bcde"],
+            ),
+            (
+                "the quick brown fox jumps over the lazy dog",
+                vec!["absent", "lazy dog", "lazy"],
+            ),
+            (
+                "singlewordonly",
+                vec!["singlewordonly", "word", "single"],
+            ),
+            ("", vec!["anything", "a"]),
+            ("     ", vec!["a"]),
+        ];
+        for (text, terms) in cases {
+            let lower = text.to_ascii_lowercase();
+            let a = highlight(lower.as_bytes(), &text, &terms);
+            let b = highlight_old(lower.as_bytes(), &text, &terms);
+            assert_eq!(a, b, "highlight mismatch for {text:?} terms {terms:?}");
+        }
+
+        // Randomized: seeded tokens including term-interacting fragments.
+        let toks = [
+            "the", "coral", "reef", "developing", "countries", "foreign", "aid", "water",
+            "small", "scale", "smallscale", "a", "ab", "abc", "x", "y", "---", "São",
+            "Tomé", "climate", "change", "adaptation", "sustainability", "tax", "evasion",
+            "health", "care", "access", "aa", "aaa",
+        ];
+        let terms_pool = [
+            "coral reef", "developing countr*", "small?sc*", "foreign aid", "water",
+            "health care", "aa", "aaa", "climate change", "a", "ab", "abc", "Tomé",
+            "tax evasion", "adaptation",
+        ];
+        let mut rng = 0x1234_5678_9abc_def0u64;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        for trial in 0..60 {
+            let mut text = String::new();
+            for _ in 0..(40 + (next() % 160)) {
+                if text.len() > 0 && next() % 7 == 0 {
+                    text.push(if next() % 2 == 0 { '\n' } else { ' ' });
+                }
+                text.push_str(toks[(next() % toks.len() as u64) as usize]);
+                if next() % 3 == 0 {
+                    text.push(' ');
+                }
+            }
+            let mut terms: Vec<&str> = Vec::new();
+            let n_terms = 1 + (next() % 8) as usize;
+            for _ in 0..n_terms {
+                terms.push(terms_pool[(next() % terms_pool.len() as u64) as usize]);
+            }
+            let lower = text.to_ascii_lowercase();
+            let a = highlight(lower.as_bytes(), &text, &terms);
+            let b = highlight_old(lower.as_bytes(), &text, &terms);
+            assert_eq!(a, b, "trial {trial}: text {text:?} terms {terms:?}");
+        }
+    }
+
+    #[test]
+    #[ignore = "benchmark; run with --ignored --nocapture"]
+    fn bench_multi_vs_old() {
+        use std::time::Instant;
+        // ~120 KB of prose with the matched keywords sprinkled throughout.
+        let sent = "The coral reef and developing countries both need climate change \
+                    adaptation and foreign aid for sustainable health care and water access. ";
+        let mut text = String::new();
+        while text.len() < 120 << 10 {
+            text.push_str(sent);
+        }
+        let lower = text.to_ascii_lowercase();
+        let terms: Vec<&str> = vec![
+            "coral reef", "developing countries", "climate change", "adaptation",
+            "foreign aid", "sustainable", "health care", "water access", "reef",
+            "countries", "change", "aid", "health", "water", "coral", "sustainab*",
+        ];
+        for _ in 0..5 {
+            std::hint::black_box(highlight_old(lower.as_bytes(), &text, &terms));
+            std::hint::black_box(highlight(lower.as_bytes(), &text, &terms));
+        }
+        let iters = 20u32;
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            std::hint::black_box(highlight_old(lower.as_bytes(), &text, &terms));
+        }
+        let old = t0.elapsed().as_secs_f64() / iters as f64 * 1e3;
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            std::hint::black_box(highlight(lower.as_bytes(), &text, &terms));
+        }
+        let new = t0.elapsed().as_secs_f64() / iters as f64 * 1e3;
+        println!(
+            "highlight {} bytes, {} terms: old {old:.3} ms  multi {new:.3} ms  ({:.1}x)",
+            text.len(),
+            terms.len(),
+            old / new.max(1e-9)
+        );
     }
 }
