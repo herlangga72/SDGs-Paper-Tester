@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 const MAGIC: &[u8; 4] = b"SDGC";
-const VERSION: u32 = 4;
+const VERSION: u32 = 5;
 
 pub struct CacheData {
     /// Parsed + resolved query ASTs (pid/mask/slot already stamped).

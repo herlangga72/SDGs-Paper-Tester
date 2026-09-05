@@ -153,9 +153,10 @@ impl Pattern {
 ///                 the first two bytes of a part. A single load + shift +
 ///                 mask, no probing.
 ///   - `quads`   : a two-hash Bloom filter over the first four bytes of a
-///                 part, sized ~16 bits per window. Two independent
-///                 multiplicative hashes into a power-of-two bit array keep
-///                 the false-positive rate low while remaining a handful of
+///                 part, sized 4 bits per window before rounding up to a
+///                 power of two (two probes per window into that array).
+///                 Two independent multiplicative hashes keep the
+///                 false-positive rate low while remaining a handful of
 ///                 branch-free bit operations. Bloom filters have no false
 ///                 negatives, which is all this pre-filter needs.
 /// The old `HashSet`-based index paid for hash-table allocation/rehashing to
@@ -342,7 +343,8 @@ fn build_chunk(
     // windows hashed into this segment: starts i with i < chunk_len and
     // i + 3 < slen  ->  at most chunk_len of them
     let wc = chunk_len.min(slen.saturating_sub(3));
-    let qbits = (wc.saturating_mul(8)).next_power_of_two().max(1 << 16);
+    // 4 bits per window (two probes); rounded up to a power of two.
+    let qbits = (wc.saturating_mul(4)).next_power_of_two().max(1 << 16);
     let quad_mask = (qbits as u32) - 1;
     let mut quads = vec![0u64; (qbits >> 6) as usize];
     let mut pos: FastMap<u32, Vec<u32>> = new_fast_map();
@@ -2441,13 +2443,40 @@ pub fn eval_ignore_not_block<'a>(
 
 /// Keyword dictionary of one SDG (leaf level), pre-tokenized at boot so the
 /// per-request suggestion scoring is allocation-free.
+///
+/// Keywords are `Arc<str>` so scoring clones a cheap refcount instead of a
+/// String. Each keyword's lowercased overlap tokens are stored as
+/// `(offset, len)` refs into ONE contiguous byte arena per dictionary
+/// (`tokens`), interning identical tokens (e.g. "health" across many
+/// keywords) to one copy. This replaces the old `Vec<String>`-per-keyword
+/// layout: each token previously cost a 24-byte `String` header plus a heap
+/// allocation; now every distinct token is a few bytes in the arena plus an
+/// 8-byte ref per occurrence.
 pub struct SdgDict {
-    /// (keyword, lowercased overlap tokens) for every unique include
-    /// keyword. Keywords are `Arc<str>` so scoring clones a cheap refcount
-    /// instead of a String; tokens are lowercased once at boot ("pretokenize")
-    /// so requests only do set lookups over them.
-    pub keywords: Vec<(Arc<str>, Vec<String>)>,
+    pub keywords: Vec<(Arc<str>, Vec<(u32, u32)>)>,
+    /// Arena holding every token's UTF-8 bytes for this SDG, concatenated.
+    pub tokens: Vec<u8>,
     pub excluded: HashSet<String>,
+}
+
+/// Append `t` to `arena` (deduplicated through `seen`) and return its
+/// `(offset, len)` ref. Dedup lets tokens shared by many keywords live once.
+fn intern_token(arena: &mut Vec<u8>, seen: &mut HashMap<String, (u32, u32)>, t: &str) -> (u32, u32) {
+    if let Some(&r) = seen.get(t) {
+        return r;
+    }
+    let o = arena.len() as u32;
+    arena.extend_from_slice(t.as_bytes());
+    let r = (o, t.len() as u32);
+    seen.insert(t.to_string(), r);
+    r
+}
+
+/// Token slice of `dict` at a `(offset, len)` ref (bytes were written from
+/// `&str`, so the slice is valid UTF-8).
+#[inline]
+fn dict_token<'b>(dict: &'b SdgDict, o: u32, l: u32) -> &'b str {
+    unsafe { std::str::from_utf8_unchecked(&dict.tokens[o as usize..o as usize + l as usize]) }
 }
 
 impl SdgDict {
@@ -2511,6 +2540,8 @@ pub fn collect_sdg_dict(blocks: &[Node]) -> SdgDict {
     }
     let mut include: Vec<String> = inc.into_iter().collect();
     include.sort_unstable();
+    let mut tokens: Vec<u8> = Vec::new();
+    let mut seen: HashMap<String, (u32, u32)> = HashMap::new();
     let keywords = include
         .into_iter()
         .map(|kw| {
@@ -2522,11 +2553,15 @@ pub fn collect_sdg_dict(blocks: &[Node]) -> SdgDict {
             let meaningful: Vec<String> = all.iter().filter(|t| t.len() > 2).cloned().collect();
             // Overlap tokens: ignore stopword-ish tokens unless the phrase is
             // all stopwords (short phrases still score).
-            let tokens = if meaningful.is_empty() { all } else { meaningful };
-            (Arc::from(kw), tokens)
+            let toks = if meaningful.is_empty() { &all } else { &meaningful };
+            let refs = toks
+                .iter()
+                .map(|t| intern_token(&mut tokens, &mut seen, t))
+                .collect();
+            (Arc::from(kw), refs)
         })
         .collect();
-    SdgDict { keywords, excluded: exc }
+    SdgDict { keywords, tokens, excluded: exc }
 }
 
 /// Paper word index: a set for exact lookups plus a sorted slice for
@@ -2635,11 +2670,14 @@ pub fn score_keywords(
     limit: usize,
 ) -> Vec<ScoredKw> {
     let mut out: Vec<ScoredKw> = Vec::with_capacity(dict.keywords.len().min(limit + 64));
-    for (kw, tokens) in &dict.keywords {
-        let hit = tokens.iter().filter(|t| token_matches(t, words)).count();
+    for (kw, trefs) in &dict.keywords {
+        let hit = trefs
+            .iter()
+            .filter(|&&(o, l)| token_matches(dict_token(dict, o, l), words))
+            .count();
         out.push(ScoredKw {
             keyword: kw.clone(),
-            score: if tokens.is_empty() { 0.0 } else { hit as f32 / tokens.len() as f32 },
+            score: if trefs.is_empty() { 0.0 } else { hit as f32 / trefs.len() as f32 },
             present: present.contains(kw.as_ref()),
             excluded_in_sdg: dict.excluded.contains(kw.as_ref()),
         });
@@ -2694,15 +2732,18 @@ pub fn suggest_keywords(
 ) -> Vec<Suggestion> {
     use std::collections::BinaryHeap;
     let mut heap: BinaryHeap<Cand> = BinaryHeap::with_capacity(limit + 1);
-    for (kw, tokens) in &dict.keywords {
+    for (kw, trefs) in &dict.keywords {
         if present.contains(kw.as_ref()) {
             continue;
         }
-        let hit = tokens.iter().filter(|t| token_matches(t, words)).count();
-        if hit == 0 || tokens.is_empty() {
+        let hit = trefs
+            .iter()
+            .filter(|&&(o, l)| token_matches(dict_token(dict, o, l), words))
+            .count();
+        if hit == 0 || trefs.is_empty() {
             continue;
         }
-        let pct = ((hit as f32 / tokens.len() as f32) * 100.0).round() as u32;
+        let pct = ((hit as f32 / trefs.len() as f32) * 100.0).round() as u32;
         if pct == 0 {
             continue;
         }
@@ -3007,15 +3048,19 @@ impl FlatBlock {
 }
 
 impl SdgDict {
+    /// Layout: n keywords, then per keyword the keyword bytes + n token
+    /// refs; then the shared token arena bytes; then the excluded set.
     pub fn serialize<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
         write_u32(w, self.keywords.len() as u32)?;
-        for (kw, toks) in &self.keywords {
+        for (kw, trefs) in &self.keywords {
             write_bytes(w, kw.as_bytes())?;
-            write_u32(w, toks.len() as u32)?;
-            for t in toks {
-                write_bytes(w, t.as_bytes())?;
+            write_u32(w, trefs.len() as u32)?;
+            for &(o, l) in trefs {
+                write_u32(w, o)?;
+                write_u32(w, l)?;
             }
         }
+        write_bytes(w, &self.tokens)?;
         write_u32(w, self.excluded.len() as u32)?;
         let mut exc: Vec<&str> = self.excluded.iter().map(String::as_str).collect();
         exc.sort_unstable();
@@ -3032,14 +3077,15 @@ impl SdgDict {
             let kw = String::from_utf8(read_bytes(r)?)
                 .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "cache: bad keyword"))?;
             let nt = read_u32(r)? as usize;
-            let mut toks = Vec::with_capacity(nt.min(64));
+            let mut trefs = Vec::with_capacity(nt.min(64));
             for _ in 0..nt {
-                let t = String::from_utf8(read_bytes(r)?)
-                    .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "cache: bad token"))?;
-                toks.push(t);
+                let o = read_u32(r)?;
+                let l = read_u32(r)?;
+                trefs.push((o, l));
             }
-            keywords.push((Arc::from(kw), toks));
+            keywords.push((Arc::from(kw), trefs));
         }
+        let tokens = read_bytes(r)?;
         let ne = read_u32(r)? as usize;
         let mut excluded = HashSet::with_capacity(ne.min(1 << 20));
         for _ in 0..ne {
@@ -3047,7 +3093,7 @@ impl SdgDict {
                 .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "cache: bad exclude"))?;
             excluded.insert(e);
         }
-        Ok(SdgDict { keywords, excluded })
+        Ok(SdgDict { keywords, tokens, excluded })
     }
 }
 
@@ -3643,16 +3689,22 @@ abstract: |
     #[test]
     fn suggest_ranks_by_token_overlap() {
         let mk = |kws: &[&str]| {
+            let mut tokens: Vec<u8> = Vec::new();
+            let mut seen: HashMap<String, (u32, u32)> = HashMap::new();
             SdgDict {
                 keywords: kws
                     .iter()
                     .map(|k| {
-                        (
-                            Arc::from(*k),
-                            k.split(' ').filter(|t| !t.is_empty()).map(|t| t.to_lowercase()).collect(),
-                        )
+                        let ts: Vec<String> = k
+                            .split(' ')
+                            .filter(|t| !t.is_empty())
+                            .map(|t| t.to_lowercase())
+                            .collect();
+                        let refs = ts.iter().map(|t| intern_token(&mut tokens, &mut seen, t)).collect();
+                        (Arc::from(*k), refs)
                     })
                     .collect(),
+                tokens,
                 excluded: HashSet::new(),
             }
         };

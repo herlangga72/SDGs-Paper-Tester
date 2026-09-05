@@ -171,18 +171,48 @@ impl Meta {
 
 pub struct Paper {
     pub title: Option<String>,
-    /// Owned input text. `full_text()` slices `[body_start..]`, so the
-    /// searchable body is never copied out of the caller's string.
+    /// Owned searchable text (the body when a body exists, otherwise the
+    /// sections joined with '\n', otherwise the whole input). `full_text()`
+    /// is the whole of it; the frontmatter region is not retained after
+    /// parsing, so its bytes are not duplicated for the request lifetime.
     input: String,
-    /// Byte offset of the searchable body within `input` (frontmatter is
-    /// dropped by slicing, not copying). 0 when the full text is the
-    /// sections join or the whole input.
+    /// Byte offset of the searchable text within `input` (always 0 today;
+    /// kept for the original slicing construction).
     body_start: usize,
+    /// Lowercased section buffers, kept ONLY when the full text is a body
+    /// (sections are not part of `lower_full`).
     lower_sections: [Option<Vec<u8>>; 4],
     lower_full: Vec<u8>,
+    /// When `full_covers_sections`, byte range of each present section
+    /// inside `lower_full` (sections joined with '\n'). A zero-length range
+    /// is a present-but-empty section, which falls back to the full text
+    /// exactly like the old `text_lower`.
+    section_bounds: [(usize, usize); 4],
     /// True when `lower_full` is the join of the section buffers (no body
     /// text), so every field search can use the full text alone.
     pub(crate) full_covers_sections: bool,
+}
+
+/// Join every present section with '\n' and record each section's byte
+/// range in the joined string. Mirrors the previous
+/// `sections.iter().flatten().join("\n")` exactly, including empty-but-
+/// present sections (which get a zero-length range).
+fn join_with_bounds(sections: &[Option<String>; 4]) -> (String, [(usize, usize); 4]) {
+    let mut bounds = [(0usize, 0usize); 4];
+    let mut out = String::new();
+    let mut first = true;
+    for (f, s) in sections.iter().enumerate() {
+        if let Some(sec) = s {
+            if !first {
+                out.push('\n');
+            }
+            let start = out.len();
+            out.push_str(sec);
+            bounds[f] = (start, out.len());
+            first = false;
+        }
+    }
+    (out, bounds)
 }
 
 
@@ -247,35 +277,36 @@ fn build_paper(text: String, meta: Vec<(String, YVal)>, body_start: usize) -> Pa
     }
 
     let has_sections = sections.iter().any(|s| s.as_ref().map_or(false, |x| !x.trim().is_empty()));
-    let (input, body_start) = if !body_is_ws {
-        (text, body_start)
-    } else if has_sections {
-        (
-            sections
-                .iter()
-                .flatten()
-                .cloned()
-                .collect::<Vec<_>>()
-                .join("\n"),
-            0,
-        )
+
+    // Choose the owned searchable text and how its sections are kept:
+    //  - no body + sections present: the sections joined with '\n', with
+    //    each section represented as a range of `lower_full` (one lowercase
+    //    buffer, no duplicate section copies);
+    //  - body present: the body only (the frontmatter region is not needed
+    //    after parsing, so retaining it would duplicate bytes for the whole
+    //    request lifetime);
+    //  - otherwise the whole (usually empty/whitespace) input.
+    let (input, section_bounds, lower_sections) = if body_is_ws && has_sections {
+        let (joined, bounds) = join_with_bounds(&sections);
+        (joined, bounds, [None, None, None, None])
+    } else if !body_is_ws {
+        let mut ls: [Option<Vec<u8>>; 4] = [None, None, None, None];
+        for f in 0..4usize {
+            ls[f] = sections[f].as_ref().map(|s| lower_ascii(s.as_bytes()));
+        }
+        (text[body_start..].to_string(), [(0, 0); 4], ls)
     } else {
-        (text, 0)
+        (text, [(0, 0); 4], [None, None, None, None])
     };
 
-    let lower_full = lower_ascii(&input.as_bytes()[body_start..]);
-    let lower_sections = [
-        sections[0].as_ref().map(|s| lower_ascii(s.as_bytes())),
-        sections[1].as_ref().map(|s| lower_ascii(s.as_bytes())),
-        sections[2].as_ref().map(|s| lower_ascii(s.as_bytes())),
-        sections[3].as_ref().map(|s| lower_ascii(s.as_bytes())),
-    ];
+    let lower_full = lower_ascii(&input.as_bytes());
     Paper {
         title,
         input,
-        body_start,
+        body_start: 0,
         lower_full,
         lower_sections,
+        section_bounds,
         full_covers_sections: body_is_ws,
     }
 }
@@ -313,16 +344,18 @@ impl Paper {
     /// round-trip), with the same fallback semantics as `from_text`: fields
     /// that are missing fall back to the joined full text.
     pub fn from_sections(sections: [Option<String>; 4]) -> Paper {
-        let full = sections.iter().flatten().cloned().collect::<Vec<_>>().join("\n");
+        let (full, bounds) = join_with_bounds(&sections);
         let lower_full = lower_ascii(full.as_bytes());
-        let lower_sections = [
-            sections[0].as_ref().map(|s| lower_ascii(s.as_bytes())),
-            sections[1].as_ref().map(|s| lower_ascii(s.as_bytes())),
-            sections[2].as_ref().map(|s| lower_ascii(s.as_bytes())),
-            sections[3].as_ref().map(|s| lower_ascii(s.as_bytes())),
-        ];
         let title = sections[F_TITLE as usize].clone();
-        Paper { title, input: full, body_start: 0, lower_full, lower_sections, full_covers_sections: true }
+        Paper {
+            title,
+            input: full,
+            body_start: 0,
+            lower_full,
+            lower_sections: [None, None, None, None],
+            section_bounds: bounds,
+            full_covers_sections: true,
+        }
     }
 
     /// Byte ranges of each present section within `text_lower(F_ANY)`.
@@ -330,6 +363,10 @@ impl Paper {
     /// '\n'); the ranges are the join positions, so per-segment glob
     /// matching keeps per-field semantics.
     pub(crate) fn full_section_ranges(&self) -> [(usize, usize); 4] {
+        if self.full_covers_sections {
+            return self.section_bounds;
+        }
+        // Non-covering papers: ranges are only meaningful for completeness.
         let mut out = [(0usize, 0usize); 4];
         let mut pos = 0usize;
         let mut first = true;
@@ -355,9 +392,14 @@ impl Paper {
     /// Lowercased text for a field id (falls back to full text).
     pub fn text_lower(&self, f: u8) -> &[u8] {
         if f <= F_AUTHKEY {
-            if let Some(s) = &self.lower_sections[f as usize] {
-                if !s.is_empty() {
-                    return s;
+            if self.full_covers_sections {
+                let (s, e) = self.section_bounds[f as usize];
+                if s < e {
+                    return &self.lower_full[s..e];
+                }
+            } else if let Some(sec) = &self.lower_sections[f as usize] {
+                if !sec.is_empty() {
+                    return sec;
                 }
             }
         }
@@ -390,5 +432,43 @@ mod tests {
         assert_eq!(p.text_lower(F_ANY), b"just a plain paper body");
         // body text present -> full text is the body, not the sections join
         assert!(!p.full_covers_sections);
+    }
+
+    #[test]
+    fn sections_paper_shares_one_lower_buffer_with_ranges() {
+        let p = Paper::from_sections([
+            Some("Title".into()),
+            Some("An Abstract Here".into()),
+            Some("kw one, kw two".into()),
+            Some("kw one, kw two".into()),
+        ]);
+        assert!(p.full_covers_sections);
+        assert_eq!(p.text_lower(F_TITLE), b"title");
+        assert_eq!(p.text_lower(F_ABS), b"an abstract here");
+        assert_eq!(p.text_lower(F_KEY), b"kw one, kw two");
+        assert_eq!(
+            p.text_lower(F_ANY),
+            b"title\nan abstract here\nkw one, kw two\nkw one, kw two"
+        );
+        // The section ranges tile `lower_full` with the '\n' separators
+        // between them: no duplicate lowercase section buffers exist.
+        let full = p.text_lower(F_ANY);
+        let fp = full.as_ptr() as usize;
+        assert!((0..4).all(|f| {
+            let s = p.text_lower(f as u8);
+            let sp = s.as_ptr() as usize;
+            sp >= fp && sp + s.len() <= fp + full.len()
+        }));
+        let r = p.full_section_ranges();
+        assert_eq!(&full[r[0].0..r[0].1], b"title");
+        assert_eq!(&full[r[1].0..r[1].1], b"an abstract here");
+        assert_eq!(full[r[1].1], b'\n');
+        assert_eq!(&full[r[3].0..r[3].1], b"kw one, kw two");
+        assert_eq!(r[3].1, full.len());
+
+        // Missing fields fall back to the full text.
+        let p2 = Paper::from_sections([Some("Hi".into()), None, None, None]);
+        assert_eq!(p2.text_lower(F_ABS), b"hi");
+        assert_eq!(p2.text_lower(F_KEY), b"hi");
     }
 }
