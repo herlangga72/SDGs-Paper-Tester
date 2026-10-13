@@ -94,8 +94,13 @@
       <button class="ghost" onclick="clearAll()">Clear</button>
       <button class="primary" id="go" onclick="run()">Match SDGs</button>
     </div>
+    <div class="row" id="validate-row" hidden>
+      <span class="spacer"></span>
+      <button class="ghost" id="validate-btn" onclick="validateResult()">✓ Validate &amp; Get QR Code</button>
+    </div>
   </div>
 
+  <div id="validate-panel"></div>
   <div id="results"></div>
 
   <details class="card legend">

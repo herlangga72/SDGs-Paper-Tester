@@ -25,6 +25,9 @@ use sdg_tools::paper::{self, Meta, Paper, F_ANY};
 use sdg_tools::query::{self, Query};
 use sdg_tools::simd::find;
 
+#[path = "web_support/turso.rs"]
+mod turso;
+
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{Read, Write};
@@ -2626,6 +2629,8 @@ fn route_get(path: &str, qs: &str) -> Resp {
         "/api/stats" => stats_json(),
         "/api/logs" => api_logs(qs),
         "/api/matches" => api_matches(qs),
+        "/api/verify" => api_verify(qs),
+        "/verify" => verify_page(qs),
         "/samples" => Resp::json(200, samples_json()),
         "/sample" => {
             let params = parse_urlencoded(qs.as_bytes());
@@ -2981,6 +2986,277 @@ fn api_keywords(headers: &[(String, String)], body: &[u8]) -> Resp {
     Resp::json(200, out.to_string())
 }
 
+// ---------------------------------------------------------------------------
+// Validation — user confirms a match result, server hashes it (SHA-256),
+// stores it durably in Turso, and hands back a short code + QR-encoded
+// verify URL. Anyone (not just this app) can later open that URL, or POST
+// the code to /api/verify, and get back the original record plus a
+// recomputed hash to confirm nothing was tampered with.
+// ---------------------------------------------------------------------------
+
+/// Base32 (Crockford-ish, no padding) of the first N bytes of a hash, used
+/// as a short, easy-to-type/read verification code (case-insensitive on
+/// lookup since we normalize to uppercase in verify).
+fn short_code(hash_hex: &str) -> String {
+    const ALPHABET: &[u8] = b"23456789ABCDEFGHJKMNPQRSTVWXYZ"; // no 0/1/O/I/L/U
+    let bytes = hex_bytes(hash_hex);
+    let mut acc: u64 = 0;
+    let mut bits = 0u32;
+    let mut out = String::new();
+    for b in bytes.iter().take(6) {
+        acc = (acc << 8) | *b as u64;
+        bits += 8;
+        while bits >= 5 {
+            bits -= 5;
+            let idx = ((acc >> bits) & 0x1F) as usize;
+            out.push(ALPHABET[idx] as char);
+        }
+    }
+    // 6 bytes -> 9 base32 chars; group as XXXX-XXXXX for readability.
+    if out.len() >= 9 {
+        format!("{}-{}", &out[..4], &out[4..9])
+    } else {
+        out
+    }
+}
+
+fn hex_bytes(hex: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(hex.len() / 2);
+    let b = hex.as_bytes();
+    let mut i = 0;
+    while i + 1 < b.len() {
+        let hi = (b[i] as char).to_digit(16).unwrap_or(0);
+        let lo = (b[i + 1] as char).to_digit(16).unwrap_or(0);
+        out.push(((hi << 4) | lo) as u8);
+        i += 2;
+    }
+    out
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    let digest = hasher.finalize();
+    digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn normalize_code(s: &str) -> String {
+    let stripped: String = s
+        .trim()
+        .to_uppercase()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
+    // Accept the code with or without the display dash; codes are always
+    // produced as 4 chars + 5 chars (see short_code).
+    if stripped.len() == 9 {
+        format!("{}-{}", &stripped[..4], &stripped[4..])
+    } else {
+        stripped
+    }
+}
+
+fn base_url(headers: &[(String, String)]) -> String {
+    let host = headers
+        .iter()
+        .find(|(k, _)| k == "host")
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("localhost");
+    let scheme = if host.contains("localhost") || host.starts_with("127.") {
+        "http"
+    } else {
+        "https"
+    };
+    format!("{scheme}://{host}")
+}
+
+/// Render a small white-on-white-margin SVG QR code for `data`. Returns the
+/// raw SVG markup (used directly as an <img src="data:image/svg+xml..."> on
+/// the frontend — no PNG/image crate needed).
+fn qr_svg(data: &str) -> Result<String, String> {
+    use qrcode::QrCode;
+    let code = QrCode::new(data.as_bytes()).map_err(|e| format!("QR encode failed: {e}"))?;
+    let svg = code
+        .render()
+        .min_dimensions(240, 240)
+        .dark_color(qrcode::render::svg::Color("#111111"))
+        .light_color(qrcode::render::svg::Color("#ffffff"))
+        .build();
+    Ok(svg)
+}
+
+/// POST /api/validate — body is the canonical JSON of a result the user is
+/// confirming (title/authors/year/journal/doi/keywords/abstract + the
+/// sdgs matched). Server stamps a timestamp, hashes the whole thing with
+/// SHA-256, derives a short code from the hash, persists it to Turso, and
+/// returns {code, hash, verify_url, qr_svg}.
+fn api_validate(headers: &[(String, String)], body: &[u8]) -> Resp {
+    if !turso::enabled() {
+        return Resp::json(
+            503,
+            "{\"error\":\"validation storage is not configured on this server (TURSO_DB_URL / TURSO_AUTH_TOKEN unset)\"}".to_string(),
+        );
+    }
+    let mut payload: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(e) => return Resp::json(400, format!("{{\"error\":\"bad JSON body: {e}\"}}")),
+    };
+    if !payload.is_object() {
+        return Resp::json(400, "{\"error\":\"body must be a JSON object\"}".to_string());
+    }
+    let uid = cookie_uid(headers).unwrap_or_default();
+    let ts = epoch_ms() as i64;
+    payload["validated_at_ms"] = serde_json::json!(ts);
+
+    // Canonical (sorted-key) JSON so the same logical payload always hashes
+    // the same way regardless of field insertion order.
+    let canonical = canonical_json(&payload);
+    let hash = sha256_hex(canonical.as_bytes());
+    let mut code = short_code(&hash);
+
+    // Astronomically unlikely, but guard against a short-code collision by
+    // trying a couple of salted variants before giving up.
+    for attempt in 0..3 {
+        match turso::insert_validation(&code, &hash, &canonical, ts, &uid) {
+            Ok(()) => break,
+            Err(e) if e.to_lowercase().contains("unique") && attempt < 2 => {
+                code = short_code(&sha256_hex(format!("{hash}:{attempt}").as_bytes()));
+            }
+            Err(e) => return Resp::json(502, format!("{{\"error\":\"could not store validation: {}\"}}", jstr(&e))),
+        }
+    }
+
+    let verify_url = format!("{}/verify?code={}", base_url(headers), percent_encode(&code));
+    let svg = match qr_svg(&verify_url) {
+        Ok(s) => s,
+        Err(e) => return Resp::json(500, format!("{{\"error\":{}}}", jstr(&e))),
+    };
+    let out = serde_json::json!({
+        "code": code,
+        "hash": hash,
+        "verify_url": verify_url,
+        "qr_svg": svg,
+        "validated_at_ms": ts,
+    });
+    Resp::json(200, out.to_string())
+}
+
+/// Deterministic JSON serialization with object keys sorted, so hashing is
+/// stable regardless of how the payload was constructed.
+fn canonical_json(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            let parts: Vec<String> = keys
+                .iter()
+                .map(|k| format!("{}:{}", jstr(k), canonical_json(&map[*k])))
+                .collect();
+            format!("{{{}}}", parts.join(","))
+        }
+        serde_json::Value::Array(arr) => {
+            let parts: Vec<String> = arr.iter().map(canonical_json).collect();
+            format!("[{}]", parts.join(","))
+        }
+        other => other.to_string(),
+    }
+}
+
+/// GET /api/verify?code=XXXX-XXXXX — look up a validation and recompute its
+/// hash to prove the stored payload hasn't been altered since it was
+/// written. Returns 404 if the code is unknown.
+fn api_verify(qs: &str) -> Resp {
+    if !turso::enabled() {
+        return Resp::json(
+            503,
+            "{\"error\":\"validation storage is not configured on this server\"}".to_string(),
+        );
+    }
+    let params = parse_urlencoded(qs.as_bytes());
+    let code = normalize_code(&params.get("code").cloned().unwrap_or_default());
+    if code.is_empty() {
+        return Resp::json(400, "{\"error\":\"missing ?code=\"}".to_string());
+    }
+    match turso::get_validation(&code) {
+        Ok(None) => Resp::json(404, "{\"error\":\"no validation found for this code\"}".to_string()),
+        Ok(Some(rec)) => {
+            let recomputed = sha256_hex(rec.payload.as_bytes());
+            let intact = recomputed == rec.hash;
+            let payload: serde_json::Value =
+                serde_json::from_str(&rec.payload).unwrap_or(serde_json::Value::Null);
+            let out = serde_json::json!({
+                "code": rec.code,
+                "hash": rec.hash,
+                "recomputed_hash": recomputed,
+                "intact": intact,
+                "validated_at_ms": rec.created_at,
+                "payload": payload,
+            });
+            Resp::json(200, out.to_string())
+        }
+        Err(e) => Resp::json(502, format!("{{\"error\":{}}}", jstr(&e))),
+    }
+}
+
+/// GET /verify — a tiny standalone HTML page (code input + result) so a
+/// verify URL works even without loading the main app, for third parties
+/// who just want to confirm "was this once submitted here".
+fn verify_page(qs: &str) -> Resp {
+    let params = parse_urlencoded(qs.as_bytes());
+    let code = params.get("code").cloned().unwrap_or_default();
+    let html = format!(
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Verify a validated result — SDG Paper Matcher</title>
+<link rel="stylesheet" href="/static/style.css"></head><body>
+<div class="wrap">
+<header class="app"><div class="logo">SDG</div><div>
+<h1>Verify a validated result</h1>
+<p>Enter or scan the code from a QR code generated by SDG Paper Matcher to confirm a paper result was once submitted and hashed here.</p>
+</div></header>
+<div class="card form-card">
+<div class="form-grid">
+<label class="fld wide">Code
+<input id="v-code" type="text" value="{}" placeholder="XXXX-XXXXX">
+</label>
+</div>
+<div class="row"><span class="spacer"></span><button class="primary" onclick="doVerify()">Verify</button></div>
+</div>
+<div id="v-result"></div>
+</div>
+<script>
+async function doVerify() {{
+  const code = document.getElementById('v-code').value.trim();
+  const el = document.getElementById('v-result');
+  if (!code) {{ el.innerHTML = ''; return; }}
+  el.innerHTML = '<div class="card"><p class="muted-text">checking…</p></div>';
+  try {{
+    const r = await fetch('/api/verify?code=' + encodeURIComponent(code));
+    const d = await r.json();
+    if (!r.ok) {{
+      el.innerHTML = '<div class="error-box">✗ ' + (d.error || 'not found') + '</div>';
+      return;
+    }}
+    const dt = new Date(d.validated_at_ms).toLocaleString();
+    el.innerHTML = '<div class="card"><p>' +
+      (d.intact ? '✅ <b>Verified</b> — this result was submitted and hashed on this server.' :
+                  '⚠️ <b>Hash mismatch</b> — stored record failed integrity check.') +
+      '</p><p class="small">Code: <code>' + d.code + '</code><br>Validated: ' + dt +
+      '<br>SHA-256: <code style="word-break:break-all">' + d.hash + '</code></p>' +
+      '<pre style="white-space:pre-wrap;font-size:12px">' + JSON.stringify(d.payload, null, 2) + '</pre></div>';
+  }} catch (e) {{
+    el.innerHTML = '<div class="error-box">✗ request failed: ' + e + '</div>';
+  }}
+}}
+if (document.getElementById('v-code').value) doVerify();
+</script>
+</body></html>"#,
+        esc(&code)
+    );
+    Resp::html(200, html)
+}
+
 fn route(method: &str, target: &str, headers: &[(String, String)], body: &[u8]) -> Resp {
     let (path, qs) = match target.find('?') {
         Some(i) => (&target[..i], &target[i + 1..]),
@@ -2991,6 +3267,7 @@ fn route(method: &str, target: &str, headers: &[(String, String)], body: &[u8]) 
         "POST" if path == "/match" => route_match(headers, body),
         "POST" if path == "/api/match" => api_match(headers, body),
         "POST" if path == "/api/keywords" => api_keywords(headers, body),
+        "POST" if path == "/api/validate" => api_validate(headers, body),
         _ => Resp::not_found(),
     }
 }

@@ -73,17 +73,97 @@ async function run() {
     const res = document.getElementById('results');
     res.innerHTML = await r.text();
     res.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    document.getElementById('validate-row').hidden = !r.ok;
+    document.getElementById('validate-panel').innerHTML = '';
   } catch (err) {
     document.getElementById('results').innerHTML =
       '<div class="error-box">Request failed: ' + escapeHtml(String(err)) + '</div>';
+    document.getElementById('validate-row').hidden = true;
   } finally {
     go.disabled = false; go.textContent = 'Match SDGs';
+  }
+}
+
+/* ---- Validate a result: hash it server-side, store it, show a QR ---- */
+
+async function validateResult() {
+  const btn = document.getElementById('validate-btn');
+  const panel = document.getElementById('validate-panel');
+  btn.disabled = true; btn.textContent = 'Validating…';
+  panel.innerHTML = '<div class="card"><p class="muted-text">hashing and storing…</p></div>';
+  try {
+    // Pull the matched-SDG chips straight out of the rendered report so the
+    // validated payload matches exactly what the user is looking at.
+    const sdgsMatched = Array.from(document.querySelectorAll('.chip.matched'))
+      .map(el => el.textContent.replace(/[^\d]/g, '')).filter(Boolean);
+    const payload = {};
+    FIELDS.forEach(k => {
+      const v = document.getElementById('f-' + k).value;
+      if (v) payload[k] = v;
+    });
+    payload.sdgs_matched = sdgsMatched;
+
+    const r = await fetch('/api/validate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || 'validation failed');
+
+    panel.innerHTML = `
+      <div class="card">
+        <h3>✅ Result validated</h3>
+        <p class="hint">This paper's result has been hashed (SHA-256) and stored. Scan the QR code
+        or copy the link below to let anyone verify it was submitted here.</p>
+        <div style="display:flex;gap:16px;align-items:flex-start;flex-wrap:wrap">
+          <div style="background:#fff;padding:8px;border-radius:8px">${d.qr_svg}</div>
+          <div style="flex:1;min-width:240px">
+            <label class="small">Verification code</label>
+            <div style="display:flex;gap:6px;margin:4px 0 12px">
+              <input readonly value="${escapeHtml(d.code)}" style="flex:1;font-family:monospace">
+              <button class="ghost" onclick="copyText('${escapeHtml(d.code)}')">Copy</button>
+            </div>
+            <label class="small">Verify URL (copyable, works on any system)</label>
+            <div style="display:flex;gap:6px;margin:4px 0 12px">
+              <input readonly value="${escapeHtml(d.verify_url)}" style="flex:1;font-family:monospace;font-size:12px">
+              <button class="ghost" onclick="copyText('${escapeHtml(d.verify_url)}')">Copy</button>
+            </div>
+            <label class="small">SHA-256</label>
+            <div style="font-family:monospace;font-size:11px;word-break:break-all;color:var(--muted,#888)">${escapeHtml(d.hash)}</div>
+            <p class="small" style="margin-top:12px"><a href="${escapeHtml(d.verify_url)}" target="_blank" rel="noopener">Open verify page ↗</a></p>
+          </div>
+        </div>
+      </div>`;
+  } catch (err) {
+    panel.innerHTML = '<div class="error-box">✗ ' + escapeHtml(err.message) + '</div>';
+  } finally {
+    btn.disabled = false; btn.textContent = '✓ Validate & Get QR Code';
+  }
+}
+
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch (e) {
+    if (document.execCommand) {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand('copy');
+      ta.remove();
+    }
   }
 }
 
 function clearAll() {
   FIELDS.forEach(k => document.getElementById('f-' + k).value = '');
   document.getElementById('results').innerHTML = '';
+  document.getElementById('validate-row').hidden = true;
+  document.getElementById('validate-panel').innerHTML = '';
   ADV.loaded = false; ADV.all = [];
   const adv = document.getElementById('adv-list');
   if (adv) adv.innerHTML = '';

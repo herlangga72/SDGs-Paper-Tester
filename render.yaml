@@ -16,3 +16,15 @@ services:
         value: 10000
       # Sentry error reporting is enabled by default (DSN hard-coded in the
       # servers). Override with SENTRY_DSN or disable with SENTRY_DSN=0.
+      # "Validate & Get QR Code" feature: stores a SHA-256-hashed record of
+      # each validated result in Turso (libSQL) so it survives redeploys on
+      # this free/ephemeral-disk plan. Without these two set, /api/validate
+      # and /api/verify return 503 but the rest of the app works normally.
+      # Create a DB with the Turso CLI:
+      #   turso db create sdg-paper-validations
+      #   turso db show sdg-paper-validations --http-url   # -> TURSO_DB_URL
+      #   turso db tokens create sdg-paper-validations      # -> TURSO_AUTH_TOKEN
+      - key: TURSO_DB_URL
+        sync: false
+      - key: TURSO_AUTH_TOKEN
+        sync: false
