@@ -126,8 +126,9 @@ details.explainer p { margin:6px 0 0; font-size:13px; line-height:1.5; }
 .sug-badge.more { background:#fff3d6; color:#9a6b00; border:1px solid #e6c37a; }
 .sug-badge.block { background:#fde2e2; color:#b3261e; border:1px solid #e5a0a0; }
 button.kw.sug.blocked { border-color:#e5a0a0; background:#fdf0f0; }
-.sdg-body { padding:4px 18px 16px; border-top:1px solid var(--line); }
+.sdg-body { padding:16px 18px 18px; border-top:1px solid var(--line); }
 .block { margin-top:12px; }
+.block:first-child { margin-top:0; }
 .block h4 { margin:0 0 4px; font-size:12.5px; text-transform:uppercase; letter-spacing:.4px; color:var(--muted); }
 .kw { display:inline-block; background:#eef2f9; border:1px solid var(--line); border-radius:6px;
       padding:1.5px 7px; margin:2px 3px 2px 0; font-size:12px; font-family:ui-monospace,Menlo,monospace; }
