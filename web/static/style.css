@@ -76,7 +76,8 @@ h2.section { font-size:17px; margin:0 0 12px; display:flex; align-items:center; 
 .paper-info b { color:var(--ink); }
 
 .sdg-card { margin-bottom:16px; overflow:hidden; }
-.sdg-head { display:flex; align-items:center; gap:12px; padding:13px 18px; cursor:pointer; user-select:none; }
+.sdg-head { display:flex; align-items:center; gap:12px; padding:13px 18px; cursor:pointer;
+       user-select:none; list-style:none; }
 .sdg-head .num { width:34px; height:34px; border-radius:9px; color:#fff; font-weight:800; font-size:15px;
         display:grid; place-items:center; flex:none; }
 .sdg-head .name { font-weight:700; font-size:14.5px; flex:1; }
