@@ -92,16 +92,17 @@ async function validateResult() {
   btn.disabled = true; btn.textContent = 'Validating…';
   panel.innerHTML = '<div class="card"><p class="muted-text">hashing and storing…</p></div>';
   try {
-    // Pull the matched-SDG chips straight out of the rendered report so the
-    // validated payload matches exactly what the user is looking at.
+    // Only title/keywords/abstract/matched SDGs are ever stored server-side
+    // (see /api/validate) — authors/year/journal/DOI are deliberately left
+    // out of what gets persisted, so only send what's actually kept.
     const sdgsMatched = Array.from(document.querySelectorAll('.chip.matched'))
       .map(el => el.textContent.replace(/[^\d]/g, '')).filter(Boolean);
-    const payload = {};
-    FIELDS.forEach(k => {
-      const v = document.getElementById('f-' + k).value;
-      if (v) payload[k] = v;
-    });
-    payload.sdgs_matched = sdgsMatched;
+    const payload = {
+      title: document.getElementById('f-title').value,
+      keywords: document.getElementById('f-keywords').value,
+      abstract: document.getElementById('f-abstract').value,
+      sdgs_matched: sdgsMatched,
+    };
 
     const r = await fetch('/api/validate', {
       method: 'POST',

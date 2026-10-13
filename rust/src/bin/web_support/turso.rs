@@ -6,11 +6,18 @@
 //! Render's free ephemeral filesystem since the data lives in Turso, not
 //! on local disk.
 //!
+//! Only title / keywords / abstract / matched SDGs are persisted per
+//! record (not the full form — authors/year/journal/DOI are left out to
+//! minimize what's stored). Records are additionally chained: each row
+//! commits to the previous row's chain hash, so any edit, deletion, or
+//! reordering of historical rows is detectable by recomputing the chain
+//! from the start, independent of the per-row content hash.
+//!
 //! Configured via two env vars:
 //!   TURSO_DB_URL    e.g. https://sdg-paper-validations-xxx.turso.io
 //!   TURSO_AUTH_TOKEN
 //! If either is unset, `enabled()` returns false and callers should
-//! degrade gracefully (e.g. fall back to local-only logging).
+//! degrade gracefully (e.g. the validate/verify endpoints return 503).
 
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -92,29 +99,6 @@ fn arg_val(v: &serde_json::Value) -> serde_json::Value {
     }
 }
 
-/// Insert one validation record. `code` must be unique (caller generates
-/// it from the hash, with a few retries on collision in the extremely
-/// unlikely case one occurs).
-pub fn insert_validation(
-    code: &str,
-    hash: &str,
-    payload_json: &str,
-    ts_ms: i64,
-    uid: &str,
-) -> Result<(), String> {
-    let res = pipeline(&[(
-        "INSERT INTO validations (code, hash, payload, created_at, uid) VALUES (?, ?, ?, ?, ?)",
-        vec![
-            serde_json::json!(code),
-            serde_json::json!(hash),
-            serde_json::json!(payload_json),
-            serde_json::json!(ts_ms),
-            serde_json::json!(uid),
-        ],
-    )])?;
-    check_ok(&res)
-}
-
 fn check_ok(res: &serde_json::Value) -> Result<(), String> {
     if let Some(arr) = res.get("results").and_then(|r| r.as_array()) {
         for item in arr {
@@ -131,50 +115,152 @@ fn check_ok(res: &serde_json::Value) -> Result<(), String> {
     Ok(())
 }
 
+fn rows_of(res: &serde_json::Value, idx: usize) -> Vec<serde_json::Value> {
+    res.get("results")
+        .and_then(|r| r.as_array())
+        .and_then(|a| a.get(idx))
+        .and_then(|r| r.get("response"))
+        .and_then(|r| r.get("result"))
+        .and_then(|r| r.get("rows"))
+        .and_then(|r| r.as_array())
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn cell_str(row: &serde_json::Value, i: usize) -> String {
+    row.get(i)
+        .and_then(|c| c.get("value"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn cell_i64(row: &serde_json::Value, i: usize) -> i64 {
+    row.get(i)
+        .and_then(|c| c.get("value"))
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(0)
+}
+
+/// Genesis value for the hash chain (first row's `prev_chain_hash`).
+pub const CHAIN_GENESIS: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+/// The latest `chain_hash` committed so far, or `CHAIN_GENESIS` if the
+/// table is empty. Callers use this as `prev_chain_hash` for a new insert.
+pub fn latest_chain_hash() -> Result<String, String> {
+    let res = pipeline(&[(
+        "SELECT chain_hash FROM validations ORDER BY id DESC LIMIT 1",
+        vec![],
+    )])?;
+    check_ok(&res)?;
+    let rows = rows_of(&res, 0);
+    Ok(rows.first().map(|r| cell_str(r, 0)).unwrap_or_else(|| CHAIN_GENESIS.to_string()))
+}
+
+/// Insert one validation record. `code` must be unique (caller generates
+/// it from the hash, with a few retries on collision in the extremely
+/// unlikely case one occurs). Only title/keywords/abstract/matched SDGs
+/// are stored — the rest of the submitted form is never persisted.
+#[allow(clippy::too_many_arguments)]
+pub fn insert_validation(
+    code: &str,
+    hash: &str,
+    title: &str,
+    keywords: &str,
+    abstract_text: &str,
+    sdgs_matched_csv: &str,
+    prev_chain_hash: &str,
+    chain_hash: &str,
+    ts_ms: i64,
+    uid: &str,
+) -> Result<(), String> {
+    let res = pipeline(&[(
+        "INSERT INTO validations \
+         (code, hash, title, keywords, abstract, sdgs_matched, prev_chain_hash, chain_hash, created_at, uid) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        vec![
+            serde_json::json!(code),
+            serde_json::json!(hash),
+            serde_json::json!(title),
+            serde_json::json!(keywords),
+            serde_json::json!(abstract_text),
+            serde_json::json!(sdgs_matched_csv),
+            serde_json::json!(prev_chain_hash),
+            serde_json::json!(chain_hash),
+            serde_json::json!(ts_ms),
+            serde_json::json!(uid),
+        ],
+    )])?;
+    check_ok(&res)
+}
+
 pub struct ValidationRecord {
     pub code: String,
     pub hash: String,
-    pub payload: String,
+    pub title: String,
+    pub keywords: String,
+    pub abstract_text: String,
+    pub sdgs_matched_csv: String,
+    pub prev_chain_hash: String,
+    pub chain_hash: String,
     pub created_at: i64,
 }
 
 /// Look up one validation by its short code. Returns Ok(None) if not found.
 pub fn get_validation(code: &str) -> Result<Option<ValidationRecord>, String> {
     let res = pipeline(&[(
-        "SELECT code, hash, payload, created_at FROM validations WHERE code = ? LIMIT 1",
+        "SELECT code, hash, title, keywords, abstract, sdgs_matched, prev_chain_hash, chain_hash, created_at \
+         FROM validations WHERE code = ? LIMIT 1",
         vec![serde_json::json!(code)],
     )])?;
     check_ok(&res)?;
-    let rows = res
-        .get("results")
-        .and_then(|r| r.as_array())
-        .and_then(|a| a.first())
-        .and_then(|r| r.get("response"))
-        .and_then(|r| r.get("result"))
-        .and_then(|r| r.get("rows"))
-        .and_then(|r| r.as_array())
-        .cloned()
-        .unwrap_or_default();
+    let rows = rows_of(&res, 0);
     let Some(row) = rows.first() else {
         return Ok(None);
     };
-    // Each cell is {"type":"text","value":"..."}.
-    let cell = |i: usize| -> String {
-        row.get(i)
-            .and_then(|c| c.get("value"))
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string()
-    };
     Ok(Some(ValidationRecord {
-        code: cell(0),
-        hash: cell(1),
-        payload: cell(2),
-        created_at: row
-            .get(3)
-            .and_then(|c| c.get("value"))
-            .and_then(|v| v.as_str())
-            .and_then(|s| s.parse::<i64>().ok())
-            .unwrap_or(0),
+        code: cell_str(row, 0),
+        hash: cell_str(row, 1),
+        title: cell_str(row, 2),
+        keywords: cell_str(row, 3),
+        abstract_text: cell_str(row, 4),
+        sdgs_matched_csv: cell_str(row, 5),
+        prev_chain_hash: cell_str(row, 6),
+        chain_hash: cell_str(row, 7),
+        created_at: cell_i64(row, 8),
     }))
+}
+
+/// One row as needed for a full chain audit (id order matters).
+pub struct ChainRow {
+    pub id: i64,
+    pub code: String,
+    pub hash: String,
+    pub prev_chain_hash: String,
+    pub chain_hash: String,
+    pub created_at: i64,
+}
+
+/// Fetch every row in insertion order, for `/api/chain-status` to recompute
+/// and confirm the whole chain is unbroken (or to report exactly where it
+/// breaks).
+pub fn all_rows_for_chain_check() -> Result<Vec<ChainRow>, String> {
+    let res = pipeline(&[(
+        "SELECT id, code, hash, prev_chain_hash, chain_hash, created_at FROM validations ORDER BY id ASC",
+        vec![],
+    )])?;
+    check_ok(&res)?;
+    let rows = rows_of(&res, 0);
+    Ok(rows
+        .iter()
+        .map(|row| ChainRow {
+            id: cell_i64(row, 0),
+            code: cell_str(row, 1),
+            hash: cell_str(row, 2),
+            prev_chain_hash: cell_str(row, 3),
+            chain_hash: cell_str(row, 4),
+            created_at: cell_i64(row, 5),
+        })
+        .collect())
 }

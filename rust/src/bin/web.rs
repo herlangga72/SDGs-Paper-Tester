@@ -2630,6 +2630,7 @@ fn route_get(path: &str, qs: &str) -> Resp {
         "/api/logs" => api_logs(qs),
         "/api/matches" => api_matches(qs),
         "/api/verify" => api_verify(qs),
+        "/api/chain-status" => api_chain_status(),
         "/verify" => verify_page(qs),
         "/samples" => Resp::json(200, samples_json()),
         "/sample" => {
@@ -3008,7 +3009,7 @@ fn short_code(hash_hex: &str) -> String {
         bits += 8;
         while bits >= 5 {
             bits -= 5;
-            let idx = ((acc >> bits) & 0x1F) as usize;
+            let idx = (((acc >> bits) & 0x1F) as usize) % ALPHABET.len();
             out.push(ALPHABET[idx] as char);
         }
     }
@@ -3086,10 +3087,13 @@ fn qr_svg(data: &str) -> Result<String, String> {
     Ok(svg)
 }
 
-/// POST /api/validate — body is the canonical JSON of a result the user is
-/// confirming (title/authors/year/journal/doi/keywords/abstract + the
-/// sdgs matched). Server stamps a timestamp, hashes the whole thing with
-/// SHA-256, derives a short code from the hash, persists it to Turso, and
+/// POST /api/validate — body is JSON with the fields the user is
+/// confirming: `title`, `keywords`, `abstract`, `sdgs_matched` (array).
+/// Only these four are ever persisted — authors/year/journal/DOI and
+/// anything else in the submitted form are intentionally dropped before
+/// storage. The server stamps a timestamp, hashes the canonical minimal
+/// record with SHA-256, derives a short code, chains it onto the previous
+/// record's chain hash (tamper-evident log), persists it to Turso, and
 /// returns {code, hash, verify_url, qr_svg}.
 fn api_validate(headers: &[(String, String)], body: &[u8]) -> Resp {
     if !turso::enabled() {
@@ -3098,30 +3102,69 @@ fn api_validate(headers: &[(String, String)], body: &[u8]) -> Resp {
             "{\"error\":\"validation storage is not configured on this server (TURSO_DB_URL / TURSO_AUTH_TOKEN unset)\"}".to_string(),
         );
     }
-    let mut payload: serde_json::Value = match serde_json::from_slice(body) {
+    let payload: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(e) => return Resp::json(400, format!("{{\"error\":\"bad JSON body: {e}\"}}")),
     };
     if !payload.is_object() {
         return Resp::json(400, "{\"error\":\"body must be a JSON object\"}".to_string());
     }
+
+    // Keep only what we intend to store — strips everything else even if
+    // the client sent more (authors, year, journal, DOI, etc).
+    let title = payload.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let keywords = payload.get("keywords").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let abstract_text = payload.get("abstract").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let sdgs_matched: Vec<String> = payload
+        .get("sdgs_matched")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    if title.is_empty() && abstract_text.is_empty() {
+        return Resp::json(
+            400,
+            "{\"error\":\"nothing to validate: title and abstract are both empty\"}".to_string(),
+        );
+    }
+
     let uid = cookie_uid(headers).unwrap_or_default();
     let ts = epoch_ms() as i64;
-    payload["validated_at_ms"] = serde_json::json!(ts);
+    let sdgs_csv = sdgs_matched.join(",");
 
-    // Canonical (sorted-key) JSON so the same logical payload always hashes
-    // the same way regardless of field insertion order.
-    let canonical = canonical_json(&payload);
+    // Canonical minimal record — only the four fields we actually persist,
+    // in a fixed order — so the hash is reproducible from what's stored.
+    let canonical = canonical_json(&serde_json::json!({
+        "title": title,
+        "keywords": keywords,
+        "abstract": abstract_text,
+        "sdgs_matched": sdgs_matched,
+        "validated_at_ms": ts,
+    }));
     let hash = sha256_hex(canonical.as_bytes());
     let mut code = short_code(&hash);
 
+    // Hash-chain: each row commits to the previous row's chain hash, so an
+    // edit/deletion/reorder of any past row is detectable by recomputing
+    // the chain from genesis (see /api/chain-status), independent of this
+    // row's own content hash.
+    let prev_chain = match turso::latest_chain_hash() {
+        Ok(h) => h,
+        Err(e) => return Resp::json(502, format!("{{\"error\":\"could not read chain head: {}\"}}", jstr(&e))),
+    };
+    let mut chain_hash = sha256_hex(format!("{prev_chain}:{code}:{hash}:{ts}").as_bytes());
+
     // Astronomically unlikely, but guard against a short-code collision by
-    // trying a couple of salted variants before giving up.
+    // trying a couple of salted variants before giving up. The chain hash
+    // depends on `code`, so it's recomputed on every retry.
     for attempt in 0..3 {
-        match turso::insert_validation(&code, &hash, &canonical, ts, &uid) {
+        match turso::insert_validation(
+            &code, &hash, &title, &keywords, &abstract_text, &sdgs_csv,
+            &prev_chain, &chain_hash, ts, &uid,
+        ) {
             Ok(()) => break,
             Err(e) if e.to_lowercase().contains("unique") && attempt < 2 => {
                 code = short_code(&sha256_hex(format!("{hash}:{attempt}").as_bytes()));
+                chain_hash = sha256_hex(format!("{prev_chain}:{code}:{hash}:{ts}").as_bytes());
             }
             Err(e) => return Resp::json(502, format!("{{\"error\":\"could not store validation: {}\"}}", jstr(&e))),
         }
@@ -3163,9 +3206,11 @@ fn canonical_json(v: &serde_json::Value) -> String {
     }
 }
 
-/// GET /api/verify?code=XXXX-XXXXX — look up a validation and recompute its
-/// hash to prove the stored payload hasn't been altered since it was
-/// written. Returns 404 if the code is unknown.
+/// GET /api/verify?code=XXXX-XXXXX — look up a validation, recompute its
+/// content hash to prove the stored record hasn't been altered since it
+/// was written, and recompute its chain-link hash to prove its position in
+/// the log hasn't been displaced either. Returns 404 if the code is
+/// unknown.
 fn api_verify(qs: &str) -> Resp {
     if !turso::enabled() {
         return Resp::json(
@@ -3181,22 +3226,82 @@ fn api_verify(qs: &str) -> Resp {
     match turso::get_validation(&code) {
         Ok(None) => Resp::json(404, "{\"error\":\"no validation found for this code\"}".to_string()),
         Ok(Some(rec)) => {
-            let recomputed = sha256_hex(rec.payload.as_bytes());
-            let intact = recomputed == rec.hash;
-            let payload: serde_json::Value =
-                serde_json::from_str(&rec.payload).unwrap_or(serde_json::Value::Null);
+            let sdgs_matched: Vec<&str> = if rec.sdgs_matched_csv.is_empty() {
+                Vec::new()
+            } else {
+                rec.sdgs_matched_csv.split(',').collect()
+            };
+            let canonical = canonical_json(&serde_json::json!({
+                "title": rec.title,
+                "keywords": rec.keywords,
+                "abstract": rec.abstract_text,
+                "sdgs_matched": sdgs_matched,
+                "validated_at_ms": rec.created_at,
+            }));
+            let recomputed = sha256_hex(canonical.as_bytes());
+            let content_intact = recomputed == rec.hash;
+
+            let recomputed_chain =
+                sha256_hex(format!("{}:{}:{}:{}", rec.prev_chain_hash, rec.code, rec.hash, rec.created_at).as_bytes());
+            let chain_link_intact = recomputed_chain == rec.chain_hash;
+
             let out = serde_json::json!({
                 "code": rec.code,
                 "hash": rec.hash,
                 "recomputed_hash": recomputed,
-                "intact": intact,
+                "intact": content_intact,
+                "chain_link_intact": chain_link_intact,
                 "validated_at_ms": rec.created_at,
-                "payload": payload,
+                "title": rec.title,
+                "keywords": rec.keywords,
+                "abstract": rec.abstract_text,
+                "sdgs_matched": sdgs_matched,
+                "note": "Run GET /api/chain-status to confirm this record's position in the full log is unbroken (detects deletion/reordering of other records too).",
             });
             Resp::json(200, out.to_string())
         }
         Err(e) => Resp::json(502, format!("{{\"error\":{}}}", jstr(&e))),
     }
+}
+
+/// GET /api/chain-status — walk every validation record in insertion order
+/// and recompute the hash chain from genesis. Reports whether the whole
+/// log is unbroken, or the exact row where it first breaks (evidence of a
+/// row being edited, deleted, or reordered after the fact). Anyone can
+/// call this — no auth — since it only proves integrity, not content.
+fn api_chain_status() -> Resp {
+    if !turso::enabled() {
+        return Resp::json(
+            503,
+            "{\"error\":\"validation storage is not configured on this server\"}".to_string(),
+        );
+    }
+    let rows = match turso::all_rows_for_chain_check() {
+        Ok(r) => r,
+        Err(e) => return Resp::json(502, format!("{{\"error\":{}}}", jstr(&e))),
+    };
+    let mut expected_prev = turso::CHAIN_GENESIS.to_string();
+    let mut broken_at: Option<i64> = None;
+    for row in &rows {
+        if row.prev_chain_hash != expected_prev {
+            broken_at = Some(row.id);
+            break;
+        }
+        let expected_chain =
+            sha256_hex(format!("{}:{}:{}:{}", row.prev_chain_hash, row.code, row.hash, row.created_at).as_bytes());
+        if expected_chain != row.chain_hash {
+            broken_at = Some(row.id);
+            break;
+        }
+        expected_prev = row.chain_hash.clone();
+    }
+    let out = serde_json::json!({
+        "total_records": rows.len(),
+        "chain_intact": broken_at.is_none(),
+        "broken_at_id": broken_at,
+        "latest_chain_hash": rows.last().map(|r| r.chain_hash.clone()),
+    });
+    Resp::json(200, out.to_string())
 }
 
 /// GET /verify — a tiny standalone HTML page (code input + result) so a
@@ -3239,12 +3344,23 @@ async function doVerify() {{
       return;
     }}
     const dt = new Date(d.validated_at_ms).toLocaleString();
+    const bothIntact = d.intact && d.chain_link_intact;
+    const esc = s => String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
     el.innerHTML = '<div class="card"><p>' +
-      (d.intact ? '✅ <b>Verified</b> — this result was submitted and hashed on this server.' :
-                  '⚠️ <b>Hash mismatch</b> — stored record failed integrity check.') +
-      '</p><p class="small">Code: <code>' + d.code + '</code><br>Validated: ' + dt +
-      '<br>SHA-256: <code style="word-break:break-all">' + d.hash + '</code></p>' +
-      '<pre style="white-space:pre-wrap;font-size:12px">' + JSON.stringify(d.payload, null, 2) + '</pre></div>';
+      (bothIntact ? '✅ <b>Verified</b> — this result was submitted and hashed on this server, and its place in the tamper-evident log is unbroken.' :
+                  '⚠️ <b>Integrity check failed</b> — this record or its position in the log does not match what was originally committed.') +
+      '</p><p class="small">Code: <code>' + esc(d.code) + '</code><br>Validated: ' + dt +
+      '<br>Content hash intact: ' + (d.intact ? 'yes' : 'NO') +
+      '<br>Chain-link intact: ' + (d.chain_link_intact ? 'yes' : 'NO') +
+      '<br>SHA-256: <code style="word-break:break-all">' + esc(d.hash) + '</code></p>' +
+      '<div class="muted-text" style="margin-top:8px">' +
+      '<b>Title:</b> ' + esc(d.title) + '<br>' +
+      (d.keywords ? '<b>Keywords:</b> ' + esc(d.keywords) + '<br>' : '') +
+      (d.sdgs_matched && d.sdgs_matched.length ? '<b>SDGs matched:</b> ' + d.sdgs_matched.map(esc).join(', ') + '<br>' : '') +
+      '</div>' +
+      (d.abstract ? '<p class="small" style="margin-top:8px;white-space:pre-wrap">' + esc(d.abstract) + '</p>' : '') +
+      '<p class="small muted-text" style="margin-top:8px">' + esc(d.note) +
+      ' <a href="/api/chain-status" target="_blank" rel="noopener">Check full log integrity ↗</a></p></div>';
   }} catch (e) {{
     el.innerHTML = '<div class="error-box">✗ request failed: ' + e + '</div>';
   }}
