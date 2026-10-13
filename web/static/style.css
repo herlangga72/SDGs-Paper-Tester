@@ -201,3 +201,27 @@ button.kw.sug.copied .score { background:#b9e3b9; color:#256b25; }
 .flag.warn { color:#c98400; }
 
 select { background:#fff; }
+
+/* ---- Validate & Get QR Code panel ---- */
+#validate-panel { margin-top:18px; }
+.validate-card { padding:18px 20px; }
+.validate-card h3 { margin:0 0 6px; font-size:15px; }
+.validate-card .hint { margin:0 0 14px; }
+.validate-layout { display:flex; gap:20px; align-items:flex-start; flex-wrap:wrap; }
+.validate-qr { flex:none; background:#fff; padding:10px; border-radius:10px; border:1px solid var(--line); }
+.validate-qr svg { display:block; width:170px; height:170px; }
+.validate-details { flex:1; min-width:260px; display:flex; flex-direction:column; gap:12px; }
+.validate-field label { display:block; font-size:12px; font-weight:600; color:var(--muted); margin-bottom:4px; }
+.validate-copy-row { display:flex; gap:8px; }
+.validate-copy-row input { flex:1; border:1px solid var(--line); border-radius:9px; padding:9px 11px;
+       font-size:13px; font-family:ui-monospace,Menlo,monospace; background:#fbfcfe; color:var(--ink); min-width:0; }
+.validate-hash { font-family:ui-monospace,Menlo,monospace; font-size:11px; color:var(--muted); word-break:break-all; }
+.validate-open-link { font-size:12.5px; margin:0; }
+
+/* ---- standalone /verify page result card ---- */
+.verify-result { padding:18px 20px; margin-top:16px; }
+.verify-result .meta { margin-top:8px; }
+.verify-result .meta b { color:var(--ink); }
+.verify-result .hash-line { word-break:break-all; }
+.verify-result .abstract { margin-top:8px; white-space:pre-wrap; }
+.verify-result .footnote { margin-top:8px; }

@@ -3335,7 +3335,7 @@ async function doVerify() {{
   const code = document.getElementById('v-code').value.trim();
   const el = document.getElementById('v-result');
   if (!code) {{ el.innerHTML = ''; return; }}
-  el.innerHTML = '<div class="card"><p class="muted-text">checking…</p></div>';
+  el.innerHTML = '<div class="card verify-result"><p class="muted-text">checking…</p></div>';
   try {{
     const r = await fetch('/api/verify?code=' + encodeURIComponent(code));
     const d = await r.json();
@@ -3346,20 +3346,20 @@ async function doVerify() {{
     const dt = new Date(d.validated_at_ms).toLocaleString();
     const bothIntact = d.intact && d.chain_link_intact;
     const esc = s => String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-    el.innerHTML = '<div class="card"><p>' +
+    el.innerHTML = '<div class="card verify-result"><p>' +
       (bothIntact ? '✅ <b>Verified</b> — this result was submitted and hashed on this server, and its place in the tamper-evident log is unbroken.' :
                   '⚠️ <b>Integrity check failed</b> — this record or its position in the log does not match what was originally committed.') +
       '</p><p class="small">Code: <code>' + esc(d.code) + '</code><br>Validated: ' + dt +
       '<br>Content hash intact: ' + (d.intact ? 'yes' : 'NO') +
       '<br>Chain-link intact: ' + (d.chain_link_intact ? 'yes' : 'NO') +
-      '<br>SHA-256: <code style="word-break:break-all">' + esc(d.hash) + '</code></p>' +
-      '<div class="muted-text" style="margin-top:8px">' +
+      '<br>SHA-256: <code class="hash-line">' + esc(d.hash) + '</code></p>' +
+      '<div class="muted-text meta">' +
       '<b>Title:</b> ' + esc(d.title) + '<br>' +
       (d.keywords ? '<b>Keywords:</b> ' + esc(d.keywords) + '<br>' : '') +
       (d.sdgs_matched && d.sdgs_matched.length ? '<b>SDGs matched:</b> ' + d.sdgs_matched.map(esc).join(', ') + '<br>' : '') +
       '</div>' +
-      (d.abstract ? '<p class="small" style="margin-top:8px;white-space:pre-wrap">' + esc(d.abstract) + '</p>' : '') +
-      '<p class="small muted-text" style="margin-top:8px">' + esc(d.note) +
+      (d.abstract ? '<p class="small abstract">' + esc(d.abstract) + '</p>' : '') +
+      '<p class="small muted-text footnote">' + esc(d.note) +
       ' <a href="/api/chain-status" target="_blank" rel="noopener">Check full log integrity ↗</a></p></div>';
   }} catch (e) {{
     el.innerHTML = '<div class="error-box">✗ request failed: ' + e + '</div>';
