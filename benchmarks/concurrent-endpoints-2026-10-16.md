@@ -84,3 +84,37 @@ Ranges across the three repeats. Latency is ApacheBench's mean time per request.
 - This implementation changes socket acceptance only. Each accepted connection still runs the same synchronous handler on its own OS thread, so matching compute remains unchanged.
 - Results suggest better throughput under concurrency for `/match` and `/api/match` on this local run, with little or mixed change on lightweight routes. The benchmark is a single local host run with three repetitions and is not evidence of Render production capacity or a guaranteed gain.
 - The two builds were not interleaved; machine load and timing variation may account for some differences. Repeat on the deployed Render instance before making a production-performance claim.
+
+## io_uring rerun against the saved baseline
+
+**Run date:** 2026-10-16 17:26 UTC
+**Source revision:** `fccf589`
+**Build:** `cargo build --release --features io-uring --bin web`
+**Environment:** Same local Linux x86_64 host, Manjaro kernel `6.18.12-1-MANJARO`, 4 CPUs, ApacheBench 2.3.
+**Active backend:** Confirmed on `/health`: `X-IO-Backend: io_uring`, `X-IO-Platform: linux`, `X-SIMD-Usage: AVX2`; startup log says `io_uring accept backend active`.
+**Workload:** Exactly as the baseline: three repeats at concurrency 1/8/32, 300 requests per GET run and 90 per POST run, same fixtures. All 36 runs had 0 failed requests and 0 non-2xx responses.
+**Raw outputs:** `/home/server/.jcode/scratch/io-uring-rerun-2026-10-16/` (local scratch, not committed).
+
+Ranges across the three rerun repeats, compared with the original threaded ranges.
+
+| Route | Concurrency | Threaded throughput | Rerun io_uring throughput | Threaded mean latency | Rerun io_uring mean latency |
+|---|---:|---:|---:|---:|---:|
+| `GET /health` | 1 | 5,852.74–9,122.15 req/s | 7,888.51–9,651.58 req/s | 0.110–0.171 ms | 0.104–0.127 ms |
+| `GET /health` | 8 | 11,042.40–21,570.32 req/s | 15,046.64–21,284.14 req/s | 0.371–0.724 ms | 0.376–0.532 ms |
+| `GET /health` | 32 | 13,778.53–17,045.45 req/s | 15,890.67–17,472.34 req/s | 1.877–2.322 ms | 1.831–2.014 ms |
+| `POST /match` | 1 | 45.19–49.95 req/s | 52.16–52.17 req/s | 20.020–22.131 ms | 19.167–19.173 ms |
+| `POST /match` | 8 | 121.48–149.86 req/s | 136.95–149.48 req/s | 53.384–65.855 ms | 53.519–58.418 ms |
+| `POST /match` | 32 | 143.38–149.33 req/s | 145.58–153.61 req/s | 214.291–223.189 ms | 208.322–219.804 ms |
+| `POST /api/match` | 1 | 19.23–20.59 req/s | 21.54–21.60 req/s | 48.572–51.996 ms | 46.295–46.428 ms |
+| `POST /api/match` | 8 | 56.46–62.28 req/s | 55.92–56.32 req/s | 128.444–141.687 ms | 142.034–143.068 ms |
+| `POST /api/match` | 32 | 47.77–53.44 req/s | 50.84–56.47 req/s | 598.772–669.941 ms | 566.720–629.487 ms |
+| `POST /api/keywords` | 1 | 689.02–1,577.59 req/s | 1,423.01–1,601.59 req/s | 0.634–1.451 ms | 0.624–0.703 ms |
+| `POST /api/keywords` | 8 | 3,660.32–4,274.32 req/s | 2,920.37–3,892.57 req/s | 1.872–2.186 ms | 2.055–2.739 ms |
+| `POST /api/keywords` | 32 | 2,719.03–3,240.09 req/s | 3,277.85–3,829.79 req/s | 9.876–11.769 ms | 8.356–9.762 ms |
+
+### Rerun interpretation
+
+- This is not a consistent across-the-board speedup. `/match` at concurrency 8 and 32 substantially overlaps the threaded range. `/api/match` at concurrency 8 has slightly lower throughput and higher mean latency, while concurrency 1 and 32 are modestly better. `/api/keywords` at concurrency 8 has a wider, slower range, and concurrency 32 is faster in this rerun.
+- Lightweight health results overlap substantially. Small differences can come from host noise and ApacheBench timing. The earlier feature run had more favorable match-route numbers, so repeat-to-repeat variation is material.
+- Both feature runs use one local host with three repetitions; no Render deployment comparison was performed. This accept-only io_uring backend still uses one OS thread and synchronous processing per connection, so CPU-bound matching is unchanged.
+- Current evidence shows no benchmark failures and modest/mixed performance differences, not a robust general performance win. A production decision should be based on repeated measurements on Render with representative traffic.
