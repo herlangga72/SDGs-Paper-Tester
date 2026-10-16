@@ -1,4 +1,4 @@
-# Concurrent endpoint benchmark: threaded baseline
+# Concurrent endpoint benchmark: threaded baseline and io_uring comparison
 
 **Run date:** 2026-10-16  
 **Source revision:** `846c92a` (before server-code changes)  
@@ -53,6 +53,34 @@ ab -n 90 -c "$C" -s 30 -l -p benchmarks/fixtures/keywords-form.txt -T applicatio
 - Existing compiler warnings in `rust/src/matcher.rs` at lines 2227 and 2235 report unused assignments to `best`; they predate the io_uring work.
 - All endpoint benchmark responses returned successfully. The startup/server log confirmed normal startup and no listener failure.
 
-## io_uring comparison status
+## io_uring-enabled comparison
 
-Not measured in this baseline run because the io_uring implementation has not yet been added. Results for the feature-enabled binary will be appended after implementation and runtime probing.
+**Run date:** 2026-10-16
+**Build:** `cargo build --release --features io-uring --bin web`
+**Active backend:** Confirmed `X-IO-Backend: io_uring`; startup log reported `io_uring accept backend active`.
+**Workload:** Identical routes, fixtures, request counts, concurrency values, and three repeats per case as the threaded baseline. All 36 runs reported 0 failed requests.
+**Raw outputs:** `/home/server/.jcode/scratch/io-uring-enabled/` (local scratch, not committed).
+
+Ranges across the three repeats. Latency is ApacheBench's mean time per request. Baseline values are repeated here for direct comparison.
+
+| Route | Concurrency | Threaded throughput (req/s) | io_uring throughput (req/s) | Threaded mean latency | io_uring mean latency |
+|---|---:|---:|---:|---:|---:|
+| `GET /health` | 1 | 5,852.74–9,122.15 | 6,678.39–10,010.68 | 0.110–0.171 ms | 0.100–0.150 ms |
+| `GET /health` | 8 | 11,042.40–21,570.32 | 20,701.08–22,258.50 | 0.371–0.724 ms | 0.359–0.386 ms |
+| `GET /health` | 32 | 13,778.53–17,045.45 | 12,433.17–19,612.97 | 1.877–2.322 ms | 1.632–2.574 ms |
+| `POST /match` | 1 | 45.19–49.95 | 44.30–49.44 | 20.020–22.131 ms | 20.225–22.571 ms |
+| `POST /match` | 8 | 121.48–149.86 | 171.35–175.15 | 53.384–65.855 ms | 45.675–46.687 ms |
+| `POST /match` | 32 | 143.38–149.33 | 175.03–180.39 | 214.291–223.189 ms | 177.392–182.821 ms |
+| `POST /api/match` | 1 | 19.23–20.59 | 20.13–21.71 | 48.572–51.996 ms | 46.066–49.669 ms |
+| `POST /api/match` | 8 | 56.46–62.28 | 63.03–63.81 | 128.444–141.687 ms | 125.363–126.932 ms |
+| `POST /api/match` | 32 | 47.77–53.44 | 62.48–65.10 | 598.772–669.941 ms | 491.558–512.171 ms |
+| `POST /api/keywords` | 1 | 689.02–1,577.59 | 1,194.60–1,644.95 | 0.634–1.451 ms | 0.608–0.837 ms |
+| `POST /api/keywords` | 8 | 3,660.32–4,274.32 | 3,639.01–4,455.89 | 1.872–2.186 ms | 1.795–2.198 ms |
+| `POST /api/keywords` | 32 | 2,719.03–3,240.09 | 2,363.26–4,284.49 | 9.876–11.769 ms | 7.469–13.541 ms |
+
+### Interpretation and limitations
+
+- The io_uring run selected the real io_uring accept path on this Linux host, rather than silently exercising fallback.
+- This implementation changes socket acceptance only. Each accepted connection still runs the same synchronous handler on its own OS thread, so matching compute remains unchanged.
+- Results suggest better throughput under concurrency for `/match` and `/api/match` on this local run, with little or mixed change on lightweight routes. The benchmark is a single local host run with three repetitions and is not evidence of Render production capacity or a guaranteed gain.
+- The two builds were not interleaved; machine load and timing variation may account for some differences. Repeat on the deployed Render instance before making a production-performance claim.

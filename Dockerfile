@@ -34,7 +34,7 @@ ENV CARGO_PROFILE_RELEASE_LTO=thin \
 # cannot snapshot a mount into a layer, so COPY it into a plain path first.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
-    cargo build --release --bin web && \
+    cargo build --release --features io-uring --bin web && \
     cp /build/target/release/web /build/web-bin
 
 FROM debian:bookworm-slim

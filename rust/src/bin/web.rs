@@ -27,6 +27,8 @@ use sdg_tools::simd::find;
 
 #[path = "web_support/turso.rs"]
 mod turso;
+#[path = "web_support/io_backend.rs"]
+mod io_backend;
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -3491,12 +3493,14 @@ fn handle_conn(stream: &mut TcpStream) {
     let mut out = Vec::with_capacity(resp.body.len() + 256);
     let mut head = format!(
         "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\
-         Cache-Control: no-store\r\nX-SIMD-Usage: {}\r\n",
+         Cache-Control: no-store\r\nX-SIMD-Usage: {}\r\nX-IO-Backend: {}\r\nX-IO-Platform: {}\r\n",
         resp.code,
         resp.reason,
         resp.ctype,
         resp.body.len(),
-        sdg_tools::simd::dispatch_name()
+        sdg_tools::simd::dispatch_name(),
+        io_backend::active_backend_name(),
+        std::env::consts::OS
     );
     for (k, v) in &resp.headers {
         head.push_str(&format!("{k}: {v}\r\n"));
@@ -3657,22 +3661,17 @@ fn main() {
         open_browser(&url);
     }
 
-    for stream in listener.incoming() {
-        match stream {
-            Ok(s) => {
-                std::thread::spawn(move || {
-                    let mut s = s;
-                    // A panicking handler must never take down the accept loop.
-                    // The panic hook reports to Sentry first; the thread then
-                    // dies exactly as it did before.
-                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        handle_conn(&mut s);
-                    }));
-                });
-            }
-            Err(e) => eprintln!("[web] accept error: {e}"),
-        }
+    let backend = io_backend::detect_backend();
+    let backend_kind = backend.kind();
+    eprintln!(
+        "[web] IO backend: {} on {}",
+        backend_kind.name(),
+        std::env::consts::OS
+    );
+    if let Some(reason) = backend.fallback_reason() {
+        eprintln!("[web] io_uring fallback reason: {reason}");
     }
+    io_backend::run_selected(listener, backend, handle_conn)
 }
 
 // ---------------------------------------------------------------------------
