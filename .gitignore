@@ -10,6 +10,9 @@ engine/data/sdg_queries.sqlite3
 target/
 rust/target/
 
+# Agent worktrees
+.worktrees/
+
 # OS junk
 .DS_Store
 Thumbs.db
