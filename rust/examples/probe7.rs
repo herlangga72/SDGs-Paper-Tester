@@ -22,8 +22,8 @@ fn main() {
     let mut scr = matcher::MinAddScratch::default();
 
     for (bi, f) in flats.iter().enumerate() {
-        let _ = matcher::scan_flat(f, &table, &mut memo);
-        let (_, cost) = matcher::min_add_flat_cost(f, &table, &mut memo, &mut scr);
+        let _ = matcher::scan_flat(f, &table, &memo);
+        let (_, cost) = matcher::min_add_flat_cost(f, &table, &memo, &mut scr);
         use std::sync::atomic::Ordering;
         matcher::DBG_OPS.store(0, Ordering::Relaxed);
         matcher::DBG_UNION_KW.store(0, Ordering::Relaxed);
@@ -31,7 +31,7 @@ fn main() {
         matcher::DBG_AND_GROUPS.store(0, Ordering::Relaxed);
         matcher::DBG_FP_HITS.store(0, Ordering::Relaxed);
         let t = Instant::now();
-        let ma = matcher::min_add_flat(f, &table, &mut memo, &mut scr);
+        let ma = matcher::min_add_flat(f, &table, &memo, &mut scr);
         let dt = t.elapsed().as_secs_f64() * 1000.0;
         let nkw: usize = ma.need.iter().map(|g| g.len()).sum();
         println!("SDG07 block {bi}: prog={} cost={} need={:.2}ms groups={} kw={nkw} ops={} unions={} union_kw={} and_groups={} fp_hits={}",

@@ -11,7 +11,7 @@ fn main() {
     matcher::rebuild_first_quads(data.patterns);
     let q1 = data.queries.iter().find(|q| q.sdg == "01").unwrap();
     let mut memo = matcher::Memo::new(&paper, 0);
-    let (scan, matched) = matcher::scan_block_shared(&q1.blocks[3], &paper, data.patterns, &mut memo);
+    let (scan, matched) = matcher::scan_block_shared(&q1.blocks[3], &paper, data.patterns, &memo);
     println!("scan: matched={matched} hits={}", scan.hits.len());
     // walk leaves: node keyword, pid, pattern raw, term verdict (fresh eval)
     let mut leaves: Vec<(String, u32, String, bool)> = Vec::new();

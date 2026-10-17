@@ -4,7 +4,8 @@ use crate::ast::Node;
 use crate::paper::{Paper, ALL_FIELDS, F_ANY};
 use crate::simd::find;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Dev-only counting instrumentation and experiment toggles (feature `prof`).
 #[cfg(feature = "prof")]
@@ -670,6 +671,9 @@ pub fn compile_all<'a>(blocks: impl Iterator<Item = &'a Node>) -> Vec<Pattern> {
             }
         }
     }
+    // Publish the pattern high-water mark so `Memo::new` can pre-size the
+    // (pid, buffer) verdict matrix.
+    GLOBAL_NPIDS.fetch_max(table.len(), Ordering::Relaxed);
     table
 }
 /// Stamp every leaf with its pattern index, effective field mask, and dense
@@ -736,6 +740,10 @@ pub fn resolve_blocks(blocks: &mut [Node], table: &[Pattern], nslots: &mut u32) 
     for b in blocks {
         assign(b, default_mask, &map, &mut slot_of, &mut *nslots);
     }
+    // Publish the slot high-water mark so later `Memo::new` calls pre-size
+    // the term cache instead of growing it while matching (which must never
+    // happen once a memo is shared across worker threads).
+    GLOBAL_NSLOTS.fetch_max(*nslots as usize, Ordering::Relaxed);
     *nslots as usize
 }
 
@@ -1039,18 +1047,37 @@ fn field_mask_from_strings(fields: &[String]) -> u8 {
 /// full-covers-sections full text) and are not buffer-decomposable, so they
 /// bypass the gate.
 pub struct Memo<'a> {
-    terms: Vec<u8>,
+    /// Tri-state (0 = unset, 1 = false, 2 = true) verdict per `(pid, mask)`
+    /// slot. Per-memo (NOT shared): it is a cheap cache over `shared`'s
+    /// (pid, buffer) verdicts, so giving every worker thread its own copy
+    /// removes the highest-frequency atomic traffic (one load per leaf push)
+    /// without duplicating any real search work.
+    terms: Vec<AtomicU8>,
     bufs: [&'a [u8]; 5],
     field_buf: [u8; 4],
     full_id: u8,
     full_covers_sections: bool,
     full_segs: [(usize, usize); 4],
-    /// Shared, lazily built presence index per deduplicated buffer id.
-    buf_idx: Vec<Option<Box<TextIndex>>>,
-    /// Tri-state (0 = unset, 1 = false, 2 = true) verdict per (pid, buffer)
-    /// pair, row-major over pid with `BUFS` cells per row.
-    buf_hits: Vec<u8>,
+    /// Expensive, request-wide state shared by every worker thread.
+    shared: Arc<SharedVerdicts>,
 }
+
+/// The search results a request memoizes: per-buffer presence indexes and the
+/// (pid, buffer) verdict matrix. Both are pure functions of `(pattern,
+/// buffer)`, so sharing them across threads removes duplicated searches
+/// while remaining race-safe (all writers store the same value).
+pub struct SharedVerdicts {
+    /// Lazily built presence index per deduplicated buffer id. `OnceLock`
+    /// lets concurrent workers agree on one build.
+    buf_idx: Vec<OnceLock<Box<TextIndex>>>,
+    /// Tri-state (0 = unset, 1 = false, 2 = true) verdict per (pid, buffer)
+    /// pair, row-major over pid with `MAX_BUFS` cells per row.
+    buf_hits: Vec<AtomicU8>,
+}
+
+// `SharedVerdicts` holds only `OnceLock`/`AtomicU8` cells and an immutable
+// per-buffer index, so sharing it across worker threads is sound: concurrent
+// writers always store the same verdict for a given (pattern, buffer).
 
 /// Max deduplicated buffers per request (full text + 4 fields).
 const MAX_BUFS: usize = 5;
@@ -1068,9 +1095,16 @@ fn push_dedup<'b>(bufs: &mut [&'b [u8]; 5], nb: &mut usize, t: &'b [u8]) -> u8 {
     (*nb - 1) as u8
 }
 
+/// Global high-water marks set at boot, used to pre-size the per-request
+/// memo caches so the hot path never has to grow them (which would be unsafe
+/// once a memo is shared across threads).
+static GLOBAL_NSLOTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static GLOBAL_NPIDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 impl<'a> Memo<'a> {
-    /// `nslots` is the global slot count returned by `resolve_blocks` (0 if
-    /// unknown; the terms vec then grows on demand).
+    /// `nslots` is the global slot count returned by `resolve_blocks`. The
+    /// caches are pre-sized from the boot high-water marks (`nslots` and the
+    /// pattern count), so no allocation happens while matching.
     pub fn new(paper: &'a Paper, nslots: u32) -> Memo<'a> {
         let mut bufs: [&'a [u8]; 5] = [&[]; 5];
         let mut nb = 0usize;
@@ -1079,15 +1113,37 @@ impl<'a> Memo<'a> {
         for f in 0..4u8 {
             field_buf[f as usize] = push_dedup(&mut bufs, &mut nb, paper.text_lower(f));
         }
+        let nterms = (nslots as usize)
+            .max(GLOBAL_NSLOTS.load(Ordering::Relaxed))
+            .max(1);
+        let npids = GLOBAL_NPIDS.load(Ordering::Relaxed);
         Memo {
-            terms: vec![0; nslots as usize],
+            terms: (0..nterms).map(|_| AtomicU8::new(0)).collect(),
             bufs,
             field_buf,
             full_id,
             full_covers_sections: paper.full_covers_sections,
             full_segs: paper.full_section_ranges(),
-            buf_idx: std::iter::repeat_with(|| None).take(nb).collect(),
-            buf_hits: Vec::new(),
+            shared: Arc::new(SharedVerdicts {
+                buf_idx: std::iter::repeat_with(OnceLock::new).take(nb).collect(),
+                buf_hits: (0..npids * MAX_BUFS).map(|_| AtomicU8::new(0)).collect(),
+            }),
+        }
+    }
+
+    /// A worker-thread view of this memo: same buffers and the same shared
+    /// (pid, buffer) verdict matrix, but a fresh per-thread `(pid, mask)`
+    /// cache. Duplicated searches are impossible; only the cheap OR-over-
+    /// buffers step may be redone once per thread.
+    pub fn fork(&self) -> Memo<'a> {
+        Memo {
+            terms: (0..self.terms.len()).map(|_| AtomicU8::new(0)).collect(),
+            bufs: self.bufs,
+            field_buf: self.field_buf,
+            full_id: self.full_id,
+            full_covers_sections: self.full_covers_sections,
+            full_segs: self.full_segs,
+            shared: Arc::clone(&self.shared),
         }
     }
 
@@ -1122,35 +1178,31 @@ impl<'a> Memo<'a> {
     /// Search one `(pid, buffer)` pair (uncached) and record its tri-state
     /// verdict so every mask that selects this buffer reads a boolean
     /// instead of re-running the filter + SIMD search.
-    fn buffer_verdict(&mut self, pid: usize, bid: u8, pat: &Pattern) -> bool {
+    fn buffer_verdict(&self, pid: usize, bid: u8, pat: &Pattern) -> bool {
         let cell = pid * MAX_BUFS + bid as usize;
-        if self.buf_hits.len() <= cell {
-            // Grow row-major to cover this pid (resize keeps tri-state 0
-            // = unset for untouched cells).
-            self.buf_hits.resize(cell + 1, 0);
-        }
-        match self.buf_hits[cell] {
-            1 => return false,
-            2 => return true,
-            _ => {}
+        let cell_ref = self.shared.buf_hits.get(cell);
+        if let Some(c) = cell_ref {
+            match c.load(Ordering::Relaxed) {
+                1 => return false,
+                2 => return true,
+                _ => {}
+            }
         }
         let v = self.search_buffer(bid, pat);
-        self.buf_hits[cell] = if v { 2 } else { 1 };
+        if let Some(c) = cell_ref {
+            c.store(if v { 2 } else { 1 }, Ordering::Relaxed);
+        }
         v
     }
 
     /// Pre-filter + search of `pat` against one deduplicated buffer using
     /// its shared `TextIndex` (built once per buffer per request).
-    fn search_buffer(&mut self, bid: u8, pat: &Pattern) -> bool {
+    fn search_buffer(&self, bid: u8, pat: &Pattern) -> bool {
         let b = self.bufs[bid as usize];
         if b.is_empty() {
             return false;
         }
-        let id = bid as usize;
-        if self.buf_idx[id].is_none() {
-            self.buf_idx[id] = Some(Box::new(TextIndex::build(b)));
-        }
-        let idx = self.buf_idx[id].as_deref().unwrap();
+        let idx = self.shared.buf_idx[bid as usize].get_or_init(|| Box::new(TextIndex::build(b)));
         // Filter first: if a literal part is absent from this buffer, the
         // SIMD search is guaranteed to fail here.
         #[cfg(feature = "prof")]
@@ -1205,7 +1257,7 @@ impl<'a> Memo<'a> {
     /// memoized at dense `slot`. The mask and slot are both precomputed and
     /// stamped on the leaf by `resolve_blocks`, so the caller passes them
     /// straight through.
-    fn term_hit(&mut self, pat: &Pattern, pid: usize, mask: u8, slot: usize) -> bool {
+    fn term_hit(&self, pat: &Pattern, pid: usize, mask: u8, slot: usize) -> bool {
         #[cfg(feature = "prof")]
         {
             use std::sync::atomic::Ordering;
@@ -1214,8 +1266,8 @@ impl<'a> Memo<'a> {
         // 0 = unset. A slot present but still 0 is NOT a cached verdict, so
         // recompute (slots are global across all blocks, and traversal may
         // visit a high slot before a lower one).
-        if slot < self.terms.len() {
-            match self.terms[slot] {
+        if let Some(c) = self.terms.get(slot) {
+            match c.load(Ordering::Relaxed) {
                 1 => {
                     #[cfg(feature = "prof")]
                     {
@@ -1241,10 +1293,9 @@ impl<'a> Memo<'a> {
             prof::TERM_COMPUTES.fetch_add(1, Ordering::Relaxed);
         }
         let v = self.compute(pat, pid, mask);
-        if slot >= self.terms.len() {
-            self.terms.resize(slot + 1, 0);
+        if let Some(c) = self.terms.get(slot) {
+            c.store(if v { 2 } else { 1 }, Ordering::Relaxed);
         }
-        self.terms[slot] = if v { 2 } else { 1 };
         v
     }
 
@@ -1256,7 +1307,7 @@ impl<'a> Memo<'a> {
     /// Skipping the boolean VM and the classification pushes is significantly
     /// cheaper than `scan_flat_into` when only presence matters.
     #[inline]
-    pub fn leaf_hit(&mut self, pat: &Pattern, pid: u32, mask: u8, slot: u32) -> bool {
+    pub fn leaf_hit(&self, pat: &Pattern, pid: u32, mask: u8, slot: u32) -> bool {
         self.term_hit(pat, pid as usize, mask, slot as usize)
     }
 
@@ -1267,7 +1318,7 @@ impl<'a> Memo<'a> {
     /// semantics are context-dependent; they run per selected buffer (per
     /// section range when the sole selection is a full-covers-sections full
     /// text).
-    fn compute(&mut self, pat: &Pattern, pid: usize, mask: u8) -> bool {
+    fn compute(&self, pat: &Pattern, pid: usize, mask: u8) -> bool {
         // A zero mask means "no field scoping" -> the default TITLE-ABS-KEY.
         let mask = if mask == 0 { field_mask(&ALL_FIELDS) } else { mask };
         let (ids, n) = self.select(mask);
@@ -1294,10 +1345,10 @@ fn pat<'a>(table: &'a [Pattern], node: &Node) -> &'a Pattern {
 /// NOT > AND/W-n > OR; W/n requires presence only).
 pub fn eval(node: &Node, fields: Option<&[u8]>, paper: &Paper, table: &[Pattern]) -> bool {
     let mut memo = Memo::new(paper, 0);
-    eval_memo(node, field_mask(fields.unwrap_or(&ALL_FIELDS)), table, &mut memo)
+    eval_memo(node, field_mask(fields.unwrap_or(&ALL_FIELDS)), table, &memo)
 }
 
-fn eval_memo(node: &Node, mask: u8, table: &[Pattern], memo: &mut Memo) -> bool {
+fn eval_memo(node: &Node, mask: u8, table: &[Pattern], memo: &Memo) -> bool {
     match node {
         Node::Leaf { pid, mask, slot, .. } => {
             let p = pat(table, node);
@@ -1525,7 +1576,7 @@ impl BoolStack {
 pub fn scan_flat<'a, 'b>(
     flat: &'b FlatBlock,
     table: &[Pattern],
-    memo: &mut Memo<'a>,
+    memo: &Memo<'a>,
 ) -> (Vec<(&'b str, u8)>, Vec<(&'b str, u8)>, Vec<&'b str>, bool) {
     let mut hits = Vec::new();
     let mut misses = Vec::new();
@@ -1539,7 +1590,7 @@ pub fn scan_flat<'a, 'b>(
 pub fn scan_flat_into<'a, 'b>(
     flat: &'b FlatBlock,
     table: &[Pattern],
-    memo: &mut Memo<'a>,
+    memo: &Memo<'a>,
     hits: &mut Vec<(&'b str, u8)>,
     misses: &mut Vec<(&'b str, u8)>,
     ex_hits: &mut Vec<&'b str>,
@@ -1619,7 +1670,7 @@ fn field_mask(fields: &[u8]) -> u8 {
 /// Per-keyword detail for a block: include terms hit/missed, excluded terms hit.
 pub fn scan_block(block: &Node, paper: &Paper, table: &[Pattern]) -> BlockScan {
     let mut memo = Memo::new(paper, 0);
-    scan_block_shared(block, paper, table, &mut memo).0
+    scan_block_shared(block, paper, table, &memo).0
 }
 
 /// `scan_block` with a caller-owned `Memo` (share it across all blocks of a
@@ -1629,7 +1680,7 @@ pub fn scan_block_shared<'a>(
     block: &Node,
     _paper: &'a Paper,
     table: &[Pattern],
-    memo: &mut Memo<'a>,
+    memo: &Memo<'a>,
 ) -> (BlockScan, bool) {
     let mut out = BlockScan { hits: Vec::new(), misses: Vec::new(), excluded_hits: Vec::new() };
 
@@ -1673,7 +1724,7 @@ pub struct MinAdd {
 /// overwhelming majority of OR/AND children) return `(keyword, hit)` without
 /// allocating a `MinAdd`. This avoids the per-leaf vector allocations that
 /// dominated large blocks (e.g. SDG07's giant lists).
-fn leaf_kw_hit(node: &Node, _mask: u8, table: &[Pattern], memo: &mut Memo) -> Option<(&'static str, bool)> {
+fn leaf_kw_hit(node: &Node, _mask: u8, table: &[Pattern], memo: &Memo) -> Option<(&'static str, bool)> {
     let (leaf, lm): (&Node, u8) = match node {
         Node::Leaf { mask: m, .. } => (node, *m),
         Node::Field { fields, child } => match child.as_ref() {
@@ -1707,7 +1758,7 @@ fn group_fp(g: &[&'static str]) -> u64 {
     h
 }
 
-fn min_add(node: &Node, mask: u8, table: &[Pattern], memo: &mut Memo) -> MinAdd {
+fn min_add(node: &Node, mask: u8, table: &[Pattern], memo: &Memo) -> MinAdd {
     match node {
         Node::Leaf { pid, mask: lm, slot, .. } => {
             let p = pat(table, node);
@@ -1949,7 +2000,7 @@ fn group_fp_slice(kw: &[&'static str], start: u32, len: u32) -> u64 {
 pub fn min_add_flat_cost(
     flat: &FlatBlock,
     table: &[Pattern],
-    memo: &mut Memo,
+    memo: &Memo,
     scr: &mut MinAddScratch,
 ) -> (bool, u32) {
     scr.pairs.clear();
@@ -2038,7 +2089,7 @@ pub fn min_add_flat_cost(
 pub fn min_add_flat(
     flat: &FlatBlock,
     table: &[Pattern],
-    memo: &mut Memo,
+    memo: &Memo,
     scr: &mut MinAddScratch,
 ) -> MinAdd {
     scr.eval.clear();
@@ -2331,7 +2382,7 @@ impl MinAddScratch {
 pub fn min_add_block<'a>(
     block: &Node,
     table: &[Pattern],
-    memo: &mut Memo<'a>,
+    memo: &Memo<'a>,
 ) -> MinAdd {
     min_add(block, field_mask(&ALL_FIELDS), table, memo)
 }
@@ -2339,7 +2390,7 @@ pub fn min_add_block<'a>(
 /// (value, cost) twin with NO allocations: the fast path used to rerank all
 /// non-matching blocks. The `need` groups are only materialized afterwards
 /// for the blocks that make the displayed list (see `min_add_block`).
-fn min_add_vc(node: &Node, mask: u8, table: &[Pattern], memo: &mut Memo) -> (bool, usize) {
+fn min_add_vc(node: &Node, mask: u8, table: &[Pattern], memo: &Memo) -> (bool, usize) {
     match node {
         Node::Leaf { pid, mask: lm, slot, .. } => {
             let v = memo.term_hit(pat(table, node), *pid as usize, *lm, *slot as usize);
@@ -2390,7 +2441,7 @@ fn min_add_vc(node: &Node, mask: u8, table: &[Pattern], memo: &mut Memo) -> (boo
 pub fn min_add_block_cost<'a>(
     block: &Node,
     table: &[Pattern],
-    memo: &mut Memo<'a>,
+    memo: &Memo<'a>,
 ) -> usize {
     min_add_vc(block, field_mask(&ALL_FIELDS), table, memo).1
 }
@@ -2405,9 +2456,9 @@ pub fn min_add_block_cost<'a>(
 pub fn eval_ignore_not_block<'a>(
     block: &Node,
     table: &[Pattern],
-    memo: &mut Memo<'a>,
+    memo: &Memo<'a>,
 ) -> bool {
-    fn go(node: &Node, mask: u8, table: &[Pattern], memo: &mut Memo) -> bool {
+    fn go(node: &Node, mask: u8, table: &[Pattern], memo: &Memo) -> bool {
         match node {
             Node::Leaf { pid, mask: lm, slot, .. } => {
                 memo.term_hit(pat(table, node), *pid as usize, *lm, *slot as usize)
@@ -2787,7 +2838,7 @@ pub fn scan_with_fields<'a>(
     block: &Node,
     _paper: &'a Paper,
     table: &[Pattern],
-    memo: &mut Memo<'a>,
+    memo: &Memo<'a>,
 ) -> (Vec<(&'static str, u8)>, Vec<(&'static str, u8)>, Vec<&'static str>, bool) {
     let mut hits = Vec::new();
     let mut misses = Vec::new();
@@ -2801,7 +2852,7 @@ fn rec_fields(
     mask: u8,
     excluded: bool,
     table: &[Pattern],
-    memo: &mut Memo,
+    memo: &Memo,
     hits: &mut Vec<(&'static str, u8)>,
     misses: &mut Vec<(&'static str, u8)>,
     ex_hits: &mut Vec<&'static str>,
@@ -2898,7 +2949,7 @@ fn rec(
     mask: u8,
     excluded: bool,
     table: &[Pattern],
-    memo: &mut Memo,
+    memo: &Memo,
     out: &mut BlockScan,
 ) -> bool {
     match node {
@@ -3211,8 +3262,8 @@ mod tests {
             let mut memo = Memo::new(&paper, 0);
             for (qi, q) in queries.iter().enumerate() {
                 for (bi, b) in q.blocks.iter().enumerate() {
-                    let ast = scan_with_fields(b, &paper, &table, &mut memo);
-                    let flat = scan_flat(&flats[qi][bi], &table, &mut memo);
+                    let ast = scan_with_fields(b, &paper, &table, &memo);
+                    let flat = scan_flat(&flats[qi][bi], &table, &memo);
 
                     assert_eq!(flat.3, ast.3, "verdict mismatch {p} q{qi} b{bi}");
                     assert_eq!(flat.0, ast.0, "hits mismatch {p} q{qi} b{bi}");
@@ -3261,8 +3312,8 @@ This is the body. It discusses carbon markets and debt relief at length.";
         let mut memo = Memo::new(&paper, nslots);
         for (qi, q) in queries.iter().enumerate() {
             for (bi, b) in q.blocks.iter().enumerate() {
-                let ast = scan_with_fields(b, &paper, &table, &mut memo);
-                let flat = scan_flat(&flats[qi][bi], &table, &mut memo);
+                let ast = scan_with_fields(b, &paper, &table, &memo);
+                let flat = scan_flat(&flats[qi][bi], &table, &memo);
                 assert_eq!(flat.3, ast.3, "verdict mismatch q{qi} b{bi}");
                 assert_eq!(
                     flat.0.iter().map(|(s, m)| ((*s).to_owned(), *m)).collect::<Vec<_>>(),
@@ -3291,7 +3342,7 @@ This is the body. It discusses carbon markets and debt relief at length.";
         resolve_blocks(&mut q.blocks, &table2, &mut nslots2);
         let f = flatten_block(&q.blocks[0], &table2);
         let mut memo2 = Memo::new(&paper, nslots2);
-        assert!(!scan_flat(&f, &table2, &mut memo2).3, "body text leaked into TITLE scope");
+        assert!(!scan_flat(&f, &table2, &memo2).3, "body text leaked into TITLE scope");
     }
 
     /// `matches_indexed` (quad positions) must agree with `matches` (full
@@ -3395,8 +3446,8 @@ This is the body. It discusses carbon markets and debt relief at length.";
             let mut memo = Memo::new(&paper, nslots);
             for (qi, q) in queries.iter().enumerate() {
                 for (bi, b) in q.blocks.iter().enumerate() {
-                    let ast = scan_with_fields(b, &paper, &table, &mut memo);
-                    let flat = scan_flat(&flats[qi][bi], &table, &mut memo);
+                    let ast = scan_with_fields(b, &paper, &table, &memo);
+                    let flat = scan_flat(&flats[qi][bi], &table, &memo);
                     assert_eq!(flat.3, ast.3, "{label}: verdict mismatch q{qi} b{bi}");
                     assert_eq!(
                         flat.0.iter().map(|(s, m)| ((*s).to_owned(), *m)).collect::<Vec<_>>(),
@@ -3578,8 +3629,8 @@ abstract: |
             let mut memo = Memo::new(&p, nslots);
             for (qi, q) in queries.iter().enumerate() {
                 for (bi, b) in q.blocks.iter().enumerate() {
-                    let ast = scan_with_fields(b, &p, &table, &mut memo);
-                    let flat = scan_flat(&flats[qi][bi], &table, &mut memo);
+                    let ast = scan_with_fields(b, &p, &table, &memo);
+                    let flat = scan_flat(&flats[qi][bi], &table, &memo);
                     assert_eq!(flat.3, ast.3, "trial {trials} q{qi} b{bi}: verdict");
                     assert_eq!(
                         flat.0.iter().map(|(s, m)| ((*s).to_owned(), *m)).collect::<Vec<_>>(),

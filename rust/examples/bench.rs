@@ -27,7 +27,7 @@ fn main() {
         let mut matched = 0;
         for q in &flats {
             for b in q {
-                if matcher::scan_flat(b, &table, &mut memo).3 {
+                if matcher::scan_flat(b, &table, &memo).3 {
                     matched += 1;
                 }
             }

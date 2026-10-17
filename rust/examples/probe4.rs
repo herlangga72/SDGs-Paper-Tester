@@ -26,9 +26,9 @@ fn main() {
     for (qi, q) in flats.iter().enumerate() {
         let mut near: Vec<(usize, usize)> = Vec::new();
         for (bi, b) in q.iter().enumerate() {
-            let (_, _, _, matched) = matcher::scan_flat(b, &table, &mut memo);
+            let (_, _, _, matched) = matcher::scan_flat(b, &table, &memo);
             if !matched {
-                let (_, cost) = matcher::min_add_flat_cost(b, &table, &mut memo, &mut mscr);
+                let (_, cost) = matcher::min_add_flat_cost(b, &table, &memo, &mut mscr);
                 if cost != matcher::INF_COST as u32 {
                     near.push((bi, cost as usize));
                 }
@@ -38,7 +38,7 @@ fn main() {
         let t = Instant::now();
         let mut groups = 0usize;
         for (bi, _) in near.into_iter().take(30) {
-            let ma = matcher::min_add_flat(&flats[qi][bi], &table, &mut memo, &mut mscr);
+            let ma = matcher::min_add_flat(&flats[qi][bi], &table, &memo, &mut mscr);
             groups += ma.need.len();
         }
         let dt = t.elapsed().as_secs_f64() * 1000.0;

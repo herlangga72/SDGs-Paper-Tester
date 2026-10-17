@@ -269,7 +269,7 @@ fn cmd_match(args: &[String]) -> Result<(), String> {
         let mut disqualified: Vec<&'static str> = Vec::new();
 
         for (bno, block) in q.blocks.iter().enumerate() {
-            let (scan, is_match) = matcher::scan_block_shared(block, &paper, &table, &mut memo);
+            let (scan, is_match) = matcher::scan_block_shared(block, &paper, &table, &memo);
             let n_hit = scan.hits.len();
             if is_match {
                 matched.push((bno, scan.hits));
@@ -278,12 +278,12 @@ fn cmd_match(args: &[String]) -> Result<(), String> {
                 // required-path NOT is already true cannot qualify by adding
                 // keywords -> report its excluded terms instead. Cost-only
                 // flat pass: sequential, zero-allocation.
-                let (_, cost) = matcher::min_add_flat_cost(&flats[qi][bno], &table, &mut memo, &mut mscr);
+                let (_, cost) = matcher::min_add_flat_cost(&flats[qi][bno], &table, &memo, &mut mscr);
                 if cost == matcher::INF_COST as u32 {
                     // Only report excluded terms when the positive side alone
                     // would have matched - i.e. the NOT genuinely blocked a
                     // near-qualifying block (off-topic blocks are dropped).
-                    if matcher::eval_ignore_not_block(block, &table, &mut memo) {
+                    if matcher::eval_ignore_not_block(block, &table, &memo) {
                         disqualified.extend(scan.excluded_hits.iter().cloned());
                     }
                 } else {
@@ -302,7 +302,7 @@ fn cmd_match(args: &[String]) -> Result<(), String> {
             .into_iter()
             .take(top)
             .map(|(bno, n_hit, cost, _)| {
-                let ma = matcher::min_add_flat(&flats[qi][bno], &table, &mut memo, &mut mscr);
+                let ma = matcher::min_add_flat(&flats[qi][bno], &table, &memo, &mut mscr);
                 (bno, n_hit, cost, ma.need)
             })
             .collect();

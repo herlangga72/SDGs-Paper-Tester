@@ -20,12 +20,12 @@ fn main() {
 
     for (bi, f) in flats.iter().enumerate() {
         let mut memo = matcher::Memo::new(&paper, nslots);
-        let _ = matcher::scan_flat(f, &table, &mut memo);
-        let ast = matcher::min_add_block(&q7.blocks[bi], &table, &mut memo);
+        let _ = matcher::scan_flat(f, &table, &memo);
+        let ast = matcher::min_add_block(&q7.blocks[bi], &table, &memo);
         let mut memo = matcher::Memo::new(&paper, nslots);
-        let _ = matcher::scan_flat(f, &table, &mut memo);
+        let _ = matcher::scan_flat(f, &table, &memo);
         let mut scr = matcher::MinAddScratch::default();
-        let fl = matcher::min_add_flat(f, &table, &mut memo, &mut scr);
+        let fl = matcher::min_add_flat(f, &table, &memo, &mut scr);
         let ast_set: std::collections::HashSet<&str> =
             ast.need.iter().flatten().map(|k| k.as_ref()).collect();
         let fl_set: std::collections::HashSet<&str> =

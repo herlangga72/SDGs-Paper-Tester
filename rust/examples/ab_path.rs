@@ -36,7 +36,7 @@ fn main() {
         let t0 = Instant::now();
         for q in &queries {
             for b in &q.blocks {
-                if matcher::scan_with_fields(b, &paper, &table, &mut memo).3 {
+                if matcher::scan_with_fields(b, &paper, &table, &memo).3 {
                     ast_matched += 1;
                 }
             }
@@ -54,7 +54,7 @@ fn main() {
                 hits.clear();
                 misses.clear();
                 ex_hits.clear();
-                if matcher::scan_flat_into(f, &table, &mut memo, &mut hits, &mut misses, &mut ex_hits) {
+                if matcher::scan_flat_into(f, &table, &memo, &mut hits, &mut misses, &mut ex_hits) {
                     flat_matched += 1;
                 }
             }

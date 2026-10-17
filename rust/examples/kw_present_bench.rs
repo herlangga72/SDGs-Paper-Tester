@@ -47,7 +47,7 @@ fn present_old(
         hits.clear();
         misses.clear();
         ex.clear();
-        matcher::scan_flat_into(flat, table, &mut memo, &mut hits, &mut misses, &mut ex);
+        matcher::scan_flat_into(flat, table, &memo, &mut hits, &mut misses, &mut ex);
         for (kw, _) in hits.drain(..) {
             present.insert(kw);
         }

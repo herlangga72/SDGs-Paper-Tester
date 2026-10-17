@@ -57,7 +57,7 @@ fn main() {
                 hits.clear();
                 misses.clear();
                 ex_hits.clear();
-                if matcher::scan_flat_into(f, &table, &mut memo, &mut hits, &mut misses, &mut ex_hits) {
+                if matcher::scan_flat_into(f, &table, &memo, &mut hits, &mut misses, &mut ex_hits) {
                     matched += 1;
                 }
             }

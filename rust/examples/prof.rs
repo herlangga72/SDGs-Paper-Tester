@@ -69,7 +69,7 @@ fn run() {
         let mut memo = matcher::Memo::new(&paper, nslots);
         for q in &flats {
             for f in q {
-                if matcher::scan_flat(f, &table, &mut memo).3 {
+                if matcher::scan_flat(f, &table, &memo).3 {
                     matched += 1;
                 }
             }

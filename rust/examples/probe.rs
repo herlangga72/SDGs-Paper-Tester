@@ -29,7 +29,7 @@ fn main() {
         // A: scan only
         let mut memo = matcher::Memo::new(&paper, nslots);
         let t0 = Instant::now();
-        for q in &flats { for b in q { let _ = matcher::scan_flat(b, &table, &mut memo); } }
+        for q in &flats { for b in q { let _ = matcher::scan_flat(b, &table, &memo); } }
         let ta = t0.elapsed().as_secs_f64() * 1000.0;
 
         // B: scan + present set + cost-only pass (all blocks)
@@ -40,10 +40,10 @@ fn main() {
         for (qi, q) in flats.iter().enumerate() {
             let mut present: HashSet<String> = HashSet::new();
             for (bi, b) in q.iter().enumerate() {
-                let (h, _, _, matched) = matcher::scan_flat(b, &table, &mut memo);
+                let (h, _, _, matched) = matcher::scan_flat(b, &table, &memo);
                 for (kw, _) in h { present.insert(kw.to_string()); }
                 if !matched {
-                    let (_, cost) = matcher::min_add_flat_cost(b, &table, &mut memo, &mut mscr);
+                    let (_, cost) = matcher::min_add_flat_cost(b, &table, &memo, &mut mscr);
                     if cost != matcher::INF_COST as u32 { n_near += 1; }
                 }
             }
@@ -59,15 +59,15 @@ fn main() {
         for (qi, q) in flats.iter().enumerate() {
             let mut near: Vec<(usize, usize)> = Vec::new();
             for (bi, b) in q.iter().enumerate() {
-                let (_, _, _, matched) = matcher::scan_flat(b, &table, &mut memo);
+                let (_, _, _, matched) = matcher::scan_flat(b, &table, &memo);
                 if !matched {
-                    let (_, cost) = matcher::min_add_flat_cost(b, &table, &mut memo, &mut mscr);
+                    let (_, cost) = matcher::min_add_flat_cost(b, &table, &memo, &mut mscr);
                     if cost != matcher::INF_COST as u32 { near.push((bi, cost as usize)); }
                 }
             }
             near.sort_by_key(|x| x.1);
             for (bi, _) in near.into_iter().take(30) {
-                let ma = matcher::min_add_flat(&flats[qi][bi], &table, &mut memo, &mut mscr);
+                let ma = matcher::min_add_flat(&flats[qi][bi], &table, &memo, &mut mscr);
                 n_groups += ma.need.len();
             }
         }
@@ -82,16 +82,16 @@ fn main() {
             let mut present: HashSet<String> = HashSet::new();
             let mut near: Vec<(usize, usize)> = Vec::new();
             for (bi, b) in q.iter().enumerate() {
-                let (h, _, _, matched) = matcher::scan_flat(b, &table, &mut memo);
+                let (h, _, _, matched) = matcher::scan_flat(b, &table, &memo);
                 for (kw, _) in h { present.insert(kw.to_string()); }
                 if !matched {
-                    let (_, cost) = matcher::min_add_flat_cost(b, &table, &mut memo, &mut mscr);
+                    let (_, cost) = matcher::min_add_flat_cost(b, &table, &memo, &mut mscr);
                     if cost != matcher::INF_COST as u32 { near.push((bi, cost as usize)); }
                 }
             }
             near.sort_by_key(|x| x.1);
             for (bi, _) in near.into_iter().take(30) {
-                let ma = matcher::min_add_flat(&flats[qi][bi], &table, &mut memo, &mut mscr);
+                let ma = matcher::min_add_flat(&flats[qi][bi], &table, &memo, &mut mscr);
                 let _ = ma;
             }
             let present_ref: HashSet<&str, matcher::FastHasher> =
