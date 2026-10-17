@@ -1921,7 +1921,8 @@ fn min_add(node: &Node, mask: u8, table: &[Pattern], memo: &Memo) -> MinAdd {
 /// u32 sentinel for INF_COST inside the flat evaluator.
 const INF_U32: u32 = u32::MAX;
 
-// TEMP probe counters
+/// TEMP probe counters (dev-only: the increments are compiled out of normal
+/// release builds so the hot min-add loop pays nothing for them).
 pub static DBG_OPS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 pub static DBG_UNION_KW: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 pub static DBG_UNIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -1944,6 +1945,12 @@ struct EvalEntry {
 struct GroupSlice {
     start: u32,
     len: u32,
+    /// Cached FNV-1a fingerprint of the group's keywords. Computed once when
+    /// the group is created so the dedup hot path (every AND/ANDN) can compare
+    /// hashes instead of re-hashing every keyword in the group. Re-hashing was
+    /// O(sum of group lengths) per dedup pass and dominated blocks with large
+    /// OR groups.
+    fp: u64,
 }
 
 /// Per-block scratch arenas, reused across blocks/requests.
@@ -1985,14 +1992,25 @@ fn str_fp(a: &str) -> u64 {
     (a.as_ptr() as usize) as u64 ^ ((a.len() as u64) << 32)
 }
 
+const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+const FNV_PRIME: u64 = 0x100000001b3;
+
 #[inline]
 fn group_fp_slice(kw: &[&'static str], start: u32, len: u32) -> u64 {
-    let mut h = 0xcbf29ce484222325u64;
+    let mut h = FNV_OFFSET;
     for kw in &kw[start as usize..(start + len) as usize] {
         h ^= str_fp(kw);
-        h = h.wrapping_mul(0x100000001b3);
+        h = h.wrapping_mul(FNV_PRIME);
     }
     h
+}
+
+/// Fingerprint of a one-keyword group. Byte-for-byte the same value
+/// `group_fp_slice` produces for `len == 1`, so single-keyword groups (every
+/// `OP_PUSH` miss) get their fingerprint for free instead of hashing later.
+#[inline]
+fn group_fp_one(kw: &str) -> u64 {
+    (FNV_OFFSET ^ str_fp(kw)).wrapping_mul(FNV_PRIME)
 }
 
 /// Cost-only pass on the flat program: (value, cost) with a dense pair
@@ -2097,6 +2115,7 @@ pub fn min_add_flat(
     scr.groups.clear();
     scr.group_seen.clear();
     for op in flat.prog {
+        #[cfg(feature = "prof")]
         DBG_OPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         match op.tag {
             OP_PUSH => {
@@ -2105,10 +2124,11 @@ pub fn min_add_flat(
                 if v {
                     scr.eval.push(EvalEntry { value: true, cost: 0, ..Default::default() });
                 } else {
+                    let raw = table[l.pid as usize].raw();
                     let k = scr.kw.len() as u32;
-                    scr.kw.push(table[l.pid as usize].raw());
+                    scr.kw.push(raw);
                     let g = scr.groups.len() as u32;
-                    scr.groups.push(GroupSlice { start: k, len: 1 });
+                    scr.groups.push(GroupSlice { start: k, len: 1, fp: group_fp_one(raw) });
                     scr.eval.push(EvalEntry { value: false, cost: 1, g_start: g, g_len: 1, k_start: k, k_len: 1 });
                 }
             }
@@ -2139,15 +2159,18 @@ pub fn min_add_flat(
                 // concat need groups with fp dedup
                 let g0 = scr.groups.len() as u32;
                 let mut ng = 0u32;
+                #[cfg(feature = "prof")]
                 DBG_AND_GROUPS.fetch_add((a.g_len + b.g_len) as usize, std::sync::atomic::Ordering::Relaxed);
                 for e in [&a, &b] {
                     for gi in e.g_start..e.g_start + e.g_len {
                         let gs = scr.groups[gi as usize];
-                        let fp = group_fp_slice(&scr.kw, gs.start, gs.len);
-                        match scr.group_seen.get(&fp) {
-                            Some(&first) if scr.group_slice_eq(first, gs) => { DBG_FP_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+                        match scr.group_seen.get(&gs.fp) {
+                            Some(&first) if scr.group_slice_eq(first, gs) => {
+                                #[cfg(feature = "prof")]
+                                DBG_FP_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
                             _ => {
-                                scr.group_seen.insert(fp, g0 + ng);
+                                scr.group_seen.insert(gs.fp, g0 + ng);
                                 scr.groups.push(gs);
                                 ng += 1;
                             }
@@ -2179,8 +2202,11 @@ pub fn min_add_flat(
                 }
                 // tie at min cost: union when both single, else first
                 if a.g_len == 1 && b.g_len == 1 {
-                    DBG_UNIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    DBG_UNION_KW.fetch_add((a.k_len + b.k_len) as usize, std::sync::atomic::Ordering::Relaxed);
+                    #[cfg(feature = "prof")]
+                    {
+                        DBG_UNIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        DBG_UNION_KW.fetch_add((a.k_len + b.k_len) as usize, std::sync::atomic::Ordering::Relaxed);
+                    }
                     let k0 = scr.kw.len() as u32;
                     scr.kw_seen.clear();
                     let mut fresh: Vec<&'static str> = Vec::new();
@@ -2193,8 +2219,9 @@ pub fn min_add_flat(
                     }
                     let nk = fresh.len() as u32;
                     scr.kw.extend(fresh);
+                    let fp = group_fp_slice(&scr.kw, k0, nk);
                     let g = scr.groups.len() as u32;
-                    scr.groups.push(GroupSlice { start: k0, len: nk });
+                    scr.groups.push(GroupSlice { start: k0, len: nk, fp });
                     scr.eval.push(EvalEntry {
                         value: false,
                         cost: a.cost,
@@ -2239,13 +2266,12 @@ pub fn min_add_flat(
                     for e in &kids {
                         for gi in e.g_start..e.g_start + e.g_len {
                             let gs = scr.groups[gi as usize];
-                            let fp = group_fp_slice(&scr.kw, gs.start, gs.len);
-                            if let Some(&first) = scr.group_seen.get(&fp) {
+                            if let Some(&first) = scr.group_seen.get(&gs.fp) {
                                 if scr.group_slice_eq(first, gs) {
                                     continue;
                                 }
                             }
-                            scr.group_seen.insert(fp, g0 + ng);
+                            scr.group_seen.insert(gs.fp, g0 + ng);
                             scr.groups.push(gs);
                             ng += 1;
                         }
@@ -2334,8 +2360,9 @@ pub fn min_add_flat(
                 }
                 let nk = fresh.len() as u32;
                 scr.kw.extend(fresh);
+                let fp = group_fp_slice(&scr.kw, k0, nk);
                 let g = scr.groups.len() as u32;
-                scr.groups.push(GroupSlice { start: k0, len: nk });
+                scr.groups.push(GroupSlice { start: k0, len: nk, fp });
                 scr.eval.push(EvalEntry {
                     value: false,
                     cost: min_cost,
