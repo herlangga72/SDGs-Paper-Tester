@@ -6,9 +6,8 @@
 #
 # Build speed: BuildKit cache mounts persist the cargo registry and the
 # target dir across builds, so unchanged deps/artifacts are reused instead
-# of rebuilt. The release profile is overridden to thin LTO + 16 codegen
-# units + symbol stripping: builds several times faster with ~1% runtime
-# cost, and the stripped binary shrinks the image (faster cold start).
+# of rebuilt. Cargo.toml defines thin LTO + 16 codegen units + symbol
+# stripping for release builds, shared with local builds.
 #
 # Pin the build stage to bookworm: rust:1.97-slim is trixie (glibc 2.41),
 # whose binaries won't run on the bookworm runtime (glibc 2.36).
@@ -25,10 +24,6 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo fetch
 
 COPY rust/src ./src
-
-ENV CARGO_PROFILE_RELEASE_LTO=thin \
-    CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
-    CARGO_PROFILE_RELEASE_STRIP=symbols
 
 # The target dir lives on a cache mount for incremental builds; BuildKit
 # cannot snapshot a mount into a layer, so COPY it into a plain path first.

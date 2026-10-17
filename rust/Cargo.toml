@@ -21,11 +21,18 @@ io-uring = { version = "0.7.15", optional = true }
 
 [profile.release]
 opt-level = 3
+# Share faster release settings between local and Docker builds.
+lto = "thin"
+codegen-units = 16
+# Strip debug symbols for smaller deployment images.
+strip = "symbols"
+
+# Original optimization settings for runtime benchmarking and final tuning.
+# Build with cargo build --profile release-max (target/release-max/).
+[profile.release-max]
+inherits = "release"
 lto = true
 codegen-units = 1
-# Strip debug symbols: smaller image, faster cold start on Render. The
-# Docker build overrides these to thin LTO / 16 CGUs for faster builds.
-strip = "symbols"
 
 [features]
 # Linux connection acceptance backend. Runtime setup is probed; failure falls back.

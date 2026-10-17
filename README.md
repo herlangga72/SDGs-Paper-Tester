@@ -64,6 +64,27 @@ cd ..
 ./rust/target/release/sdg_tools match papers/sample_paper.md --top 3 --max-kw 10
 ```
 
+### Faster Rust builds
+
+Normal `cargo build --release` uses thin LTO and 16 codegen units, matching
+the Docker build. This favors shorter build times while retaining level-3
+optimization and symbol stripping. Runtime performance can differ from the
+previous full-LTO settings.
+
+From `rust/`, use the smallest build needed for your task:
+
+```bash
+cargo check                         # type-check without producing binaries
+cargo build --bin web                # fast debug build of just the server
+cargo build --release --bin web      # optimized server only
+cargo build --profile release-max    # original full LTO + one codegen unit
+```
+
+The last command writes binaries to `rust/target/release-max/`, not
+`rust/target/release/`. Use it for benchmarking the original optimization
+settings. Keep `target/` between builds so Cargo can reuse cached artifacts.
+Changing profiles requires a separate initial build for that profile.
+
 The legacy Python server still works if you prefer it:
 `python3 web/app.py` (it also backs the PythonAnywhere WSGI deploy).
 
