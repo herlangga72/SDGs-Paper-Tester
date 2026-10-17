@@ -35,7 +35,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -1171,25 +1171,79 @@ fn kw_pid() -> &'static HashMap<&'static str, u32, matcher::FastHasher> {
 }
 
 fn match_report(paper: &Paper, top: usize, max_kw: usize) -> Vec<SdgReport> {
+    let n = get_queries().len();
+    // The 17 SDGs are independent. The per-request memo is shared: its
+    // expensive part - the (pid, buffer) verdict matrix, i.e. the actual
+    // pattern searches - is thread-safe and identical across threads, so
+    // splitting by SDG duplicates no search work. Each worker forks a private
+    // (pid, mask) cache on top of it.
+    //
+    // `available_parallelism` is 1 on hosts that throttle small containers
+    // (e.g. Render's free tier), where the serial path is taken unchanged.
+    let threads = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(1)
+        .min(n);
+    if threads <= 1 {
+        let memo = matcher::Memo::new(paper, 0);
+        let mut mscr = matcher::MinAddScratch::default();
+        return (0..n)
+            .map(|qi| sdg_report(qi, paper, top, max_kw, &memo, &mut mscr))
+            .collect();
+    }
+    let memo = matcher::Memo::new(paper, 0);
+    let next = AtomicUsize::new(0);
+    let slots: Vec<std::sync::Mutex<Option<SdgReport>>> =
+        (0..n).map(|_| std::sync::Mutex::new(None)).collect();
+    std::thread::scope(|s| {
+        for _ in 0..threads {
+            s.spawn(|| {
+                let memo = memo.fork();
+                let mut mscr = matcher::MinAddScratch::default();
+                loop {
+                    let qi = next.fetch_add(1, Ordering::Relaxed);
+                    if qi >= n {
+                        break;
+                    }
+                    let r = sdg_report(qi, paper, top, max_kw, &memo, &mut mscr);
+                    *slots[qi].lock().unwrap() = Some(r);
+                }
+            });
+        }
+    });
+    slots
+        .into_iter()
+        .map(|m| m.into_inner().unwrap().expect("sdg slot filled"))
+        .collect()
+}
+
+/// One SDG's full report: scan every block, cost-only min-add for the
+/// non-matching ones, best-fit suggestions, then full min-add for the
+/// displayed and badge-candidate blocks. `memo` may be shared across worker
+/// threads; `mscr` must be thread-local.
+fn sdg_report(
+    qi: usize,
+    paper: &Paper,
+    top: usize,
+    max_kw: usize,
+    memo: &matcher::Memo,
+    mscr: &mut matcher::MinAddScratch,
+) -> SdgReport {
     let table = get_patterns();
     let queries = get_queries();
     let flats = get_flats();
     let sdg_pid = sdg_pid_blocks();
     let kw_pid = kw_pid();
-    // One memo per request: keywords repeated across SDG blocks (~4.4x in
-    // the corpus) are evaluated once instead of once per occurrence.
-    let mut memo = matcher::Memo::new(paper, 0);
-    let mut out = Vec::new();
-    // Paper word set, built once and reused for every SDG's suggestion
-    // scoring (allocation-free after this point).
-    let paper_text = String::from_utf8_lossy(paper.text_lower(paper::F_ANY));
-    let words = matcher::text_words(&paper_text);
-    // Scratch vectors reused across blocks (clear keeps their capacity).
-    let mut hits: Vec<(&'static str, u8)> = Vec::new();
-    let mut misses: Vec<(&'static str, u8)> = Vec::new();
-    let mut ex_hits: Vec<&'static str> = Vec::new();
-    let mut mscr = matcher::MinAddScratch::default();
-    for (qi, q) in queries.iter().enumerate() {
+    let q = &queries[qi];
+    {
+        // Paper word set, built once per worker and reused for every SDG's
+        // suggestion scoring (allocation-free after this point).
+        let paper_text = String::from_utf8_lossy(paper.text_lower(paper::F_ANY));
+        let words = matcher::text_words(&paper_text);
+        // Scratch vectors reused across blocks (clear keeps their capacity).
+        let mut hits: Vec<(&'static str, u8)> = Vec::new();
+        let mut misses: Vec<(&'static str, u8)> = Vec::new();
+        let mut ex_hits: Vec<&'static str> = Vec::new();
         let mut matched = Vec::new();
         // (block_no, keywords already hit, min keywords to add,
         //  already-hit keyword entries); need groups are materialized later
@@ -1208,7 +1262,7 @@ fn match_report(paper: &Paper, top: usize, max_kw: usize) -> Vec<SdgReport> {
             hits.clear();
             misses.clear();
             ex_hits.clear();
-            let is_match = matcher::scan_flat_into(flat, table, &mut memo, &mut hits, &mut misses, &mut ex_hits);
+            let is_match = matcher::scan_flat_into(flat, table, &memo, &mut hits, &mut misses, &mut ex_hits);
             // Every include-leaf hit counts as "present" for the keyword
             // suggestions (even when its block did not match overall).
             for (kw, _) in hits.iter() {
@@ -1225,12 +1279,12 @@ fn match_report(paper: &Paper, top: usize, max_kw: usize) -> Vec<SdgReport> {
             // keywords to add. INF_COST means a required-path NOT is already
             // true - the block is disqualified by an excluded term, so it is
             // NOT a near miss.
-            let (_, cost) = matcher::min_add_flat_cost(flat, table, &mut memo, &mut mscr);
+            let (_, cost) = matcher::min_add_flat_cost(flat, table, memo, mscr);
             if cost == matcher::INF_COST as u32 {
                 // Only report excluded terms when the positive side alone
                 // would have matched - i.e. the NOT genuinely blocked a
                 // near-qualifying block (off-topic blocks are dropped).
-                if matcher::eval_ignore_not_block(&queries[qi].blocks[bno], table, &mut memo) {
+                if matcher::eval_ignore_not_block(&queries[qi].blocks[bno], table, &memo) {
                     ex.extend(ex_hits.iter().cloned());
                 }
             } else {
@@ -1287,7 +1341,7 @@ fn match_report(paper: &Paper, top: usize, max_kw: usize) -> Vec<SdgReport> {
         let mut near_blocks: Vec<NearBlock> = Vec::new();
         for (bno, n_hit, cost, near_hits) in near.into_iter().take(top) {
             let flat = &flats[qi][bno];
-            let ma = matcher::min_add_flat(flat, table, &mut memo, &mut mscr);
+            let ma = matcher::min_add_flat(flat, table, memo, mscr);
             add_effects(&ma, cost);
             computed.insert(bno as u32);
             near_blocks.push(NearBlock {
@@ -1307,7 +1361,7 @@ fn match_report(paper: &Paper, top: usize, max_kw: usize) -> Vec<SdgReport> {
                     if costs[bno] == matcher::INF_COST as u32 || computed.contains(&(bno as u32)) {
                         continue;
                     }
-                    let ma = matcher::min_add_flat(&flats[qi][bno], table, &mut memo, &mut mscr);
+                    let ma = matcher::min_add_flat(&flats[qi][bno], table, memo, mscr);
                     add_effects(&ma, costs[bno]);
                     computed.insert(bno as u32);
                 }
@@ -1316,7 +1370,7 @@ fn match_report(paper: &Paper, top: usize, max_kw: usize) -> Vec<SdgReport> {
         let mut exu = ex.clone();
         exu.sort_unstable();
         exu.dedup();
-        out.push(SdgReport {
+        SdgReport {
             sdg: q.sdg.clone(),
             matched,
             near: near_blocks,
@@ -1326,9 +1380,8 @@ fn match_report(paper: &Paper, top: usize, max_kw: usize) -> Vec<SdgReport> {
             suggestions,
             solo,
             extra,
-        });
+        }
     }
-    out
 }
 
 fn paper_from_fields(f: &HashMap<String, String>) -> (Paper, Meta) {
@@ -3834,7 +3887,7 @@ fn match_report_old_reference(paper: &Paper, top: usize, max_kw: usize) -> Vec<S
             hits.clear();
             misses.clear();
             ex_hits.clear();
-            let is_match = matcher::scan_flat_into(flat, table, &mut memo, &mut hits, &mut misses, &mut ex_hits);
+            let is_match = matcher::scan_flat_into(flat, table, &memo, &mut hits, &mut misses, &mut ex_hits);
             // Every include-leaf hit counts as "present" for the keyword
             // suggestions (even when its block did not match overall).
             for (kw, _) in hits.iter() {
@@ -3852,19 +3905,19 @@ fn match_report_old_reference(paper: &Paper, top: usize, max_kw: usize) -> Vec<S
                 // excluded term, so it is NOT a near miss. The candidate
                 // keyword groups are materialized below only for the blocks
                 // that make the displayed list.
-                let (_, cost) = matcher::min_add_flat_cost(flat, table, &mut memo, &mut mscr);
+                let (_, cost) = matcher::min_add_flat_cost(flat, table, &memo, &mut mscr);
                 if cost == matcher::INF_COST as u32 {
                     // Only report excluded terms when the positive side alone
                     // would have matched - i.e. the NOT genuinely blocked a
                     // near-qualifying block (off-topic blocks are dropped).
-                    if matcher::eval_ignore_not_block(&get_queries()[qi].blocks[bno], table, &mut memo) {
+                    if matcher::eval_ignore_not_block(&get_queries()[qi].blocks[bno], table, &memo) {
                         ex.extend(ex_hits.iter().cloned());
                     }
                 } else {
                     // Materialize the missing-tag groups for every finite-cost
                     // block: they feed both the AND-clause visualization and
                     // the per-chip "qualifies alone / needs N more" badges.
-                    let ma = matcher::min_add_flat(flat, table, &mut memo, &mut mscr);
+                    let ma = matcher::min_add_flat(flat, table, &memo, &mut mscr);
                     let cost_us = cost as usize;
                     if cost_us == 1 && ma.need.len() == 1 {
                         solo.extend(ma.need[0].iter().copied());
