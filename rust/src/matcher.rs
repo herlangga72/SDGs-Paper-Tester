@@ -2554,11 +2554,14 @@ fn intern_token(arena: &mut Vec<u8>, seen: &mut HashMap<String, (u32, u32)>, t: 
     r
 }
 
-/// Token slice of `dict` at a `(offset, len)` ref (bytes were written from
-/// `&str`, so the slice is valid UTF-8).
+/// Token slice of `dict` at an `(offset, len|kind)` ref (bytes were written
+/// from `&str`, so the slice is valid UTF-8). Returns the pre-normalised key
+/// and its match kind (packed into the top two bits of the stored length).
 #[inline]
-fn dict_token<'b>(dict: &'b SdgDict, o: u32, l: u32) -> &'b str {
-    unsafe { std::str::from_utf8_unchecked(&dict.tokens[o as usize..o as usize + l as usize]) }
+fn dict_token<'b>(dict: &'b SdgDict, o: u32, lk: u32) -> (&'b str, u32) {
+    let kind = lk >> 30;
+    let len = lk & 0x3FFF_FFFF;
+    unsafe { (std::str::from_utf8_unchecked(&dict.tokens[o as usize..o as usize + len as usize]), kind) }
 }
 
 impl SdgDict {
@@ -2638,12 +2641,55 @@ pub fn collect_sdg_dict(blocks: &[Node]) -> SdgDict {
             let toks = if meaningful.is_empty() { &all } else { &meaningful };
             let refs = toks
                 .iter()
-                .map(|t| intern_token(&mut tokens, &mut seen, t))
+                .map(|t| {
+                    // Classify once at boot: the per-request scoring loop then
+                    // does a plain lookup with a pre-normalised key instead of
+                    // trimming / allocating per token per request.
+                    let (kind, key) = classify_token(t);
+                    let (o, l) = intern_token(&mut tokens, &mut seen, &key);
+                    (o, l | (kind << 30))
+                })
                 .collect();
             (Arc::from(kw), refs)
         })
         .collect();
     SdgDict { keywords, tokens, excluded: exc.into_iter().collect() }
+}
+
+/// Token match kind, packed into the top two bits of a token ref's length.
+const TOK_EXACT: u32 = 0;
+const TOK_PREFIX: u32 = 1;
+const TOK_CONTAINS: u32 = 2;
+const TOK_NEVER: u32 = 3;
+
+/// Normalise a keyword token into `(kind, key)` ONCE at boot. `key` is the
+/// exact string `token_matches` needs, so the per-request scoring loop never
+/// trims, lowercases or allocates.
+pub(crate) fn classify_token(tok: &str) -> (u32, String) {
+    if tok.ends_with('*') {
+        let p = tok
+            .trim_end_matches('*')
+            .trim_end_matches(|c: char| !c.is_alphanumeric());
+        if p.is_empty() {
+            (TOK_NEVER, String::new())
+        } else {
+            (TOK_PREFIX, p.to_string())
+        }
+    } else if tok.contains('*') || tok.contains('?') {
+        let literal: String = tok.chars().filter(|c| c.is_alphanumeric()).collect();
+        if literal.is_empty() {
+            (TOK_NEVER, String::new())
+        } else {
+            (TOK_CONTAINS, literal)
+        }
+    } else {
+        let s = tok.trim_matches(|c: char| !c.is_alphanumeric());
+        if s.is_empty() {
+            (TOK_NEVER, String::new())
+        } else {
+            (TOK_EXACT, s.to_string())
+        }
+    }
 }
 
 /// Paper word index: a fast-hashed set for exact lookups plus a sorted
@@ -2720,26 +2766,22 @@ pub fn text_words(text: &str) -> PaperWords<'_> {
     PaperWords { set, sorted }
 }
 
-fn token_matches(tok: &str, words: &PaperWords) -> bool {
-    // `tok` is already lowercased (pre-tokenized at boot).
-    if tok.ends_with('*') {
-        let p = tok.trim_end_matches('*').trim_end_matches(|c: char| !c.is_alphanumeric());
-        if p.is_empty() {
-            return false;
+/// Match a pre-classified keyword token against the paper's word index. The
+/// normalisation (wildcard classification, alphanumeric trimming) already
+/// happened once at boot in `classify_token`, so the hot scoring loop is a
+/// pure lookup: no per-call trim, no per-call `String` allocation.
+#[inline]
+fn token_matches(kind: u32, key: &str, words: &PaperWords) -> bool {
+    match kind {
+        TOK_NEVER => false,
+        TOK_EXACT => words.set.contains(key),
+        TOK_PREFIX => {
+            // Prefix range [p, p+) via binary search over the sorted words.
+            let lo = words.sorted.partition_point(|w| w.as_bytes() < key.as_bytes());
+            words.sorted.get(lo).is_some_and(|w| w.starts_with(key))
         }
-        // Prefix range [p, p+) via binary search over the sorted words.
-        let lo = words.sorted.partition_point(|w| w.as_bytes() < p.as_bytes());
-        return words.sorted.get(lo).is_some_and(|w| w.starts_with(p));
+        _ => words.sorted.iter().any(|w| w.contains(key)),
     }
-    if tok.contains('*') || tok.contains('?') {
-        let literal: String = tok.chars().filter(|c| c.is_alphanumeric()).collect();
-        if literal.is_empty() {
-            return false;
-        }
-        return words.sorted.iter().any(|w| w.contains(literal.as_str()));
-    }
-    let stripped = tok.trim_matches(|c: char| !c.is_alphanumeric());
-    !stripped.is_empty() && words.set.contains(stripped)
 }
 
 /// Score every unique include keyword of an SDG against the paper's word
@@ -2757,7 +2799,10 @@ pub fn score_keywords(
     for (kw, trefs) in &dict.keywords {
         let hit = trefs
             .iter()
-            .filter(|&&(o, l)| token_matches(dict_token(dict, o, l), words))
+            .filter(|&&(o, lk)| {
+                let (key, kind) = dict_token(dict, o, lk);
+                token_matches(kind, key, words)
+            })
             .count();
         out.push(ScoredKw {
             keyword: kw.clone(),
@@ -2822,7 +2867,10 @@ pub fn suggest_keywords(
         }
         let hit = trefs
             .iter()
-            .filter(|&&(o, l)| token_matches(dict_token(dict, o, l), words))
+            .filter(|&&(o, lk)| {
+                let (key, kind) = dict_token(dict, o, lk);
+                token_matches(kind, key, words)
+            })
             .count();
         if hit == 0 || trefs.is_empty() {
             continue;
@@ -4057,4 +4105,90 @@ abstract: |
         eprintln!("per_buffer_join_equivalence: {checked} checks, {true_hits} hits");
     }
 
+}
+
+/// Guards the Tier-3 suggestion refactor: pre-classifying a keyword token at
+/// boot must not change any match decision. The oracle below is the verbatim
+/// pre-optimisation `token_matches`, checked against the new
+/// `classify_token` + `token_matches` pair over every distinct token in the
+/// real Scopus corpus and several paper word indexes.
+#[cfg(test)]
+mod token_classify_tests {
+    use super::*;
+
+    fn token_matches_ref(tok: &str, words: &PaperWords) -> bool {
+        if tok.ends_with('*') {
+            let p = tok
+                .trim_end_matches('*')
+                .trim_end_matches(|c: char| !c.is_alphanumeric());
+            if p.is_empty() {
+                return false;
+            }
+            let lo = words.sorted.partition_point(|w| w.as_bytes() < p.as_bytes());
+            return words.sorted.get(lo).is_some_and(|w| w.starts_with(p));
+        }
+        if tok.contains('*') || tok.contains('?') {
+            let literal: String = tok.chars().filter(|c| c.is_alphanumeric()).collect();
+            if literal.is_empty() {
+                return false;
+            }
+            return words.sorted.iter().any(|w| w.contains(literal.as_str()));
+        }
+        let stripped = tok.trim_matches(|c: char| !c.is_alphanumeric());
+        !stripped.is_empty() && words.set.contains(stripped)
+    }
+
+    /// Every distinct token `collect_sdg_dict` would produce, taken from the
+    /// real query files through the same split/filter/lowercase pipeline.
+    fn corpus_tokens() -> Vec<String> {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../engine/data/queries");
+        let queries = crate::query::load_queries(&dir).expect("load queries");
+        let mut out: Vec<String> = Vec::new();
+        for q in &queries {
+            for b in &q.blocks {
+                let mut leaves = Vec::new();
+                collect_leaves(b, &mut leaves);
+                for kw in leaves {
+                    let all: Vec<String> = kw
+                        .split(' ')
+                        .filter(|t| !t.is_empty())
+                        .map(|t| t.to_lowercase())
+                        .collect();
+                    let meaningful: Vec<String> = all.iter().filter(|t| t.len() > 2).cloned().collect();
+                    let toks: &Vec<String> = if meaningful.is_empty() { &all } else { &meaningful };
+                    out.extend(toks.iter().cloned());
+                }
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    #[test]
+    fn classify_is_equivalent_to_reference() {
+        let papers = [
+            "renewable energy policy and climate adaptation in coastal cities",
+            "water sanitation for poor rural households and gender equality",
+            "can't deny: the co2 level (2020) rose 3.5% in low-income countries",
+            "ocean plastic waste and marine biodiversity conservation of coral reefs",
+            "",
+        ];
+        let toks = corpus_tokens();
+        assert!(toks.len() > 1000, "corpus tokens: {}", toks.len());
+        let mut checked = 0usize;
+        for p in papers {
+            let words = text_words(p);
+            for tok in &toks {
+                let (kind, key) = classify_token(tok);
+                assert_eq!(
+                    token_matches_ref(tok, &words),
+                    token_matches(kind, &key, &words),
+                    "token {tok:?} against paper {p:?}"
+                );
+                checked += 1;
+            }
+        }
+        eprintln!("classify_is_equivalent_to_reference: {checked} checks over {} tokens", toks.len());
+    }
 }
